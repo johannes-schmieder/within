@@ -51,4 +51,7 @@ skip = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# Frozen original implementation, used only by workspace compatibility tests.
+allow-git = ["https://github.com/py-econometrics/within"]
+required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

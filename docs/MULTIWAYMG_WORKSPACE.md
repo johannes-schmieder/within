@@ -76,3 +76,9 @@ after this fork PR qualifies; immutable performance baselines stay unchanged.
 - Full local Rust 1.85 format, strict workspace Clippy, all/minimal tests and
   warning-free documentation passed. Exact-source GitHub qualification pending.
 - Dependency pin integration into MultiwayMG: pending qualified fork merge.
+
+The first inherited CI source-policy check correctly rejected the new Git test
+baseline. `deny.toml` now explicitly allows only the upstream within repository
+and requires revision pins for Git sources. The baseline remains the exact
+`b7779cb` revision; unknown Git sources still fail. This is the explicit source
+registration required by the new compatibility test, not removal of the check.
