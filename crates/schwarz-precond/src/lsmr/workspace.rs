@@ -52,6 +52,39 @@ pub struct MlsmrWorkspaceOptions<'a> {
     pub escalation: Option<&'a mut dyn EscalationHandler>,
 }
 
+/// Caller-owned veto at an iterative native tolerance candidate that can continue.
+///
+/// Return `true` to permit the existing terminal native audit; return `false` to
+/// continue the same recurrence without that audit clobbering its basis vectors.
+/// A warm-start candidate is `correction + warm_start`; cold candidates are just
+/// `correction`. The gate owns any certificate scratch and must not change the
+/// operator or preconditioner. Errors publish no result; reuse reinitializes the
+/// recurrence. Reset any gate state explicitly between calls.
+///
+/// This is not final acceptance: zero/initial-normal-zero exits, exact breakdown,
+/// iteration limits and escalation can terminate without consulting the gate.
+/// The caller must independently certify every returned candidate.
+pub trait LsmrCandidateGate {
+    /// Decide whether to allow a resumable native tolerance candidate to stop.
+    fn allow_stop(
+        &mut self,
+        correction: &[f64],
+        warm_start: Option<&[f64]>,
+    ) -> Result<bool, SolveError>;
+}
+impl<F> LsmrCandidateGate for F
+where
+    F: FnMut(&[f64], Option<&[f64]>) -> Result<bool, SolveError>,
+{
+    fn allow_stop(
+        &mut self,
+        correction: &[f64],
+        warm_start: Option<&[f64]>,
+    ) -> Result<bool, SolveError> {
+        self(correction, warm_start)
+    }
+}
+
 /// Reusable modified-LSMR vectors and local reorthogonalization history.
 ///
 /// The workspace is shape-bound, not operator-bound: every run initializes all
@@ -195,6 +228,46 @@ pub fn mlsmr_with_workspace<'w, A: OperatorMut + ?Sized, M: OperatorMut + ?Sized
         options,
         workspace,
         false,
+        None,
+    )
+}
+
+/// Serial workspace solve with a caller-owned certificate gate at resumable stops.
+///
+/// Vetoed native candidates keep the current bidiagonalization, rotations and
+/// local reorthogonalization history. No restart, tolerance change, extra vector
+/// allocation or extra native audit occurs on a veto. Gate work/allocation belongs
+/// to the caller. A gate that always permits stopping reproduces the ordinary
+/// serial workspace route. Legacy allocating and workspace APIs never invoke a gate.
+///
+/// See [`LsmrCandidateGate`] for warm-start composition and non-resumable exits.
+/// Native result diagnostics retain their original meaning; they are not a
+/// promise that the caller's gate or final independent certificate accepted.
+#[allow(clippy::too_many_arguments)]
+pub fn mlsmr_with_workspace_and_candidate_gate<
+    'w,
+    A: OperatorMut + ?Sized,
+    M: OperatorMut + ?Sized,
+>(
+    operator: &mut A,
+    b: &[f64],
+    preconditioner: &mut M,
+    tol: f64,
+    maxiter: usize,
+    options: MlsmrWorkspaceOptions<'_>,
+    gate: &mut dyn LsmrCandidateGate,
+    workspace: &'w mut MlsmrWorkspace,
+) -> Result<LsmrWorkspaceResult<'w>, SolveError> {
+    solve(
+        operator,
+        b,
+        preconditioner,
+        tol,
+        maxiter,
+        options,
+        workspace,
+        false,
+        Some(gate),
     )
 }
 
@@ -208,6 +281,7 @@ pub(super) fn solve<'w, A: OperatorMut + ?Sized, M: OperatorMut + ?Sized>(
     options: MlsmrWorkspaceOptions<'_>,
     workspace: &'w mut MlsmrWorkspace,
     parallel: bool,
+    candidate_gate: Option<&mut dyn LsmrCandidateGate>,
 ) -> Result<LsmrWorkspaceResult<'w>, SolveError> {
     if operator.nrows() != workspace.rows || operator.ncols() != workspace.cols {
         return Err(SolveError::WorkspaceMismatch);
@@ -263,6 +337,8 @@ pub(super) fn solve<'w, A: OperatorMut + ?Sized, M: OperatorMut + ?Sized>(
                 maxiter,
                 escalation: options.escalation,
                 parallel,
+                candidate_gate,
+                warm_start: options.warm_start,
             },
         )?;
         if let Some(x0) = options.warm_start {

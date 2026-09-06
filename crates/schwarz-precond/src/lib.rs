@@ -104,8 +104,9 @@ pub use domain::{PartitionWeights, SubdomainCore};
 pub use error::{BuildError, LocalSolveError, SolveError};
 pub use local_solve::{LocalSolver, SubdomainEntry};
 pub use lsmr::{
-    lsmr, mlsmr, mlsmr_with_workspace, EscalationHandler, EscalationPolicy, LsmrDiagnostics,
-    LsmrResult, LsmrStopReason, LsmrWorkspaceResult, MlsmrOptions, MlsmrWorkspace,
-    MlsmrWorkspaceOptions, Progress, Staleness, StalenessError,
+    lsmr, mlsmr, mlsmr_with_workspace, mlsmr_with_workspace_and_candidate_gate, EscalationHandler,
+    EscalationPolicy, LsmrCandidateGate, LsmrDiagnostics, LsmrResult, LsmrStopReason,
+    LsmrWorkspaceResult, MlsmrOptions, MlsmrWorkspace, MlsmrWorkspaceOptions, Progress, Staleness,
+    StalenessError,
 };
 pub use schwarz::{ReductionStrategy, SchwarzPreconditioner};

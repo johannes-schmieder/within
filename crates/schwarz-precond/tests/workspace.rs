@@ -476,3 +476,285 @@ fn invalid_inputs_do_not_call_mutable_actions_and_do_not_poison_reuse() {
         assert!((x - target).abs() < 1e-10);
     }
 }
+
+// Candidate gates share this existing three-platform test target.
+use schwarz_precond::{mlsmr_with_workspace_and_candidate_gate, LsmrStopReason};
+
+struct Counted<'a> {
+    op: &'a Dense,
+    forward: usize,
+    adjoint: usize,
+}
+impl OperatorMut for Counted<'_> {
+    fn nrows(&self) -> usize {
+        self.op.m
+    }
+    fn ncols(&self) -> usize {
+        self.op.n
+    }
+    fn apply(&mut self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+        self.forward += 1;
+        self.op.apply_raw(x, y);
+        Ok(())
+    }
+    fn apply_adjoint(&mut self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+        self.adjoint += 1;
+        self.op.adjoint_raw(x, y);
+        Ok(())
+    }
+}
+
+#[test]
+fn veto_preserves_uninterrupted_recurrence_bits_and_work_including_warm_starts() {
+    let op = Dense::new(17, 9, false);
+    let pre = Identity(9);
+    let b: Vec<_> = (0..17).map(|i| (i as f64 * 0.7).cos()).collect();
+    let x0 = [0.125; 9];
+    for local in [None, Some(3), Some(8)] {
+        let mut w = MlsmrWorkspace::try_new(17, 9, local).unwrap();
+        for warm in [false, true] {
+            for cap in 1..=6 {
+                let options = || MlsmrWorkspaceOptions {
+                    warm_start: warm.then_some(&x0[..]),
+                    escalation: None,
+                };
+                let reference =
+                    mlsmr_with_workspace(&mut &op, &b, &mut &pre, 0.0, cap, options(), &mut w)
+                        .unwrap();
+                let expected = reference.x.to_vec();
+                assert_eq!(reference.diagnostics.iterations, cap);
+                let mut counted = Counted {
+                    op: &op,
+                    forward: 0,
+                    adjoint: 0,
+                };
+                let mut calls = 0;
+                let mut gate = |_: &[f64], offset: Option<&[f64]>| {
+                    calls += 1;
+                    assert_eq!(offset, warm.then_some(&x0[..]));
+                    Ok(false)
+                };
+                // Loose native tolerance proposes each iterate, but the gate vetoes all resumable stops.
+                let result = mlsmr_with_workspace_and_candidate_gate(
+                    &mut counted,
+                    &b,
+                    &mut &pre,
+                    1.0,
+                    cap,
+                    options(),
+                    &mut gate,
+                    &mut w,
+                )
+                .unwrap();
+                bits(&expected, result.x);
+                assert_eq!(result.diagnostics.iterations, cap);
+                assert_eq!(calls, cap - 1);
+                // Initialization plus one uninterrupted stream and the final native audit.
+                assert_eq!(counted.forward, cap + 1 + usize::from(warm));
+                assert_eq!(counted.adjoint, cap + 2);
+            }
+        }
+    }
+}
+
+#[test]
+fn original_gradient_gate_continues_early_native_stop_and_checks_full_warm_candidate() {
+    let op = Dense::new(17, 9, false);
+    let pre = Identity(9);
+    let b: Vec<_> = (0..17).map(|i| (i as f64 * 0.7).cos()).collect();
+    let mut reference_gradient = [0.0; 9];
+    op.adjoint_raw(&b, &mut reference_gradient);
+    let reference_norm = reference_gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let x0 = [0.125; 9];
+    for warm in [false, true] {
+        let mut w = MlsmrWorkspace::try_new(17, 9, Some(8)).unwrap();
+        let options = || MlsmrWorkspaceOptions {
+            warm_start: warm.then_some(&x0[..]),
+            escalation: None,
+        };
+        let native =
+            mlsmr_with_workspace(&mut &op, &b, &mut &pre, 1e-2, 100, options(), &mut w).unwrap();
+        let native_iterations = native.diagnostics.iterations;
+        let mut candidate = [0.0; 9];
+        let mut residual = [0.0; 17];
+        let mut gradient = [0.0; 9];
+        let mut calls = 0;
+        let mut last_certificate = f64::INFINITY;
+        let mut gate = |correction: &[f64], offset: Option<&[f64]>| {
+            calls += 1;
+            for i in 0..9 {
+                candidate[i] = correction[i] + offset.map_or(0.0, |x| x[i]);
+            }
+            op.apply_raw(&candidate, &mut residual);
+            for i in 0..17 {
+                residual[i] = b[i] - residual[i];
+            }
+            op.adjoint_raw(&residual, &mut gradient);
+            last_certificate = gradient.iter().map(|v| v * v).sum::<f64>().sqrt() / reference_norm;
+            Ok(last_certificate <= 1e-10)
+        };
+        let result = mlsmr_with_workspace_and_candidate_gate(
+            &mut &op,
+            &b,
+            &mut &pre,
+            1e-2,
+            100,
+            options(),
+            &mut gate,
+            &mut w,
+        )
+        .unwrap();
+        assert!(result.diagnostics.iterations > native_iterations);
+        assert!(result.diagnostics.converged);
+        assert!(calls > 1 && last_certificate <= 1e-10);
+        bits(result.x, &candidate);
+        // Independent final test: every exit remains a candidate, including non-resumable ones.
+        op.apply_raw(result.x, &mut residual);
+        for i in 0..17 {
+            residual[i] = b[i] - residual[i];
+        }
+        op.adjoint_raw(&residual, &mut gradient);
+        assert!(gradient.iter().map(|v| v * v).sum::<f64>().sqrt() / reference_norm <= 1e-10);
+    }
+}
+
+#[test]
+fn permitting_gate_matches_native_diagnostics_and_recovery_after_gate_error() {
+    let op = Dense::new(17, 9, false);
+    let pre = Identity(9);
+    let b: Vec<_> = (0..17).map(|i| (i as f64 * 0.7).cos()).collect();
+    let mut w = MlsmrWorkspace::try_new(17, 9, Some(8)).unwrap();
+    let native = mlsmr_with_workspace(
+        &mut &op,
+        &b,
+        &mut &pre,
+        1e-2,
+        100,
+        MlsmrWorkspaceOptions::default(),
+        &mut w,
+    )
+    .unwrap();
+    let expected = native.x.to_vec();
+    let diagnostics = native.diagnostics;
+    let mut calls = 0;
+    let mut failure = |_: &[f64], _: Option<&[f64]>| -> Result<bool, SolveError> {
+        calls += 1;
+        Err(SolveError::Synchronization {
+            context: "injected candidate gate failure",
+        })
+    };
+    assert!(matches!(
+        mlsmr_with_workspace_and_candidate_gate(
+            &mut &op,
+            &b,
+            &mut &pre,
+            1e-2,
+            100,
+            MlsmrWorkspaceOptions::default(),
+            &mut failure,
+            &mut w
+        ),
+        Err(SolveError::Synchronization {
+            context: "injected candidate gate failure"
+        })
+    ));
+    assert_eq!(calls, 1);
+    for _ in 0..3 {
+        let mut permit = |_: &[f64], _: Option<&[f64]>| Ok(true);
+        let result = mlsmr_with_workspace_and_candidate_gate(
+            &mut &op,
+            &b,
+            &mut &pre,
+            1e-2,
+            100,
+            MlsmrWorkspaceOptions::default(),
+            &mut permit,
+            &mut w,
+        )
+        .unwrap();
+        bits(result.x, &expected);
+        assert_eq!(result.diagnostics, diagnostics);
+    }
+    let mut wrong = MlsmrWorkspace::try_new(18, 9, Some(8)).unwrap();
+    let mut never = |_: &[f64], _: Option<&[f64]>| -> Result<bool, SolveError> {
+        panic!("invalid dimensions must not call gate")
+    };
+    assert!(matches!(
+        mlsmr_with_workspace_and_candidate_gate(
+            &mut &op,
+            &b,
+            &mut &pre,
+            1e-2,
+            100,
+            MlsmrWorkspaceOptions::default(),
+            &mut never,
+            &mut wrong
+        ),
+        Err(SolveError::WorkspaceMismatch)
+    ));
+}
+
+#[test]
+fn non_resumable_exits_are_candidates_and_veto_does_not_skip_escalation() {
+    let identity = Identity(1);
+    let mut w = MlsmrWorkspace::try_new(1, 1, Some(8)).unwrap();
+    let mut never = |_: &[f64], _: Option<&[f64]>| -> Result<bool, SolveError> {
+        panic!("non-resumable exit must not call gate")
+    };
+    for (rhs, offset, stop) in [
+        ([0.0], None, LsmrStopReason::ZeroRhs),
+        ([2.0], Some([2.0]), LsmrStopReason::WarmStartExact),
+        ([2.0], None, LsmrStopReason::ResidualTolerance),
+    ] {
+        let result = mlsmr_with_workspace_and_candidate_gate(
+            &mut &identity,
+            &rhs,
+            &mut &identity,
+            1e-8,
+            100,
+            MlsmrWorkspaceOptions {
+                warm_start: offset.as_ref().map(|x| &x[..]),
+                escalation: None,
+            },
+            &mut never,
+            &mut w,
+        )
+        .unwrap();
+        assert_eq!(result.diagnostics.stop_reason, stop);
+        assert_eq!(result.x, &rhs);
+    }
+    struct Escalate(usize);
+    impl schwarz_precond::EscalationHandler for Escalate {
+        fn should_escalate(&mut self, _: schwarz_precond::Progress) -> bool {
+            self.0 += 1;
+            true
+        }
+    }
+    let op = Dense::new(17, 9, false);
+    let pre = Identity(9);
+    let b = [1.0; 17];
+    let mut w = MlsmrWorkspace::try_new(17, 9, Some(8)).unwrap();
+    let mut escalation = Escalate(0);
+    let mut calls = 0;
+    let mut veto = |_: &[f64], _: Option<&[f64]>| {
+        calls += 1;
+        Ok(false)
+    };
+    let result = mlsmr_with_workspace_and_candidate_gate(
+        &mut &op,
+        &b,
+        &mut &pre,
+        1.0,
+        100,
+        MlsmrWorkspaceOptions {
+            warm_start: None,
+            escalation: Some(&mut escalation),
+        },
+        &mut veto,
+        &mut w,
+    )
+    .unwrap();
+    assert_eq!(result.diagnostics.stop_reason, LsmrStopReason::Escalated);
+    assert_eq!(result.diagnostics.iterations, 1);
+    assert_eq!((calls, escalation.0), (1, 1));
+}

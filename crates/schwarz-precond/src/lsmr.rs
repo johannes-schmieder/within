@@ -10,8 +10,8 @@ mod fixtures;
 mod recurrence;
 mod workspace;
 pub use workspace::{
-    mlsmr_with_workspace, LsmrDiagnostics, LsmrWorkspaceResult, MlsmrWorkspace,
-    MlsmrWorkspaceOptions,
+    mlsmr_with_workspace, mlsmr_with_workspace_and_candidate_gate, LsmrCandidateGate,
+    LsmrDiagnostics, LsmrWorkspaceResult, MlsmrWorkspace, MlsmrWorkspaceOptions,
 };
 #[cfg(test)]
 mod tests;
@@ -237,6 +237,7 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
         },
         &mut workspace,
         true,
+        None,
     )?;
     let diagnostics = result.diagnostics;
     Ok(diagnostics.into_owned(workspace.into_x()))
@@ -266,12 +267,14 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
                 .as_deref_mut()
                 .map(|h| h as &mut dyn EscalationHandler),
             parallel: true,
+            candidate_gate: None,
+            warm_start: None,
         },
     )?;
     Ok(diagnostics.into_owned(solution.into_x()))
 }
 
-struct RecurrenceRun<'rhs, 'handler> {
+struct RecurrenceRun<'rhs, 'handler, 'gate> {
     step1: BidiagStep,
     rhs: &'rhs [f64],
     rhs_norm: f64,
@@ -279,12 +282,14 @@ struct RecurrenceRun<'rhs, 'handler> {
     maxiter: usize,
     escalation: Option<&'handler mut dyn EscalationHandler>,
     parallel: bool,
+    candidate_gate: Option<&'gate mut dyn LsmrCandidateGate>,
+    warm_start: Option<&'rhs [f64]>,
 }
 
 fn run_recurrence<B: Bidiagonalization>(
     mut bidiag: B,
     solution: &mut SolutionState,
-    run: RecurrenceRun<'_, '_>,
+    run: RecurrenceRun<'_, '_, '_>,
 ) -> Result<LsmrDiagnostics, SolveError> {
     let RecurrenceRun {
         step1,
@@ -294,6 +299,8 @@ fn run_recurrence<B: Bidiagonalization>(
         maxiter,
         mut escalation,
         parallel,
+        mut candidate_gate,
+        warm_start,
     } = run;
     solution.reset(bidiag.v());
     if step1.alpha == 0.0 {
@@ -322,20 +329,31 @@ fn run_recurrence<B: Bidiagonalization>(
             Stop::ResidualTolerance => Some(LsmrStopReason::ResidualTolerance),
             Stop::NormalEquationTolerance => Some(LsmrStopReason::NormalEquationTolerance),
         } {
-            let x = solution.x();
-            let cert = bidiag.certify(x, rhs)?;
-            let converged = convergence.certified(&cert, recurrence.zeta0);
-            return Ok(LsmrDiagnostics {
-                converged,
-                iterations: itn,
-                residual_norm: cert.normr,
-                normal_eq_residual: cert.normar / recurrence.zeta0,
-                stop_reason: if converged {
-                    stop_reason
-                } else {
-                    LsmrStopReason::FalseConvergence
-                },
-            });
+            // The native audit overwrites v, so a caller veto must happen first.
+            // Budget/exact-breakdown exits cannot resume; final caller certification
+            // remains mandatory there, just as at the zero/initial/escalation exits.
+            let can_continue = itn < maxiter && step.alpha != 0.0 && step.beta != 0.0;
+            let allow_stop = !can_continue
+                || match candidate_gate.as_deref_mut() {
+                    Some(gate) => gate.allow_stop(solution.x(), warm_start)?,
+                    None => true,
+                };
+            if allow_stop {
+                let x = solution.x();
+                let cert = bidiag.certify(x, rhs)?;
+                let converged = convergence.certified(&cert, recurrence.zeta0);
+                return Ok(LsmrDiagnostics {
+                    converged,
+                    iterations: itn,
+                    residual_norm: cert.normr,
+                    normal_eq_residual: cert.normar / recurrence.zeta0,
+                    stop_reason: if converged {
+                        stop_reason
+                    } else {
+                        LsmrStopReason::FalseConvergence
+                    },
+                });
+            }
         }
         if let Some(rule) = escalation.as_deref_mut() {
             let progress = Progress {
