@@ -20,7 +20,13 @@ thiserror.workspace = true
 thread_local = "1.1"
 
 [dev-dependencies]
+stats_alloc = "=0.1.10"
+schwarz-precond-baseline = { package = "schwarz-precond", git = "https://github.com/py-econometrics/within", rev = "b7779cbab7a3116be56aae4389fde1f6e6a99a9f" }
 faer.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "workspace_allocations"
+harness = false

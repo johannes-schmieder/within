@@ -64,6 +64,15 @@ pub enum LocalSolveError {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SolveError {
+    /// Prepared LSMR storage does not match the requested operator shape.
+    #[error("LSMR workspace shape mismatch")]
+    WorkspaceMismatch,
+    /// A checked workspace element or byte count overflowed.
+    #[error("LSMR workspace size overflow")]
+    WorkspaceSizeOverflow,
+    /// A workspace reservation failed; previously reserved arrays are released.
+    #[error("LSMR workspace allocation failed")]
+    WorkspaceAllocation,
     /// A local subdomain solve failed during a preconditioner apply.
     #[error("subdomain {subdomain} local solve failed: {source}")]
     LocalSolveFailed {
