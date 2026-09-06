@@ -362,3 +362,117 @@ fn caller_owned_escalation_matches_upstream_handoff() {
         frozen.normal_eq_residual.to_bits()
     );
 }
+
+#[test]
+fn invalid_inputs_do_not_call_mutable_actions_and_do_not_poison_reuse() {
+    let mut op = MutableAction {
+        n: 3,
+        scale: 1.0,
+        fail: false,
+        calls: 0,
+    };
+    let pre = Identity(3);
+    let bad_pre = Identity(2);
+    let b = [1.0, 2.0, 3.0];
+    let mut w = MlsmrWorkspace::try_new(3, 3, Some(3)).unwrap();
+    for tol in [f64::NAN, f64::INFINITY, -1.0] {
+        assert!(mlsmr_with_workspace(
+            &mut op,
+            &b,
+            &mut &pre,
+            tol,
+            30,
+            MlsmrWorkspaceOptions::default(),
+            &mut w
+        )
+        .is_err());
+    }
+    assert!(mlsmr_with_workspace(
+        &mut op,
+        &b[..2],
+        &mut &pre,
+        1e-10,
+        30,
+        MlsmrWorkspaceOptions::default(),
+        &mut w
+    )
+    .is_err());
+    assert!(mlsmr_with_workspace(
+        &mut op,
+        &b,
+        &mut &bad_pre,
+        1e-10,
+        30,
+        MlsmrWorkspaceOptions::default(),
+        &mut w
+    )
+    .is_err());
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(mlsmr_with_workspace(
+            &mut op,
+            &[bad; 3],
+            &mut &pre,
+            1e-10,
+            30,
+            MlsmrWorkspaceOptions::default(),
+            &mut w
+        )
+        .is_err());
+        assert!(mlsmr_with_workspace(
+            &mut op,
+            &b,
+            &mut &pre,
+            1e-10,
+            30,
+            MlsmrWorkspaceOptions {
+                warm_start: Some(&[bad; 3]),
+                escalation: None
+            },
+            &mut w
+        )
+        .is_err());
+    }
+    assert!(mlsmr_with_workspace(
+        &mut op,
+        &b,
+        &mut &pre,
+        1e-10,
+        30,
+        MlsmrWorkspaceOptions {
+            warm_start: Some(&[0.0; 2]),
+            escalation: None
+        },
+        &mut w
+    )
+    .is_err());
+    assert_eq!(op.calls, 0);
+    // A computed warm residual has its own guard; recovery must discard it.
+    op.scale = f64::INFINITY;
+    assert!(mlsmr_with_workspace(
+        &mut op,
+        &b,
+        &mut &pre,
+        1e-10,
+        30,
+        MlsmrWorkspaceOptions {
+            warm_start: Some(&[0.0; 3]),
+            escalation: None
+        },
+        &mut w
+    )
+    .is_err());
+    op.scale = 1.0;
+    let result = mlsmr_with_workspace(
+        &mut op,
+        &b,
+        &mut &pre,
+        1e-10,
+        30,
+        MlsmrWorkspaceOptions::default(),
+        &mut w,
+    )
+    .unwrap();
+    for (&x, &target) in result.x.iter().zip(&b) {
+        assert!((x - target).abs() < 1e-10);
+    }
+}
