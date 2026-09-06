@@ -56,6 +56,37 @@ pub trait Operator: Send + Sync {
     fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), error::SolveError>;
 }
 
+/// Mutable operator actions using caller-owned scratch without interior mutability.
+///
+/// Unlike [`Operator`], this serial action interface does not require `Sync`.
+/// Implementations must overwrite the full output and keep a fixed mathematical
+/// operator during a solve. The caller controls any internal parallel execution.
+pub trait OperatorMut {
+    /// Number of output rows.
+    fn nrows(&self) -> usize;
+    /// Number of input columns.
+    fn ncols(&self) -> usize;
+    /// Compute `y = A x`, using any scratch owned by this action.
+    fn apply(&mut self, x: &[f64], y: &mut [f64]) -> Result<(), error::SolveError>;
+    /// Compute `y = A' x`, using any scratch owned by this action.
+    fn apply_adjoint(&mut self, x: &[f64], y: &mut [f64]) -> Result<(), error::SolveError>;
+}
+
+impl<T: Operator + ?Sized> OperatorMut for &T {
+    fn nrows(&self) -> usize {
+        Operator::nrows(*self)
+    }
+    fn ncols(&self) -> usize {
+        Operator::ncols(*self)
+    }
+    fn apply(&mut self, x: &[f64], y: &mut [f64]) -> Result<(), error::SolveError> {
+        Operator::apply(*self, x, y)
+    }
+    fn apply_adjoint(&mut self, x: &[f64], y: &mut [f64]) -> Result<(), error::SolveError> {
+        Operator::apply_adjoint(*self, x, y)
+    }
+}
+
 // Compiles the README usage example as a doctest so it cannot drift from the public API.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
@@ -73,7 +104,8 @@ pub use domain::{PartitionWeights, SubdomainCore};
 pub use error::{BuildError, LocalSolveError, SolveError};
 pub use local_solve::{LocalSolver, SubdomainEntry};
 pub use lsmr::{
-    lsmr, mlsmr, EscalationHandler, EscalationPolicy, LsmrResult, LsmrStopReason, MlsmrOptions,
-    Progress, Staleness, StalenessError,
+    lsmr, mlsmr, mlsmr_with_workspace, EscalationHandler, EscalationPolicy, LsmrDiagnostics,
+    LsmrResult, LsmrStopReason, LsmrWorkspaceResult, MlsmrOptions, MlsmrWorkspace,
+    MlsmrWorkspaceOptions, Progress, Staleness, StalenessError,
 };
 pub use schwarz::{ReductionStrategy, SchwarzPreconditioner};

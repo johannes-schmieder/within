@@ -8,13 +8,16 @@ mod bidiag;
 #[cfg(test)]
 mod fixtures;
 mod recurrence;
+mod workspace;
+pub use workspace::{
+    mlsmr_with_workspace, LsmrDiagnostics, LsmrWorkspaceResult, MlsmrWorkspace,
+    MlsmrWorkspaceOptions,
+};
 #[cfg(test)]
 mod tests;
 
-use std::borrow::Cow;
-
 use crate::{Operator, SolveError};
-use bidiag::{BidiagStep, Bidiagonalization, GolubKahan, ModifiedGolubKahan};
+use bidiag::{BidiagStep, Bidiagonalization, GolubKahan};
 use recurrence::{ConvergenceCriteria, LsmrRecurrenceState, RotationStep, SolutionState, Stop};
 
 /// Euclidean norm of a vector.
@@ -214,92 +217,34 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
     options: MlsmrOptions<'_>,
 ) -> Result<LsmrResult, SolveError> {
     validate_lsmr_inputs(operator, b, tol)?;
-    let n = operator.ncols();
-    if preconditioner.nrows() != n || preconditioner.ncols() != n {
-        return Err(invalid_input(format!(
-            "preconditioner shape {}x{} must match operator column count {n}",
-            preconditioner.nrows(),
-            preconditioner.ncols(),
-        )));
-    }
-    let MlsmrOptions {
-        warm_start,
-        escalation,
-        local_size,
-    } = options;
-
-    if let Some(x0) = warm_start {
-        if x0.len() != n {
-            return Err(invalid_input(format!(
-                "warm-start length {} does not match operator column count {n}",
-                x0.len()
-            )));
-        }
-        if let Some((index, value)) = x0.iter().copied().enumerate().find(|(_, v)| !v.is_finite()) {
-            return Err(invalid_input(format!(
-                "warm-start entry {index} must be finite, got {value}"
-            )));
-        }
-    }
-
-    let b_norm = vec_norm(b);
-    let local_size = local_size.unwrap_or(0);
-
-    let rhs: Cow<'_, [f64]> = match warm_start {
-        None => Cow::Borrowed(b),
-        Some(x0) => {
-            let mut residual = vec![0.0; operator.nrows()];
-            operator.apply(x0, &mut residual)?;
-            for (ri, &bi) in residual.iter_mut().zip(b) {
-                *ri = bi - *ri;
-            }
-            Cow::Owned(residual)
-        }
-    };
-    let rhs_norm = vec_norm(&rhs);
-    // Unlike `b`, `rhs` is computed: an ∞ entry norms to NaN, which reads as β₁ = 0 downstream.
-    if !rhs_norm.is_finite() {
-        return Err(invalid_input(format!(
-            "warm-start residual b - A·x0 has non-finite norm {rhs_norm}"
-        )));
-    }
-    if rhs_norm == 0.0 {
-        let (x, stop_reason) = match warm_start {
-            Some(x0) => (x0.to_vec(), LsmrStopReason::WarmStartExact),
-            None => (vec![0.0; n], LsmrStopReason::ZeroRhs),
-        };
-        return Ok(LsmrResult {
-            x,
-            converged: true,
-            iterations: 0,
-            residual_norm: 0.0,
-            normal_eq_residual: 0.0,
-            stop_reason,
-        });
-    }
-
-    let (bidiag, step1) = ModifiedGolubKahan::init(operator, preconditioner, &rhs, local_size)?;
-    let criteria = ConvergenceCriteria::new(b_norm, tol);
-    let mut result = lsmr_from_bidiag(
-        bidiag,
-        step1,
-        &rhs,
-        rhs_norm,
-        criteria,
+    let mut op = operator;
+    let mut precond = preconditioner;
+    workspace::validate_inputs(&op, b, &precond, tol, options.warm_start)?;
+    let mut workspace =
+        MlsmrWorkspace::try_new(operator.nrows(), operator.ncols(), options.local_size)?;
+    let mut escalation = options.escalation.map(|policy| policy.handler());
+    let result = workspace::solve(
+        &mut op,
+        b,
+        &mut precond,
+        tol,
         maxiter,
-        escalation.map(|policy| policy.handler()),
+        MlsmrWorkspaceOptions {
+            warm_start: options.warm_start,
+            escalation: escalation
+                .as_deref_mut()
+                .map(|h| h as &mut dyn EscalationHandler),
+        },
+        &mut workspace,
+        true,
     )?;
-    if let Some(x0) = warm_start {
-        for (xi, &x0i) in result.x.iter_mut().zip(x0) {
-            *xi += x0i;
-        }
-    }
-    Ok(result)
+    let diagnostics = result.diagnostics;
+    Ok(diagnostics.into_owned(workspace.into_x()))
 }
 
 /// Runs the LSMR recurrences over a preconditioner-specific bidiagonalization stream.
 fn lsmr_from_bidiag<B: Bidiagonalization>(
-    mut bidiag: B,
+    bidiag: B,
     step1: BidiagStep,
     rhs: &[f64],
     rhs_norm: f64,
@@ -307,10 +252,52 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
     maxiter: usize,
     mut escalation: Option<Box<dyn EscalationHandler>>,
 ) -> Result<LsmrResult, SolveError> {
-    let n = bidiag.v().len();
+    let mut solution = SolutionState::init(bidiag.v());
+    let diagnostics = run_recurrence(
+        bidiag,
+        &mut solution,
+        RecurrenceRun {
+            step1,
+            rhs,
+            rhs_norm,
+            criteria,
+            maxiter,
+            escalation: escalation
+                .as_deref_mut()
+                .map(|h| h as &mut dyn EscalationHandler),
+            parallel: true,
+        },
+    )?;
+    Ok(diagnostics.into_owned(solution.into_x()))
+}
+
+struct RecurrenceRun<'rhs, 'handler> {
+    step1: BidiagStep,
+    rhs: &'rhs [f64],
+    rhs_norm: f64,
+    criteria: ConvergenceCriteria,
+    maxiter: usize,
+    escalation: Option<&'handler mut dyn EscalationHandler>,
+    parallel: bool,
+}
+
+fn run_recurrence<B: Bidiagonalization>(
+    mut bidiag: B,
+    solution: &mut SolutionState,
+    run: RecurrenceRun<'_, '_>,
+) -> Result<LsmrDiagnostics, SolveError> {
+    let RecurrenceRun {
+        step1,
+        rhs,
+        rhs_norm,
+        criteria,
+        maxiter,
+        mut escalation,
+        parallel,
+    } = run;
+    solution.reset(bidiag.v());
     if step1.alpha == 0.0 {
-        return Ok(LsmrResult {
-            x: vec![0.0; n],
+        return Ok(LsmrDiagnostics {
             converged: true,
             iterations: 0,
             residual_norm: rhs_norm,
@@ -321,14 +308,13 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
 
     let mut convergence = criteria.start(step1.alpha);
     let mut recurrence = LsmrRecurrenceState::init(step1);
-    let mut solution = SolutionState::init(bidiag.v());
     let mut prev_rot = RotationStep::initial();
 
     for itn in 1..=maxiter {
         let step = bidiag.step()?;
         convergence.observe(step);
         let curr_rot = recurrence.step(step);
-        solution.update(bidiag.v(), curr_rot, prev_rot);
+        solution.update(bidiag.v(), curr_rot, prev_rot, parallel);
 
         // The tolerance test catches breakdown when the residual recurrences collapse.
         if let Some(stop_reason) = match convergence.check(&recurrence) {
@@ -336,11 +322,10 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
             Stop::ResidualTolerance => Some(LsmrStopReason::ResidualTolerance),
             Stop::NormalEquationTolerance => Some(LsmrStopReason::NormalEquationTolerance),
         } {
-            let x = solution.into_x();
-            let cert = bidiag.certify(&x, rhs)?;
+            let x = solution.x();
+            let cert = bidiag.certify(x, rhs)?;
             let converged = convergence.certified(&cert, recurrence.zeta0);
-            return Ok(LsmrResult {
-                x,
+            return Ok(LsmrDiagnostics {
                 converged,
                 iterations: itn,
                 residual_norm: cert.normr,
@@ -358,8 +343,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
                 normal_eq_residual: recurrence.relative_normal_eq_residual(),
             };
             if rule.should_escalate(progress) {
-                return Ok(LsmrResult {
-                    x: solution.into_x(),
+                return Ok(LsmrDiagnostics {
                     converged: false,
                     iterations: itn,
                     residual_norm: recurrence.residual_estimate(),
@@ -371,8 +355,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
         prev_rot = curr_rot;
     }
 
-    Ok(LsmrResult {
-        x: solution.into_x(),
+    Ok(LsmrDiagnostics {
         converged: false,
         iterations: maxiter,
         residual_norm: recurrence.residual_estimate(),

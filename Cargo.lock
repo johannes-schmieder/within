@@ -1533,7 +1533,19 @@ version = "0.4.0"
 dependencies = [
  "faer",
  "rayon",
+ "schwarz-precond 0.4.0 (git+https://github.com/py-econometrics/within?rev=b7779cbab7a3116be56aae4389fde1f6e6a99a9f)",
  "serde",
+ "stats_alloc",
+ "thiserror 2.0.19",
+ "thread_local",
+]
+
+[[package]]
+name = "schwarz-precond"
+version = "0.4.0"
+source = "git+https://github.com/py-econometrics/within?rev=b7779cbab7a3116be56aae4389fde1f6e6a99a9f#b7779cbab7a3116be56aae4389fde1f6e6a99a9f"
+dependencies = [
+ "rayon",
  "thiserror 2.0.19",
  "thread_local",
 ]
@@ -1659,6 +1671,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stats_alloc"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c0e04424e733e69714ca1bbb9204c1a57f09f5493439520f9f68c132ad25eec"
 
 [[package]]
 name = "syn"
@@ -2055,7 +2073,7 @@ dependencies = [
  "proptest",
  "rand 0.10.2",
  "rayon",
- "schwarz-precond",
+ "schwarz-precond 0.4.0",
  "serde",
  "thiserror 2.0.19",
 ]

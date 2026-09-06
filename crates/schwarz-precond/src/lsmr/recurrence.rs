@@ -140,8 +140,43 @@ impl SolutionState {
         }
     }
 
+    pub(super) fn try_new_with<F>(n: usize, allocate: &mut F) -> Result<Self, crate::SolveError>
+    where
+        F: FnMut(usize) -> Result<Vec<f64>, crate::SolveError>,
+    {
+        Ok(Self {
+            x: allocate(n)?,
+            h: allocate(n)?,
+            h_bar: allocate(n)?,
+        })
+    }
+    pub(super) fn reset(&mut self, v1: &[f64]) {
+        self.x.fill(0.0);
+        self.h.copy_from_slice(v1);
+        self.h_bar.fill(0.0);
+    }
+    pub(super) fn x(&self) -> &[f64] {
+        &self.x
+    }
+    pub(super) fn x_mut(&mut self) -> &mut [f64] {
+        &mut self.x
+    }
+    pub(super) fn retained_elements(&self) -> Result<usize, crate::SolveError> {
+        self.x
+            .capacity()
+            .checked_add(self.h.capacity())
+            .and_then(|n| n.checked_add(self.h_bar.capacity()))
+            .ok_or(crate::SolveError::WorkspaceSizeOverflow)
+    }
+
     /// One `(x, h, h̄)` step; `v` must be normalized `v_{k+1}` and `prev` carries `(ρ, ρ̄)_{k-1}`.
-    pub(super) fn update(&mut self, v: &[f64], curr: RotationStep, prev: RotationStep) {
+    pub(super) fn update(
+        &mut self,
+        v: &[f64],
+        curr: RotationStep,
+        prev: RotationStep,
+        parallel: bool,
+    ) {
         // Denominators are O(1) Givens diagonals, so an absolute `f64::EPSILON` guard suffices.
         let t_x_denom = curr.rho * curr.rho_bar;
         let t_x = if t_x_denom.abs() > f64::EPSILON {
@@ -179,7 +214,7 @@ impl SolutionState {
             }
         };
 
-        if n >= LSMR_PAR_THRESHOLD {
+        if parallel && n >= LSMR_PAR_THRESHOLD {
             self.h_bar
                 .par_chunks_mut(LSMR_UPDATE_CHUNK)
                 .zip(self.h.par_chunks_mut(LSMR_UPDATE_CHUNK))
