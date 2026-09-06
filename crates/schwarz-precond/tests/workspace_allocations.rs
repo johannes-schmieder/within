@@ -1,6 +1,7 @@
 //! Isolated allocator proof, including the very first serial solve above Rayon's legacy threshold.
 use schwarz_precond::{
-    mlsmr_with_workspace, MlsmrWorkspace, MlsmrWorkspaceOptions, OperatorMut, SolveError,
+    mlsmr_with_workspace, mlsmr_with_workspace_and_candidate_gate, MlsmrWorkspace,
+    MlsmrWorkspaceOptions, OperatorMut, SolveError,
 };
 use stats_alloc::{StatsAlloc, INSTRUMENTED_SYSTEM};
 use std::{alloc::System, hint::black_box};
@@ -44,6 +45,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (setup.allocations, setup.reallocations, setup.deallocations),
         (11, 0, 0)
     );
+    let reference_norm = b
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            let a = 1.0 + (i % 4) as f64 * 0.25;
+            (a * value).powi(2)
+        })
+        .sum::<f64>()
+        .sqrt();
+    let gradient_ratio = |x: &[f64]| {
+        x.iter()
+            .zip(&b)
+            .enumerate()
+            .map(|(i, (value, target))| {
+                let a = 1.0 + (i % 4) as f64 * 0.25;
+                (a * (target - a * value)).powi(2)
+            })
+            .sum::<f64>()
+            .sqrt()
+            / reference_norm
+    };
+    let before = GLOBAL.stats();
+    for _ in 0..16 {
+        let mut calls = 0;
+        let mut gate = |x: &[f64], offset: Option<&[f64]>| {
+            assert!(offset.is_none());
+            calls += 1;
+            Ok(gradient_ratio(x) <= 1e-10)
+        };
+        let result = mlsmr_with_workspace_and_candidate_gate(
+            &mut op,
+            black_box(&b),
+            &mut pre,
+            1.0,
+            100,
+            MlsmrWorkspaceOptions::default(),
+            &mut gate,
+            &mut w,
+        )?;
+        assert!(calls > 1 && result.diagnostics.iterations > 1);
+        assert!(gradient_ratio(result.x) <= 1e-10);
+        black_box(result.x);
+    }
+    let mut gate_error = |_: &[f64], _: Option<&[f64]>| -> Result<bool, SolveError> {
+        Err(SolveError::Synchronization {
+            context: "injected candidate gate failure",
+        })
+    };
+    assert!(mlsmr_with_workspace_and_candidate_gate(
+        &mut op,
+        &b,
+        &mut pre,
+        1.0,
+        100,
+        MlsmrWorkspaceOptions::default(),
+        &mut gate_error,
+        &mut w
+    )
+    .is_err());
+    let delta = GLOBAL.stats() - before;
+    assert_eq!(
+        (delta.allocations, delta.reallocations, delta.deallocations),
+        (0, 0, 0)
+    );
     let before = GLOBAL.stats();
     for _ in 0..16 {
         let result = mlsmr_with_workspace(
@@ -69,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(delta.bytes_deallocated, expected);
     assert_eq!((delta.allocations, delta.reallocations), (0, 0));
     println!(
-        "serial LSMR: first/repeat16 allocations=0; n={n}; retained/released={expected} bytes"
+        "serial LSMR: first gated/repeat16/error and native/recovery allocations=0; n={n}; retained/released={expected} bytes"
     );
     Ok(())
 }
