@@ -131,3 +131,20 @@ and minimal-feature workspace tests, warning-free rustdoc and release all/minima
 workspace/allocation tests pass. The frozen-upstream comparisons remain intact.
 Exact-source and PR qualification is pending; both downstream pins remain at the
 qualified M3 merge until this incremental fork PR merges.
+
+
+## M5 prepared norm rejection
+
+M4 merged in fork PR #2 as `cb20b27a7137804202be39976415618686a144de`.
+M5's stronger complete-solve allocator test exposed a 100-byte formatted error
+when a finite RHS had an unrepresentable Euclidean norm. The prepared workspace
+now returns `SolveError::NonFiniteResidualNorm { value_bits }` at the same boundary.
+The owning `mlsmr` wrapper translates it to the historical `InvalidInput` variant
+and exact text. No successful arithmetic, scan, work count, or storage changes.
+This covers the numerical norm failure; static malformed-input diagnostics in
+the standalone dependency remain allocating. MultiwayMG validates those before
+entering the driver. The isolated allocator test covers gated/native cold norm
+overflow, warm residual overflow, and same-workspace successful recovery.
+Rust 1.85 formatting, strict Clippy, all/minimal workspace tests, warning-free
+rustdoc and release all/minimal workspace/allocation checks pass locally.
+Exact-source and PR CI qualification remains before downstream pin integration.

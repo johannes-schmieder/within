@@ -238,7 +238,15 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
         &mut workspace,
         true,
         None,
-    )?;
+    )
+    .map_err(|error| match error {
+        // Keep the owning API's historical variant and diagnostic text.
+        SolveError::NonFiniteResidualNorm { value_bits } => invalid_input(format!(
+            "warm-start residual b - A·x0 has non-finite norm {}",
+            f64::from_bits(value_bits)
+        )),
+        other => other,
+    })?;
     let diagnostics = result.diagnostics;
     Ok(diagnostics.into_owned(workspace.into_x()))
 }

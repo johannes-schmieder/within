@@ -73,6 +73,12 @@ pub enum SolveError {
     /// A workspace reservation failed; previously reserved arrays are released.
     #[error("LSMR workspace allocation failed")]
     WorkspaceAllocation,
+    /// A prepared recurrence rejected an unrepresentable residual norm.
+    #[error("prepared LSMR residual norm is non-finite")]
+    NonFiniteResidualNorm {
+        /// Exact IEEE-754 norm bits, preserving error equality without allocating text.
+        value_bits: u64,
+    },
     /// A local subdomain solve failed during a preconditioner apply.
     #[error("subdomain {subdomain} local solve failed: {source}")]
     LocalSolveFailed {
