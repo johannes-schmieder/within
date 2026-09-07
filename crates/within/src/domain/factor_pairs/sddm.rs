@@ -397,7 +397,16 @@ fn folding_signs(cross_tab: &CrossTab) -> Option<Vec<f64>> {
 
 fn adjacency_sums(cross_tab: &CrossTab) -> Vec<f64> {
     (0..cross_tab.n_local())
-        .map(|i| cross_tab.neighbors(i).map(|(_, v)| v).sum())
+        .map(|i| {
+            let (block, row) = if i < cross_tab.n_rows() {
+                (&cross_tab.c, i)
+            } else {
+                (&cross_tab.ct, i - cross_tab.n_rows())
+            };
+            crate::block_elim::compensated_sum(
+                &block.data[block.indptr[row] as usize..block.indptr[row + 1] as usize],
+            )
+        })
         .collect()
 }
 

@@ -74,6 +74,17 @@ The crate is organized in four layers:
 4. **`orchestrate`** — End-to-end solve entry points (`solve`, `solve_batch`)
    with typed configuration (`LsmrOptions`, `PreconditionerConfig`).
 
+## Weighted assembly memory
+
+Weighted intercept-pair construction uses compensated sums for both cross-tab
+cells and independently accumulated diagonals. The Laplacian consistency
+budget is unchanged. Structural unit weights and pairs containing slope
+channels retain their existing accumulation paths. For a weighted intercept
+pair with `R` and `C` active levels, dense construction temporarily adds
+`8 * (R*C + R + C)` bytes; sparse construction adds `8 * (R + C)` bytes and
+reuses the column corrections for edge sums. These buffers are not retained
+by the solver. Concurrent pair construction must account for each live pair.
+
 ## License
 
 MIT

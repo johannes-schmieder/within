@@ -31,6 +31,133 @@ fn design_of(columns: Vec<Vec<u32>>) -> Design<'static> {
 }
 
 #[test]
+fn weighted_categorical_accumulation_preserves_graph_identity() {
+    // Long high-degree sums and long individual edge sums must both be stable.
+    for (n_rows, n_cols, hub) in [(20, 16, false), (80, 64, true), (1, 1, false)] {
+        let n = 100_000;
+        let rows: Vec<u32> = (0..n)
+            .map(|i| {
+                if hub && (i + 1) % 3 != 0 {
+                    0
+                } else {
+                    (i % n_rows) as u32
+                }
+            })
+            .collect();
+        let cols: Vec<u32> = (0..n)
+            .map(|i| ((i / n_rows + 7 * i) % n_cols) as u32)
+            .collect();
+        let active =
+            build_compact_mapping(&vec![true; n_rows], &vec![true; n_cols], 0, n_rows).unwrap();
+        for scale in [0.1, 10.123456789] {
+            let weights = vec![scale; n];
+            let inputs = PairColumns {
+                row_levels: &rows,
+                col_levels: &cols,
+                row_load: Unit,
+                col_load: Unit,
+                weights: Some(&weights),
+            };
+            let dense = accumulate_dense_cross_block(inputs, &active);
+            let sparse = accumulate_sparse_cross_block(inputs, &active);
+            assert_eq!(dense.0.indptr, sparse.0.indptr);
+            assert_eq!(dense.0.indices, sparse.0.indices);
+            assert_eq!(dense.0.data, sparse.0.data);
+            assert_eq!(dense.1, sparse.1);
+            assert_eq!(dense.2, sparse.2);
+            let ct = CrossTab {
+                ct: dense.0.transpose(),
+                c: dense.0,
+            };
+            let diagonals: Vec<_> = dense.1.iter().chain(&dense.2).copied().collect();
+            let mismatch: f64 = diagonals
+                .iter()
+                .enumerate()
+                .map(|(i, d)| (d - ct.neighbors(i).map(|(_, v)| v).sum::<f64>()).abs())
+                .sum();
+            let budget = 64.0
+                * f64::EPSILON
+                * ((n_rows + n_cols) as f64).sqrt()
+                * diagonals.iter().sum::<f64>();
+            assert!(
+                mismatch <= budget,
+                "{n_rows}/{n_cols}/{scale}: {mismatch} > {budget}"
+            );
+            // Counts times a constant are independent of the accumulation recurrence.
+            for (row, &d) in dense.1.iter().enumerate() {
+                let expected = rows.iter().filter(|&&r| r as usize == row).count() as f64 * scale;
+                assert!((d - expected).abs() <= 2.0 * f64::EPSILON * expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn weighted_categorical_accumulation_retains_small_positive_weights() {
+    let n = 100_001;
+    let rows = vec![0; n];
+    let cols: Vec<u32> = (0..n).map(|i| (i % 2) as u32).collect();
+    let mut weights = vec![1.0; n];
+    weights[0] = 1e16;
+    let active = build_compact_mapping(&[true], &[true, true], 0, 1).unwrap();
+    let inputs = PairColumns {
+        row_levels: &rows,
+        col_levels: &cols,
+        row_load: Unit,
+        col_load: Unit,
+        weights: Some(&weights),
+    };
+    for (c, row, col) in [
+        accumulate_dense_cross_block(inputs, &active),
+        accumulate_sparse_cross_block(inputs, &active),
+    ] {
+        assert_eq!(row, vec![1e16 + 100_000.0]);
+        assert_eq!(col, vec![1e16 + 50_000.0, 50_000.0]);
+        assert_eq!(c.data, col);
+    }
+}
+
+#[test]
+fn weighted_categorical_accumulation_matches_exact_binary_oracle() {
+    let n = 100_000;
+    let rows: Vec<u32> = (0..n).map(|i| (i % 7) as u32).collect();
+    let cols: Vec<u32> = (0..n).map(|i| ((i / 7) % 5) as u32).collect();
+    let weights: Vec<f64> = (0..n).map(|i| 2.0_f64.powi((i % 41) - 20)).collect();
+    let mut exact_rows = [0_u128; 7];
+    let mut exact_cols = [0_u128; 5];
+    let mut exact_cells = [0_u128; 35];
+    for i in 0..n as usize {
+        let value = 1_u128 << (i % 41);
+        let row = rows[i] as usize;
+        let col = cols[i] as usize;
+        exact_rows[row] += value;
+        exact_cols[col] += value;
+        exact_cells[row * 5 + col] += value;
+    }
+    let active = build_compact_mapping(&[true; 7], &[true; 5], 0, 7).unwrap();
+    let inputs = PairColumns {
+        row_levels: &rows,
+        col_levels: &cols,
+        row_load: Unit,
+        col_load: Unit,
+        weights: Some(&weights),
+    };
+    for (c, row, col) in [
+        accumulate_dense_cross_block(inputs, &active),
+        accumulate_sparse_cross_block(inputs, &active),
+    ] {
+        for (actual, exact) in row
+            .iter()
+            .zip(exact_rows)
+            .chain(col.iter().zip(exact_cols))
+            .chain(c.data.iter().zip(exact_cells))
+        {
+            assert_eq!(*actual, exact as f64 / 1_048_576.0);
+        }
+    }
+}
+
+#[test]
 fn test_cross_tab_sparse_accumulation_path() {
     // n_rows * n_cols > 5M triggers the sparse path; few observations keep both paths equal.
     let n_obs = 200usize;

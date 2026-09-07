@@ -12,6 +12,80 @@ fn default_params() -> LsmrOptions {
     LsmrOptions::default()
 }
 
+#[test]
+fn weighted_high_degree_schwarz_builds_and_certifies_under_rescaling() {
+    for hub in [false, true] {
+        let n = 1_000_000;
+        let (p, q) = if hub { (80, 64) } else { (20, 16) };
+        let a: Vec<u32> = (0..n)
+            .map(|i| {
+                if hub && (i + 1) % 3 != 0 {
+                    0
+                } else {
+                    (i % p) as u32
+                }
+            })
+            .collect();
+        let b: Vec<u32> = (0..n)
+            .map(|i| {
+                if hub {
+                    (13 * i % q) as u32
+                } else {
+                    ((i / p + 7 * i) % q) as u32
+                }
+            })
+            .collect();
+        let y: Vec<f64> = (0..n).map(|i| (i % 101) as f64 / 100.0).collect();
+        for threads in [1, 7] {
+            let team = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for scale in [1.0, 0.1, 10.123456789] {
+                team.install(|| {
+                    let effects = vec![
+                        Effect::new(&a, true, std::iter::empty::<&[f64]>()).unwrap(),
+                        Effect::new(&b, true, std::iter::empty::<&[f64]>()).unwrap(),
+                    ];
+                    let solver = Solver::new(
+                        effects,
+                        Some(vec![scale; n]),
+                        PreconditionerConfig::default(),
+                    )
+                    .expect("positive categorical graph must build");
+                    let options = LsmrOptions {
+                        tol: 1e-10,
+                        ..Default::default()
+                    };
+                    let fit = solver.solve(&y, &options).unwrap();
+                    assert!(fit.converged);
+                    let input: Vec<_> = (0..p + q).map(|j| (j % 11) as f64 - 5.0).collect();
+                    let mut image = vec![0.0; p + q];
+                    let mut repeat = vec![0.0; p + q];
+                    let preconditioner = solver.preconditioner().unwrap();
+                    preconditioner.apply(&input, &mut image).unwrap();
+                    preconditioner.apply(&input, &mut repeat).unwrap();
+                    assert!(image
+                        .iter()
+                        .zip(&repeat)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()));
+                    let mut score = vec![0.0; p + q];
+                    let mut count = vec![0; p + q];
+                    for i in 0..n {
+                        for j in [a[i] as usize, p + b[i] as usize] {
+                            score[j] += fit.demeaned[i];
+                            count[j] += 1;
+                        }
+                    }
+                    for (s, c) in score.into_iter().zip(count) {
+                        assert!(s.abs() <= 1e-8 * c as f64);
+                    }
+                });
+            }
+        }
+    }
+}
+
 fn additive_precond() -> PreconditionerConfig {
     PreconditionerConfig::default()
 }

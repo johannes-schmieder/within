@@ -15,11 +15,13 @@ use crate::domain::Design;
 use super::{to_u32, ActiveLevels};
 use crate::domain::Loading as ColumnLoading;
 
-/// Hard cap on the dense accumulator (~40 MB); larger tables always go sparse.
+/// Above this table size, dispatch compares dense payload with sparse buckets.
+/// Weighted intercept pairs additionally carry an equally sized correction table.
 const DENSE_TABLE_MAX_ENTRIES: usize = 5_000_000;
 
 /// A channel's per-observation loading.
 pub(super) trait Loading: Copy {
+    const UNIT: bool = false;
     fn at(self, uid: usize) -> f64;
 }
 
@@ -28,9 +30,35 @@ pub(super) trait Loading: Copy {
 pub(super) struct Unit;
 
 impl Loading for Unit {
+    const UNIT: bool = true;
     #[inline]
     fn at(self, _uid: usize) -> f64 {
         1.0
+    }
+}
+
+// Weighted intercept pairs must agree with their Laplacian identity even when
+// a level or a single edge accumulates millions of noninteger weights. Slope
+// pairs retain their signed-Gram arithmetic and validation. Empty correction
+// slices preserve the structural unit-weight path without extra allocation.
+#[inline]
+fn add(sum: &mut f64, corrections: &mut [f64], index: usize, value: f64) {
+    if corrections.is_empty() {
+        *sum += value;
+    } else {
+        let next = *sum + value;
+        corrections[index] += if sum.abs() >= value.abs() {
+            (*sum - next) + value
+        } else {
+            (value - next) + *sum
+        };
+        *sum = next;
+    }
+}
+
+fn finish(sums: &mut [f64], corrections: &[f64]) {
+    for (sum, correction) in sums.iter_mut().zip(corrections) {
+        *sum += correction;
     }
 }
 
@@ -177,16 +205,26 @@ pub(super) fn accumulate_dense_cross_block<Lq: Loading, Lr: Loading>(
     let mut row_diag = vec![0.0f64; n_rows];
     let mut col_diag = vec![0.0f64; n_cols];
     let mut table = vec![0.0f64; n_rows * n_cols];
+    let stable = Lq::UNIT && Lr::UNIT && cols.weights.is_some();
+    let mut row_correction = vec![0.0; if stable { n_rows } else { 0 }];
+    let mut col_correction = vec![0.0; if stable { n_cols } else { 0 }];
+    let mut cell_correction = vec![0.0; if stable { table.len() } else { 0 }];
 
     for uid in 0..n_obs {
         let Some(o) = cols.decode(active, uid) else {
             continue;
         };
         debug_assert!(o.cj < n_rows && o.ck < n_cols);
-        row_diag[o.cj] += o.row_diag;
-        col_diag[o.ck] += o.col_diag;
-        table[o.cj * n_cols + o.ck] += o.cell;
+        add(&mut row_diag[o.cj], &mut row_correction, o.cj, o.row_diag);
+        add(&mut col_diag[o.ck], &mut col_correction, o.ck, o.col_diag);
+        let cell = o.cj * n_cols + o.ck;
+        add(&mut table[cell], &mut cell_correction, cell, o.cell);
     }
+
+    finish(&mut row_diag, &row_correction);
+    finish(&mut col_diag, &col_correction);
+    finish(&mut table, &cell_correction);
+    drop((row_correction, col_correction, cell_correction));
 
     let c = CsrBlock::from_dense_table(&table, n_rows, n_cols);
     (c, row_diag, col_diag)
@@ -202,16 +240,23 @@ pub(super) fn accumulate_sparse_cross_block<Lq: Loading, Lr: Loading>(
     let n_cols = active.n_cols;
     let mut row_diag = vec![0.0f64; n_rows];
     let mut col_diag = vec![0.0f64; n_cols];
+    let stable = Lq::UNIT && Lr::UNIT && cols.weights.is_some();
+    let mut row_correction = vec![0.0; if stable { n_rows } else { 0 }];
+    let mut col_correction = vec![0.0; if stable { n_cols } else { 0 }];
 
     let mut row_counts = vec![0u32; n_rows];
     for uid in 0..n_obs {
         let Some(o) = cols.decode(active, uid) else {
             continue;
         };
-        row_diag[o.cj] += o.row_diag;
-        col_diag[o.ck] += o.col_diag;
+        add(&mut row_diag[o.cj], &mut row_correction, o.cj, o.row_diag);
+        add(&mut col_diag[o.ck], &mut col_correction, o.ck, o.col_diag);
         row_counts[o.cj] += 1;
     }
+    finish(&mut row_diag, &row_correction);
+    finish(&mut col_diag, &col_correction);
+    drop(row_correction);
+    col_correction.fill(0.0);
 
     let mut bucket_indptr = vec![0u32; n_rows + 1];
     for i in 0..n_rows {
@@ -247,16 +292,20 @@ pub(super) fn accumulate_sparse_cross_block<Lq: Loading, Lr: Loading>(
             if work[col] == 0.0 {
                 touched.push(to_u32(col));
             }
-            work[col] += bucket_vals[idx];
+            add(&mut work[col], &mut col_correction, col, bucket_vals[idx]);
         }
         touched.sort_unstable();
         for &col in &touched {
-            let v = work[col as usize];
+            let index = col as usize;
+            let v = work[index] + col_correction.get(index).copied().unwrap_or(0.0);
             if v != 0.0 {
                 c_indices.push(col);
                 c_data.push(v);
             }
             work[col as usize] = 0.0;
+            if stable {
+                col_correction[index] = 0.0;
+            }
         }
         c_indptr[row + 1] = to_u32(c_indices.len());
         touched.clear();
