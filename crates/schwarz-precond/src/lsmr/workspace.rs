@@ -299,9 +299,9 @@ pub(super) fn solve<'w, A: OperatorMut + ?Sized, M: OperatorMut + ?Sized>(
     };
     let rhs_norm = vec_norm(rhs);
     if !rhs_norm.is_finite() {
-        return Err(super::invalid_input(format!(
-            "warm-start residual b - A·x0 has non-finite norm {rhs_norm}"
-        )));
+        return Err(SolveError::NonFiniteResidualNorm {
+            value_bits: rhs_norm.to_bits(),
+        });
     }
     let diagnostics = if rhs_norm == 0.0 {
         let stop_reason = if let Some(x0) = options.warm_start {

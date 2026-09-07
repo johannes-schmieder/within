@@ -128,13 +128,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (delta.allocations, delta.reallocations, delta.deallocations),
         (0, 0, 0)
     );
+    // Finite input whose norm overflows, and warm residual overflow, exercise
+    // rejection without entering bidiagonalization. Recovery uses the same arrays.
+    let overflow = vec![f64::MAX; n];
+    let warm = vec![-f64::MAX; n];
+    let zero = vec![0.0; n];
+    let before = GLOBAL.stats();
+    for gated in [false, true] {
+        for (rhs, warm_start) in [(&overflow, None), (&zero, Some(warm.as_slice()))] {
+            let options = MlsmrWorkspaceOptions {
+                warm_start,
+                escalation: None,
+            };
+            let mut gate = |_: &[f64], _: Option<&[f64]>| -> Result<bool, SolveError> {
+                panic!("invalid norm must not reach candidate gate")
+            };
+            let result = if gated {
+                mlsmr_with_workspace_and_candidate_gate(
+                    &mut op, rhs, &mut pre, 1e-10, 100, options, &mut gate, &mut w,
+                )
+            } else {
+                mlsmr_with_workspace(&mut op, rhs, &mut pre, 1e-10, 100, options, &mut w)
+            };
+            assert!(
+                matches!(result, Err(SolveError::NonFiniteResidualNorm { value_bits }) if !f64::from_bits(value_bits).is_finite())
+            );
+            let recovered = mlsmr_with_workspace(
+                &mut op,
+                &b,
+                &mut pre,
+                1e-10,
+                100,
+                MlsmrWorkspaceOptions::default(),
+                &mut w,
+            )?;
+            assert!(recovered.diagnostics.converged);
+            assert!(gradient_ratio(recovered.x) <= 1e-10);
+        }
+    }
+    let delta = GLOBAL.stats() - before;
+    assert_eq!(
+        (delta.allocations, delta.reallocations, delta.deallocations),
+        (0, 0, 0)
+    );
     let before = GLOBAL.stats();
     drop(w);
     let delta = GLOBAL.stats() - before;
     assert_eq!(delta.bytes_deallocated, expected);
     assert_eq!((delta.allocations, delta.reallocations), (0, 0));
     println!(
-        "serial LSMR: first gated/repeat16/error and native/recovery allocations=0; n={n}; retained/released={expected} bytes"
+        "serial LSMR: first gated/repeat16/error and native/recovery/norm-overflow allocations=0; n={n}; retained/released={expected} bytes"
     );
     Ok(())
 }
