@@ -36,6 +36,8 @@ fn axpy_with_sq_norm(y: &mut [f64], x: &[f64], scale: f64) -> f64 {
         y.par_chunks_mut(LSMR_UPDATE_CHUNK)
             .zip(x.par_chunks(LSMR_UPDATE_CHUNK))
             .map(|(y_c, x_c)| seq(y_c, x_c))
+            // One chunk per leaf fixes association independently of worker stealing.
+            .with_max_len(1)
             .sum()
     } else {
         seq(y, x)
@@ -89,6 +91,8 @@ fn par_dot(a: &[f64], b: &[f64]) -> f64 {
         a.par_chunks(LSMR_UPDATE_CHUNK)
             .zip(b.par_chunks(LSMR_UPDATE_CHUNK))
             .map(|(ac, bc)| ac.iter().zip(bc).map(|(x, y)| x * y).sum::<f64>())
+            // One chunk per leaf fixes association independently of worker stealing.
+            .with_max_len(1)
             .sum()
     } else {
         dot(a, b)
