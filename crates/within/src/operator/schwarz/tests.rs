@@ -135,7 +135,12 @@ fn run_block_elim_parallel_reduction_regression_case() {
         )
         .expect("build block-elim atomic preconditioner");
 
-        for _ in 0..4 {
+        // Exercise the explicit serial hint above the concrete CSR/backsolve
+        // parallel thresholds, inside a four-worker caller pool.
+        let mut serial = reduction.inner.try_serial_workspace(usize::MAX).unwrap();
+        let mut z_serial = vec![0.0; n_dofs];
+        let mut first_serial = vec![0.0; n_dofs];
+        for repeat in 0..4 {
             let mut z_reduction = vec![0.0; n_dofs];
             let mut z_atomic = vec![0.0; n_dofs];
             reduction
@@ -144,6 +149,17 @@ fn run_block_elim_parallel_reduction_regression_case() {
             atomic
                 .apply(&rhs, &mut z_atomic)
                 .expect("atomic apply succeeds");
+            serial.apply(&rhs, &mut z_serial).unwrap();
+            if repeat == 0 {
+                first_serial.copy_from_slice(&z_serial);
+            } else {
+                for (a, b) in z_serial.iter().zip(&first_serial) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+            }
+            for (a, b) in z_serial.iter().zip(&z_reduction) {
+                assert!(a.is_finite() && (a - b).abs() <= 1e-9);
+            }
             for (i, (&zr, &za)) in z_reduction.iter().zip(&z_atomic).enumerate() {
                 assert!(
                     zr.is_finite() && za.is_finite(),

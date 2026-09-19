@@ -13,6 +13,9 @@ use crate::domain::Loading;
 use crate::domain::{Design, LocalDomain};
 use crate::{BuildError, BuildWarning};
 
+mod serial;
+pub use serial::SerialPreconditionerWorkspace;
+
 #[cfg(test)]
 mod tests;
 

@@ -99,3 +99,10 @@ MIT
 - Toselli & Widlund (2005). *Domain Decomposition Methods — Algorithms and Theory*. Springer.
 - Smith, Bjørstad & Gropp (1996). *Domain Decomposition: Parallel Multilevel Methods for Elliptic PDEs*. Cambridge University Press.
 - Nicolaides (1987). *Deflation of Conjugate Gradients with Applications to Boundary Value Problems*. SIAM J. Numer. Anal. 24(2).
+
+
+For a caller-owned fixed-order action, `try_serial_workspace(max_requested_bytes)`
+borrows the preconditioner and reserves `8*(n_dofs+2*max_local_scratch)` outer
+array bytes. It implements `OperatorMut`, preserves output on errors and avoids
+the pooled executor. Generic local solvers retain their own allocation/threading
+behavior. See [the precise workspace boundary](../../docs/MULTIWAYMG_WORKSPACE.md).

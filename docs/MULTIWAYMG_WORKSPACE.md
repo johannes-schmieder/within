@@ -148,3 +148,78 @@ overflow, warm residual overflow, and same-workspace successful recovery.
 Rust 1.85 formatting, strict Clippy, all/minimal workspace tests, warning-free
 rustdoc and release all/minimal workspace/allocation checks pass locally.
 Exact-source and PR CI qualification remains before downstream pin integration.
+
+
+## M6o serial Schwarz application
+
+M5's norm-error increment merged as `fad1d462d44e7d5b5226370021d69dab4e854669`.
+The new `SchwarzPreconditioner::try_serial_workspace` borrows its exact immutable
+owner and keeps one array for a V-element transaction result plus two maximum
+local scratch vectors. The maximum includes augmented ground/cover dimensions.
+Requested bytes are `8*(V+2*Smax)`, checked against overflow/Vec representability
+and the caller's requested-payload limit before one fallible reservation. Actual
+capacity is separately reported; owner storage, old pooled buffers, allocator
+rounding/headers and opaque local-factor internals are excluded. This is not yet
+a full terminal budget. Construction of the preconditioner remains unchanged.
+
+`SerialSchwarzWorkspace::apply` visits entries in stored order, passes exact local
+slices and disables the inner-parallelism hint. Immutable core indices validate
+once at binding; each call checks shapes and local scratch bounds before touching
+scratch. It never enters Rayon or the old buffer pool. User output is published
+only after every domain succeeds. Typed static failures allocate no messages;
+local errors retain their existing types and may allocate text. Dirty scratch
+from a failure is reusable. The borrowed owner cannot be substituted or outlived;
+generic local implementations must keep interior numerical state fixed and obey
+their scratch contract. A generic outer executor cannot forbid its local solvers
+from allocating or ignoring the parallelism hint.
+
+`within::SerialPreconditionerWorkspace` hides the private concrete pair solver,
+exposes the same requested/retained payload boundary and implements `OperatorMut`
+for direct prepared-LSMR use. Diagonal actions reserve no array. Existing
+allocating/pooled APIs, factor setup, numerical kernels and solver recurrences
+are unchanged; no dependency version or serialized owner layout changes.
+
+Independent dense assembly and cancellation-order controls cover two-sided
+partition weights, overlapping/uncovered/empty domains, augmentation, static
+rejection, late local failure, dirty-buffer recovery, changed generic scratch,
+checked-size overflow and reservation failure/unwind. Real dense/approximate
+pair tests use unit/dyadic weights, connected, nested, disconnected interleaved
+and unbalanced inputs; compare with one-worker pooled actions, fixed results
+across caller pools and independent concurrent workspaces. The existing 33,792-
+coordinate local fixture also checks the serial action above concrete parallel
+thresholds inside a four-worker caller pool. Isolated executables
+measure first and repeated actions with active allocator controls. Concrete
+setup uses an explicit pool and joins each OS worker handle before the first measured action;
+this avoids unrelated asynchronous worker TLS allocations contaminating a
+process-wide allocator measurement. No action warmup hides first-call costs.
+The initial global-pool and scoped-pool harness failures are retained in external
+qualification logs; explicit OS-thread joins remove the delayed setup activity.
+The small connected recipe was relabeled from the inaccurate "tensor" to "latin"
+without changing its tuples; earlier raw log labels remain untouched.
+
+### Remaining terminal requirements
+
+The pinned approx-chol0.5.0 factor can still allocate an n-vector when it carries
+a permutation; its nested capacities and build/fill peak are not exposed. Passing
+these particular real-factor fixtures does not establish allocation freedom for
+all valid factor provenance. Serial setup, permutation scratch, factor capacity
+statistics and checked Schur/fill admission require a separate dependency change.
+
+Full numerical range is also distinct from structural factor-shift projection.
+An external MultiwayMG audit found dimension12/rank7 support whose two-sided
+structurally projected Schwarz action is symmetric/positive on the quotient,
+yet leaks 0.252389 (unit) / 0.176210 (dyadic weights) outside the numerical range.
+That input requires extra treatment or rejection under the accepted terminal
+gate. A workspace does not resolve this eligibility issue, and certified existing
+LSMR results are not invalidated by it. No sparse terminal, route/default change,
+competitive claim or holdout is introduced by this fork increment.
+
+
+M6o local Rust1.85 format, strict all-target/all-feature Clippy, all/minimal
+workspace tests, warning-free rustdoc and release generic/all/minimal/concrete
+contracts pass. Sixteen real-factor configurations record one exact outer
+reservation (288/360/632 bytes by fixture), zero first/repeated/static-rejection
+allocations and exact drop. The generic n=12,000 action retains 288,016 bytes,
+with zero first/repeated/static/local-error/recovery allocations for its tested
+allocation-free local solver. Source/PR CI qualification precedes fork merge;
+both downstream pins remain unchanged until that merge qualifies.

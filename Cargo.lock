@@ -2075,6 +2075,7 @@ dependencies = [
  "rayon",
  "schwarz-precond 0.4.0",
  "serde",
+ "stats_alloc",
  "thiserror 2.0.19",
 ]
 

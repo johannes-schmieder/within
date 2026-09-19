@@ -109,4 +109,4 @@ pub use lsmr::{
     LsmrWorkspaceResult, MlsmrOptions, MlsmrWorkspace, MlsmrWorkspaceOptions, Progress, Staleness,
     StalenessError,
 };
-pub use schwarz::{ReductionStrategy, SchwarzPreconditioner};
+pub use schwarz::{ReductionStrategy, SchwarzPreconditioner, SerialSchwarzWorkspace};

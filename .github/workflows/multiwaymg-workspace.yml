@@ -47,3 +47,24 @@ jobs:
         run: cargo test --locked --release --manifest-path crates/schwarz-precond/Cargo.toml --all-features --test workspace --test workspace_allocations
       - name: Release minimal
         run: cargo test --locked --release --manifest-path crates/schwarz-precond/Cargo.toml --no-default-features --test workspace --test workspace_allocations
+      - name: Serial Schwarz and concrete within contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir serial-evidence
+          git rev-parse HEAD > serial-evidence/metadata.txt
+          echo "event=${{ github.event_name }} run=${{ github.run_id }}" >> serial-evidence/metadata.txt
+          rustc -Vv >> serial-evidence/metadata.txt
+          cargo -V >> serial-evidence/metadata.txt
+          cargo test --locked --manifest-path crates/schwarz-precond/Cargo.toml --all-features --test serial_schwarz --test serial_schwarz_allocations 2>&1 | tee serial-evidence/schwarz-debug-all.txt
+          cargo test --locked --manifest-path crates/schwarz-precond/Cargo.toml --no-default-features --test serial_schwarz --test serial_schwarz_allocations 2>&1 | tee serial-evidence/schwarz-debug-minimal.txt
+          cargo test --locked --release --manifest-path crates/schwarz-precond/Cargo.toml --all-features --test serial_schwarz --test serial_schwarz_allocations 2>&1 | tee serial-evidence/schwarz-release-all.txt
+          cargo test --locked --release --manifest-path crates/schwarz-precond/Cargo.toml --no-default-features --test serial_schwarz --test serial_schwarz_allocations 2>&1 | tee serial-evidence/schwarz-release-minimal.txt
+          cargo test --locked --manifest-path crates/within/Cargo.toml --all-features --test serial_preconditioner --test serial_preconditioner_allocations 2>&1 | tee serial-evidence/within-debug.txt
+          cargo test --locked --release --manifest-path crates/within/Cargo.toml --all-features --test serial_preconditioner --test serial_preconditioner_allocations 2>&1 | tee serial-evidence/within-release.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serial-schwarz-${{ matrix.os }}
+          path: serial-evidence/
+          if-no-files-found: error
