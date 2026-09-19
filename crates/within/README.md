@@ -84,3 +84,11 @@ MIT
 - Gao, Y., Kyng, R. & Spielman, D. A. (2025). AC(k): Robust Solution of Laplacian Equations by Randomized Approximate Cholesky Factorization. *SIAM Journal on Scientific Computing*.
 - Toselli & Widlund (2005). *Domain Decomposition Methods — Algorithms and Theory*. Springer.
 - Xu, J. (1992). Iterative Methods by Space Decomposition and Subspace Correction. *SIAM Review*, 34(4), 581--613.
+
+
+A retained `Preconditioner` can create an immutable-owner-bound
+`SerialPreconditionerWorkspace` through `try_serial_workspace(max_requested_bytes)`.
+It implements `schwarz_precond::OperatorMut`, uses a fixed domain order and keeps
+output unchanged on errors. The byte limit covers outer scratch, not opaque
+local factors or setup; some factor permutations still allocate internally.
+See [the exact scope and qualification](../../docs/MULTIWAYMG_WORKSPACE.md).

@@ -6,6 +6,8 @@ mod buffers;
 mod executor;
 mod planning;
 mod preconditioner;
+mod serial;
 
 pub use planning::ReductionStrategy;
 pub use preconditioner::SchwarzPreconditioner;
+pub use serial::SerialSchwarzWorkspace;

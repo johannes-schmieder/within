@@ -64,6 +64,39 @@ pub enum LocalSolveError {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SolveError {
+    /// Serial action input/output shape differs from the bound preconditioner.
+    #[error("serial workspace shape mismatch: rhs={rhs}, output={output}, expected={expected}")]
+    SerialWorkspaceShape {
+        /// Submitted input length.
+        rhs: usize,
+        /// Submitted output length.
+        output: usize,
+        /// Bound square operator dimension.
+        expected: usize,
+    },
+    /// A domain's indices or local dimensions violate the serial action contract.
+    #[error("serial workspace domain {subdomain} has invalid dimensions or indices")]
+    SerialWorkspaceInvalidDomain {
+        /// First invalid domain in stored order.
+        subdomain: usize,
+    },
+    /// The checked requested array payload cannot be represented by a Vec.
+    #[error("serial workspace size overflow")]
+    SerialWorkspaceSizeOverflow,
+    /// The requested array payload exceeds the caller's explicit limit.
+    #[error("serial workspace requested payload {required} exceeds limit {limit}")]
+    SerialWorkspaceBudget {
+        /// Checked requested array bytes, excluding the owner and local internals.
+        required: usize,
+        /// Caller-supplied requested-array limit in bytes.
+        limit: usize,
+    },
+    /// A generic local solver's current scratch requirement exceeds its bound storage.
+    #[error("serial workspace dimensions changed after binding")]
+    SerialWorkspaceChanged,
+    /// The single serial workspace reservation failed.
+    #[error("serial workspace allocation failed")]
+    SerialWorkspaceAllocation,
     /// Prepared LSMR storage does not match the requested operator shape.
     #[error("LSMR workspace shape mismatch")]
     WorkspaceMismatch,

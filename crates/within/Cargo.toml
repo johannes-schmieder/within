@@ -21,6 +21,7 @@ rayon.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+stats_alloc = "=0.1.10"
 criterion = { version = "0.7", features = ["html_reports"] }
 rand = "0.10"
 proptest = "1"
@@ -39,3 +40,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[test]]
+name = "serial_preconditioner_allocations"
+harness = false

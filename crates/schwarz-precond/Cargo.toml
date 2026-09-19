@@ -30,3 +30,7 @@ workspace = true
 [[test]]
 name = "workspace_allocations"
 harness = false
+
+[[test]]
+name = "serial_schwarz_allocations"
+harness = false
