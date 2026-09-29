@@ -5,10 +5,12 @@ pub(crate) mod cross_tab;
 mod effect;
 pub(crate) mod factor_pairs;
 pub(crate) mod level_moments;
+mod membership;
 
 pub(crate) use cross_tab::{find_all_active_levels, BlockDiagonals, CrossTab};
 
 pub use effect::Effect;
+pub(crate) use membership::LevelMembership;
 
 pub(crate) use factor_pairs::{
     build_local_domains, CoordinateMap, Grounding, LocalComponent, LocalDomain, MatrixForm,
@@ -16,6 +18,7 @@ pub(crate) use factor_pairs::{
 };
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::channel::Channel;
 use crate::observation::ObservationFrame;
@@ -147,6 +150,7 @@ pub struct Design<'a> {
     /// Columns in internal row order (caller's, or an owned locality-sorted copy).
     pub(crate) frame: ObservationFrame<'a>,
     pub(crate) terms: Vec<TermMeta>,
+    pub(crate) membership: Arc<Vec<LevelMembership>>,
     pub(crate) n_obs: usize,
     pub(crate) n_dofs: usize,
     /// `obs_perm[k]` = caller's original index of the observation at internal position `k`.
@@ -239,9 +243,19 @@ impl<'a> Design<'a> {
             _ => (frame, None),
         };
 
+        let membership = Arc::new(
+            terms
+                .iter()
+                .enumerate()
+                .map(|(q, term)| {
+                    LevelMembership::new(frame.level_column(q), term.n_levels, term.sorted)
+                })
+                .collect(),
+        );
         Ok(Design {
             frame,
             terms,
+            membership,
             n_obs,
             n_dofs: offset,
             obs_perm,
@@ -253,6 +267,7 @@ impl<'a> Design<'a> {
         Design {
             frame: self.frame.into_owned(),
             terms: self.terms,
+            membership: self.membership,
             n_obs: self.n_obs,
             n_dofs: self.n_dofs,
             obs_perm: self.obs_perm,

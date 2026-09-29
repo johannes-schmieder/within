@@ -2050,7 +2050,6 @@ dependencies = [
  "approx-chol",
  "criterion",
  "ndarray",
- "portable-atomic",
  "postcard",
  "proptest",
  "rand 0.10.2",
