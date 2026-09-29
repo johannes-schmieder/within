@@ -307,9 +307,42 @@ impl<'a> Solver<'a> {
         weights: Option<&[f64]>,
         preconditioner: impl Into<PreconditionerInput>,
     ) -> Result<Self, BuildError> {
-        // Whiten the slope columns (if any) before the preconditioner reads them.
-        let prepared = PreparedDesign::new(design.into_design()?, weights)?;
-        let screened = detect_collinear_slopes(&prepared);
+        Self::build(design, weights, preconditioner, false)
+    }
+
+    /// Construct in the caller's raw slope coordinates, without rank truncation.
+    ///
+    /// This skips slope whitening and cross-term alias constraints. It is intended
+    /// for callers that own rank decisions and independently certify the original
+    /// design. Near dependencies can require much tighter iteration tolerances;
+    /// the normal-equation residual alone does not bound forward error. Returned
+    /// `unidentified` lists are empty: identification remains the caller's job.
+    /// Preconditioning and solves use the same kernels as [`Self::new`].
+    pub fn new_raw(
+        design: impl IntoDesign<'a>,
+        weights: Option<&[f64]>,
+        preconditioner: impl Into<PreconditionerInput>,
+    ) -> Result<Self, BuildError> {
+        Self::build(design, weights, preconditioner, true)
+    }
+
+    fn build(
+        design: impl IntoDesign<'a>,
+        weights: Option<&[f64]>,
+        preconditioner: impl Into<PreconditionerInput>,
+        raw: bool,
+    ) -> Result<Self, BuildError> {
+        let design = design.into_design()?;
+        let prepared = if raw {
+            PreparedDesign::new_raw(design, weights)?
+        } else {
+            PreparedDesign::new(design, weights)?
+        };
+        let screened = if raw {
+            Vec::new()
+        } else {
+            detect_collinear_slopes(&prepared)
+        };
         let mut warnings: Vec<BuildWarning> = screened.iter().map(CollinearSlope::warn).collect();
         let n_dofs = prepared.design.n_dofs;
 

@@ -37,12 +37,26 @@ impl<'p> PreparedTerm<'p> {
 
 impl<'a> PreparedDesign<'a> {
     pub(crate) fn new(design: Design<'a>, weights: Option<&[f64]>) -> Result<Self, BuildError> {
+        Self::prepare(design, weights, false)
+    }
+
+    pub(crate) fn new_raw(design: Design<'a>, weights: Option<&[f64]>) -> Result<Self, BuildError> {
+        Self::prepare(design, weights, true)
+    }
+
+    fn prepare(design: Design<'a>, weights: Option<&[f64]>, raw: bool) -> Result<Self, BuildError> {
         let sqrt_weights = weights
             .map(|weights| prepare_sqrt_weights(&design, weights))
             .transpose()?;
         let reparams: Vec<Option<TermReparam>> = (0..design.n_factors())
             .into_par_iter()
-            .map(|t| TermReparam::build(&design, t, sqrt_weights.as_deref()))
+            .map(|t| {
+                if raw {
+                    TermReparam::raw(&design.terms[t])
+                } else {
+                    TermReparam::build(&design, t, sqrt_weights.as_deref())
+                }
+            })
             .collect();
         let diagonals = (0..design.n_factors()).map(|_| OnceLock::new()).collect();
         Ok(Self {
