@@ -1,5 +1,7 @@
 //! Solve behaviors: preconditioning, rank, and local reorthogonalization.
 
+use rstest::rstest;
+
 use super::super::*;
 use crate::lsmr::fixtures::*;
 use crate::{Operator, SolveError};
@@ -171,6 +173,32 @@ fn test_mlsmr_rank_deficient_system() {
     assert!(result.converged);
     assert!(((result.x[0] + result.x[1]) - 3.0).abs() < 1e-10);
     assert!(normal_equation_residual(&RankDeficientOp, &result.x, &b) < 1e-10);
+}
+
+/// `M⁻¹` must be nonsingular; the true-residual audit cannot see a direction it removed.
+#[rstest]
+#[case(&[1.0, 0.0])]
+#[case(&[1.0, 1.0, 0.0])]
+#[case(&[1e20, 0.0])]
+fn a_singular_preconditioner_certifies_the_direction_it_annihilates(#[case] m: &[f64]) {
+    let a = IdentityOp { n: m.len() };
+    let b = vec![1.0; m.len()];
+    let result = mlsmr(
+        &a,
+        &b,
+        &DiagOp(m.to_vec()),
+        1e-10,
+        100,
+        MlsmrOptions::default(),
+    )
+    .expect("singular-preconditioner solve");
+
+    assert!(result.converged, "{:?}", result.stop_reason);
+    let residual = normal_equation_residual(&a, &result.x, &b);
+    assert!(
+        (residual - 1.0).abs() < 1e-9,
+        "normal-equation residual: {residual}"
+    );
 }
 
 #[test]
@@ -402,11 +430,13 @@ fn test_mlsmr_local_reorth_preconditioned() {
     );
 }
 
-/// Window sizes at the boundaries of useful values: `Some(1)` (degenerate
-/// ring of one), `Some(12)` (= number of columns), `Some(13)` (= cols + 1).
-/// All three must converge and produce a small normal-equation residual.
-#[test]
-fn test_mlsmr_local_reorth_window_boundary_sizes() {
+/// Window sizes at the boundaries of useful values; each must converge to a small
+/// normal-equation residual.
+#[rstest]
+#[case::ring_of_one(1)]
+#[case::cols(12)]
+#[case::cols_plus_one(13)]
+fn test_mlsmr_local_reorth_window_boundary_sizes(#[case] window_size: usize) {
     let op = DenseOp::vandermonde(30, 12);
     let b: Vec<f64> = (0..op.rows)
         .map(|i| {
@@ -415,18 +445,183 @@ fn test_mlsmr_local_reorth_window_boundary_sizes() {
         })
         .collect();
 
-    // Budget of 200 iterations gives `Some(1)` (which degenerates to no real
-    // reorthogonalization) enough room to converge on this cond ≈ 1e10 system,
-    // while still being a small bounded budget for the larger window sizes.
-    for window_size in [Some(1usize), Some(12), Some(13)] {
-        let result = lsmr(&op, &b, 1e-9, 200, window_size).expect("lsmr boundary-window solve");
-        assert!(
-            result.converged,
-            "did not converge with window {window_size:?}"
-        );
-        assert!(
-            normal_equation_residual(&op, &result.x, &b) < 1e-6,
-            "normal-eq residual too large with window {window_size:?}",
-        );
+    // 200 iterations lets a ring of one (no real reorthogonalization) converge at cond ≈ 1e10.
+    let result = lsmr(&op, &b, 1e-9, 200, Some(window_size)).expect("lsmr boundary-window solve");
+    assert!(result.converged);
+    assert!(
+        normal_equation_residual(&op, &result.x, &b) < 1e-6,
+        "normal-eq residual too large with window {window_size}",
+    );
+}
+
+/// `α² + β²` overflows for an operator this large, and an infinite `‖A‖` estimate divides the
+/// normal-equation ratio to zero, which certifies any residual.
+#[test]
+fn an_overflowing_operator_norm_estimate_does_not_certify_a_stop() {
+    let a = DiagOp(vec![1.2e154, 1e154]);
+    let result = lsmr(&a, &[1.0, 1.0], 1e-10, 100, None).expect("extreme-scale solve");
+
+    assert!(result.converged);
+    // The refused stop sat at 0.254 after one iteration.
+    assert!(
+        result.residual_norm < 1e-10,
+        "residual norm: {}",
+        result.residual_norm
+    );
+}
+
+/// `‖Aᵀb‖` far below `‖b‖` leaves only the backward-error leg; the plain audit must use it too.
+#[test]
+fn a_response_nearly_orthogonal_to_the_design_certifies_under_an_identity_preconditioner() {
+    let op = DenseOp {
+        rows: 3,
+        cols: 2,
+        data: vec![1.0, 0.0, 0.0, 1e-2, 0.0, 0.0],
+    };
+    let b = vec![1e-12, 1e-12, 1.0];
+    let plain = lsmr(&op, &b, 1e-10, 50, None).expect("lsmr solve");
+    let id = mlsmr(
+        &op,
+        &b,
+        &IdentityOp { n: op.cols },
+        1e-10,
+        50,
+        MlsmrOptions::default(),
+    )
+    .expect("identity-preconditioned solve");
+    assert!(plain.converged);
+    assert_eq!(id.converged, plain.converged);
+    assert_eq!(id.stop_reason, plain.stop_reason);
+}
+
+/// The plain audit's reference is `‖Aᵀb‖`; a metric one rescales it and refuses an honest stop.
+#[test]
+fn a_rescaling_preconditioner_does_not_deflate_the_plain_audit_reference() {
+    let op = DenseOp {
+        rows: 3,
+        cols: 2,
+        data: vec![1e6, 0.0, 0.0, 1e-3, 0.0, 0.0],
+    };
+    let m = DiagOp(vec![1e-12, 1e-16]);
+    let r = mlsmr(
+        &op,
+        &[1.0, 1.0, 1.0],
+        &m,
+        1e-10,
+        50,
+        MlsmrOptions::default(),
+    )
+    .expect("rescaled solve");
+    assert!(r.converged, "stop_reason: {:?}", r.stop_reason);
+}
+
+/// An absolute `ε` floor on `ρρ̄` would drop the whole update on a design with `‖A‖ ≈ 1e-9`.
+#[test]
+fn a_small_normed_design_still_gets_its_solution_update() {
+    let op = DenseOp {
+        rows: 2,
+        cols: 1,
+        data: vec![1e-9, 0.0],
+    };
+    let r = lsmr(&op, &[1e-5, 1.0], 1e-10, 1, None).expect("small-normed solve");
+    assert!(r.converged, "stop_reason: {:?}", r.stop_reason);
+    assert!((r.x[0] / 1e4 - 1.0).abs() < 1e-9, "{:?}", r.x);
+}
+
+/// `ζ/(ρρ̄)` rounds to zero below `2^-1074` although `β₁` scales it back to a normal `x`.
+#[rstest]
+#[case::overflowing_rhs(960, 1023)]
+#[case::dominant_miss(23, 80)]
+fn the_solution_update_survives_its_unit_rhs_underflowing(
+    #[case] fit_exp: i32,
+    #[case] miss_exp: i32,
+) {
+    let op = DenseOp {
+        rows: 2,
+        cols: 1,
+        data: vec![2f64.powi(1023), 0.0],
+    };
+    let b = [2f64.powi(fit_exp), 2f64.powi(miss_exp)];
+    let r = lsmr(&op, &b, 1e-10, 10, None).expect("extreme solve");
+    assert!(r.converged, "stop_reason: {:?}", r.stop_reason);
+    let want = 2f64.powi(fit_exp - 1023);
+    assert!(
+        (r.x[0] / want - 1.0).abs() < 1e-12,
+        "{:e} vs {want:e}",
+        r.x[0]
+    );
+}
+
+/// A budget stop's `‖r_k‖` is the returned iterate's own, not LSQR's `|φ̄_k|`.
+#[rstest]
+fn the_residual_estimate_is_the_iterates_own(#[values(2, 4, 8)] maxiter: usize) {
+    let (op, b) = vandermonde_ls();
+    let r = lsmr(&op, &b, 1e-14, maxiter, None).expect("budget solve");
+    assert_eq!(r.stop_reason, LsmrStopReason::MaxIterations);
+
+    let mut residual = vec![0.0; b.len()];
+    op.apply(&r.x, &mut residual).expect("apply");
+    for (ri, &bi) in residual.iter_mut().zip(&b) {
+        *ri = bi - *ri;
+    }
+    let recomputed = vec_norm(&residual);
+    assert!(
+        (r.residual_norm / recomputed - 1.0).abs() < 1e-8,
+        "estimate {:e} vs recomputed {recomputed:e}",
+        r.residual_norm
+    );
+}
+
+/// Power-of-two scaling is exact, so an extreme `‖A‖` or `‖b‖` must reproduce the unit-scale solve.
+#[rstest]
+#[case::small_design(-560, 0)]
+#[case::small_product(-560, -470)]
+#[case::large_design(530, 0)]
+#[case::large_product(530, 500)]
+fn a_power_of_two_scaling_reproduces_the_unit_scale_solve(
+    #[case] design_exp: i32,
+    #[case] rhs_exp: i32,
+    #[values(false, true)] metric: bool,
+) {
+    let solve = |op: &DenseOp, b: &[f64]| {
+        let identity = IdentityOp { n: op.cols };
+        match metric {
+            false => lsmr(op, b, 1e-4, 100, None),
+            true => mlsmr(op, b, &identity, 1e-4, 100, MlsmrOptions::default()),
+        }
+        .expect("scaled solve")
+    };
+    // Conditioned well enough that one rounding apart stays far below the checked agreement.
+    let op = DenseOp::vandermonde(30, 6);
+    // A sawtooth no low-degree polynomial fits keeps the residual far above the tolerance.
+    let b: Vec<f64> = (0..op.rows)
+        .map(|i| (1.0 + i as f64 / (op.rows - 1) as f64).ln() + 0.1 * (-1f64).powi(i as i32))
+        .collect();
+    let unit = solve(&op, &b);
+    assert_eq!(unit.stop_reason, LsmrStopReason::NormalEquationTolerance);
+
+    let (s, t) = (2f64.powi(design_exp), 2f64.powi(rhs_exp));
+    let scaled_op = DenseOp {
+        data: op.data.iter().map(|a| a * s).collect(),
+        ..op
+    };
+    let scaled_b: Vec<f64> = b.iter().map(|bi| bi * t).collect();
+    let r = solve(&scaled_op, &scaled_b);
+
+    assert_eq!(
+        (r.stop_reason, r.iterations),
+        (unit.stop_reason, unit.iterations)
+    );
+    assert!(r.converged);
+    assert!((r.residual_norm / t / unit.residual_norm - 1.0).abs() < 1e-10);
+    assert!(
+        (r.normal_eq_residual / unit.normal_eq_residual - 1.0).abs() < 1e-6,
+        "{:e} vs {:e}",
+        r.normal_eq_residual,
+        unit.normal_eq_residual
+    );
+    let x_max = unit.x.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    for (xi, ui) in r.x.iter().zip(&unit.x) {
+        assert!((xi * s / t - ui).abs() < 1e-8 * x_max, "{:?}", r.x);
     }
 }

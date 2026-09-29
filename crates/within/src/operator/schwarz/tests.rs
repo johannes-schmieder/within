@@ -10,17 +10,18 @@ use crate::config::{
 use schwarz_precond::SubdomainCore;
 
 use crate::csr_block::CsrBlock;
-use crate::domain::{build_local_domains, Design, LocalDomain};
+use crate::domain::{build_local_domains, LocalDomain, PreparedDesign};
 use crate::domain::{CrossTab, LocalComponent};
-use crate::operator::schwarz::build_additive_with_strategy;
+use crate::operator::schwarz::{build_additive, SchwarzConfig};
 use schwarz_precond::{LocalSolver, Operator, ReductionStrategy};
 
 const BLOCK_ELIM_NESTED_RAYON_CHILD_ENV: &str = "WITHIN_TEST_BLOCK_ELIM_NESTED_RAYON_CHILD";
 
-fn make_test_data() -> (Design<'static>, Vec<LocalDomain>) {
-    let design = Design::from_levels_for_test(vec![vec![0, 1, 0, 1, 2], vec![0, 0, 1, 1, 0]]);
-    let (domain_pairs, _) = build_local_domains(&design, None, &LocalSolverConfig::default())
-        .expect("plain domains build");
+fn make_test_data() -> (PreparedDesign<'static>, Vec<LocalDomain>) {
+    let design =
+        PreparedDesign::from_levels_for_test(vec![vec![0, 1, 0, 1, 2], vec![0, 0, 1, 1, 0]]);
+    let (domain_pairs, _) =
+        build_local_domains(&design, &LocalSolverConfig::default()).expect("plain domains build");
     (design, domain_pairs)
 }
 
@@ -70,9 +71,8 @@ fn synthetic_sparse_cross_tab(n_keep: usize, elim_ratio: usize) -> (CrossTab, Ve
         nrows: n_rows,
         ncols: n_cols,
     };
-    let ct = c.transpose();
     (
-        CrossTab { c, ct },
+        CrossTab::eager(c),
         row_diag.into_iter().chain(col_diag).collect(),
     )
 }
@@ -120,17 +120,21 @@ fn run_block_elim_parallel_reduction_regression_case() {
         .build()
         .expect("test rayon pool");
     pool.install(|| {
-        let reduction = build_additive_with_strategy(
+        let reduction = build_additive(
             domain_pairs,
-            &config,
-            ReductionStrategy::ParallelReduction,
+            &SchwarzConfig {
+                local_solver: config.clone(),
+                reduction: ReductionStrategy::ParallelReduction,
+            },
             n_dofs,
         )
         .expect("build block-elim additive preconditioner");
-        let atomic = build_additive_with_strategy(
+        let atomic = build_additive(
             domain_pairs_atomic,
-            &config,
-            ReductionStrategy::AtomicScatter,
+            &SchwarzConfig {
+                local_solver: config.clone(),
+                reduction: ReductionStrategy::AtomicScatter,
+            },
             n_dofs,
         )
         .expect("build block-elim atomic preconditioner");
@@ -201,14 +205,16 @@ fn test_block_elim_parallel_reduction_nested_rayon_does_not_deadlock() {
 }
 
 #[test]
-fn test_build_additive_with_strategy() {
+fn test_build_additive() {
     let (design, domain_pairs) = make_test_data();
-    let config = LocalSolverConfig::default();
-    let strategy = schwarz_precond::ReductionStrategy::default();
-    let schwarz = build_additive_with_strategy(domain_pairs, &config, strategy, design.n_dofs)
+    let config = SchwarzConfig {
+        local_solver: LocalSolverConfig::default(),
+        reduction: ReductionStrategy::default(),
+    };
+    let schwarz = build_additive(domain_pairs, &config, design.design.n_dofs)
         .expect("build schwarz with explicit domains");
-    let r = vec![1.0; design.n_dofs];
-    let mut z = vec![0.0; design.n_dofs];
+    let r = vec![1.0; design.design.n_dofs];
+    let mut z = vec![0.0; design.design.n_dofs];
     schwarz.apply(&r, &mut z).expect("schwarz apply succeeds");
 }
 

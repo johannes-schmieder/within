@@ -12,7 +12,8 @@ class PreconditionerConfig:
     """Preconditioner configuration for the LSMR solver.
 
     A tagged union: each variant is a subclass. Construct with ``Off()``,
-    ``Diagonal()``, or ``Additive(local_solver=..., reduction=...)``. Instances
+    ``Diagonal()``, ``Additive(local_solver=..., reduction=...)``, or
+    ``Adaptive(local_solver=..., reduction=..., stall=...)``. Instances
     compare by value and support ``match``/``case``.
     """
 
@@ -36,6 +37,42 @@ class PreconditionerConfig:
             local_solver: LocalSolverConfig = ...,
             reduction: ReductionStrategy = ...,
         ) -> None: ...
+
+    class Adaptive(PreconditionerConfig):
+        """Diagonal first, escalating to additive Schwarz on a stalled contraction.
+
+        The factorization is built only at the moment of escalation, so a design
+        whose diagonal solve never stalls never pays to construct it. A build
+        error therefore surfaces from :meth:`Solver.solve`, not the constructor.
+        """
+
+        local_solver: LocalSolverConfig
+        reduction: ReductionStrategy
+        stall: Staleness
+        def __init__(
+            self,
+            local_solver: LocalSolverConfig = ...,
+            reduction: ReductionStrategy = ...,
+            stall: Staleness = ...,
+        ) -> None: ...
+
+class Staleness:
+    """Escalates after ``window`` consecutive contraction ratios exceed ``threshold``.
+
+    Defaults to ``window=4``, ``threshold=0.7``. Raises ``ValueError`` for a zero
+    window or a threshold outside ``[0, 1)``.
+    """
+
+    @property
+    def window(self) -> int: ...
+    @property
+    def threshold(self) -> float: ...
+    def __init__(
+        self,
+        window: int | None = None,
+        threshold: float | None = None,
+    ) -> None: ...
+    def __repr__(self) -> str: ...
 
 class ReductionStrategy:
     """Strategy for combining subdomain contributions in additive Schwarz.
@@ -90,7 +127,7 @@ class UnidentifiedDirection:
 
     Attributes:
         term: Index into the design's term list.
-        level: Level index within the term (``0..n_levels``).
+        level: Caller-visible factor label.
         column: Column within the term's per-level block — intercept first
             (when present), then slopes in declaration order.
     """
@@ -122,12 +159,12 @@ class SolveResult:
     """Result of a single fixed-effects solve.
 
     Attributes:
-        x: Fixed-effect coefficients, shape ``(n_dofs,)``. Term-major:
-            coefficient column ``c`` of level ``level`` sits at
-            ``term_offset + c * n_levels + level``, columns ordered
-            ``[intercept?, slopes...]`` (for plain factors: all levels of
-            factor 0 first, then factor 1, etc.). Slots for unidentified
-            directions hold the minimal-norm value ``0``, never NaN.
+        x: Fixed-effect coefficients, shape ``(n_dofs,)``. Term-major by
+            compact level position ``p``: coefficient column ``c`` sits at
+            ``term_offset + c * n_levels + p``, with columns ordered
+            ``[intercept?, slopes...]``. Use ``layout`` to translate caller
+            labels to these slots. Slots for unidentified directions hold the
+            minimal-norm value ``0``, never NaN.
         unidentified: Per-level directions the data cannot identify, as
             :class:`UnidentifiedDirection` records.
         layout: Address <-> flat-``x``-index translation for the coefficients.
@@ -138,7 +175,9 @@ class SolveResult:
         residual: Relative normal-equation residual
             ``||D^T W (y - Dx)|| / ||D^T W y||`` estimated from the LSMR
             recurrence at no extra cost. Exact for an unpreconditioned solve;
-            measured in the preconditioner's metric otherwise.
+            measured in the preconditioner's metric otherwise. An ``Adaptive``
+            hand-off is rebased onto the original response, so the escalating
+            solve reports on the same footing as a cold one.
         time_total: Wall-clock time for the entire solve (setup + solve), in seconds.
         time_setup: Wall-clock time for the setup phase (operator + preconditioner
             construction), in seconds.
@@ -222,8 +261,20 @@ class Effect:
         slopes: list[NDArray[np.float64]] | None = None,
     ) -> None: ...
 
+class Design:
+    """Persistent fixed-effects design.
+
+    Constructs and owns the native observation storage for reuse across solvers.
+    """
+
+    def __init__(self, design: Design | NDArray[np.uint32] | list[Effect]) -> None: ...
+    @property
+    def n_obs(self) -> int: ...
+    @property
+    def n_dofs(self) -> int: ...
+
 def solve(
-    design: NDArray[np.uint32] | list[Effect],
+    design: Design | NDArray[np.uint32] | list[Effect],
     y: NDArray[np.float64],
     weights: NDArray[np.float64] | None = None,
     options: LsmrOptions | None = None,
@@ -236,17 +287,20 @@ def solve(
     implied by ``categories`` and ``W`` is the diagonal weight matrix.
 
     Args:
-        design: Either a ``(n_obs, n_factors)`` ``uint32`` array of factor
-            assignments (F-contiguous for best performance; a ``UserWarning``
-            is emitted otherwise), or a list of :class:`Effect` terms.
+        design: A persistent :class:`Design`, a ``(n_obs, n_factors)``
+            ``uint32`` array of factor assignments (F-contiguous for best
+            performance; a ``UserWarning`` is emitted otherwise), or a list of
+            :class:`Effect` terms.
         y: Response vector, shape ``(n_obs,)``, dtype ``float64``.
         weights: Observation weights, shape ``(n_obs,)``, dtype ``float64``.
             Default: unit weights (unweighted).
         options: LSMR solver tuning. Pass ``LsmrOptions(...)`` to override
             defaults. Default: ``LsmrOptions(tol=1e-8, maxiter=1000)``.
         preconditioner: Controls preconditioning. Accepted forms:
-            ``None`` (default) builds the additive Schwarz preconditioner with
-            default settings. ``PreconditionerConfig.Off()`` disables it.
+            ``None`` (the default) is ``PreconditionerConfig.Adaptive()``,
+            which starts on the diagonal and escalates to additive Schwarz on
+            a stalled contraction; pass ``Adaptive(...)`` to tune it.
+            ``PreconditionerConfig.Off()`` disables it.
             ``PreconditionerConfig.Diagonal()`` uses diagonal/Jacobi scaling.
             ``PreconditionerConfig.Additive(...)`` overrides the local-solver /
             reduction settings. A previously-built ``Preconditioner`` instance
@@ -283,7 +337,7 @@ def solve(
     ...
 
 def solve_batch(
-    design: NDArray[np.uint32] | list[Effect],
+    design: Design | NDArray[np.uint32] | list[Effect],
     Y: NDArray[np.float64],
     weights: NDArray[np.float64] | None = None,
     options: LsmrOptions | None = None,
@@ -295,9 +349,10 @@ def solve_batch(
     the setup phase (preconditioner construction).
 
     Args:
-        design: Either a ``(n_obs, n_factors)`` ``uint32`` array of factor
-            assignments (F-contiguous for best performance; a ``UserWarning``
-            is emitted otherwise), or a list of :class:`Effect` terms.
+        design: A persistent :class:`Design`, a ``(n_obs, n_factors)``
+            ``uint32`` array of factor assignments (F-contiguous for best
+            performance; a ``UserWarning`` is emitted otherwise), or a list of
+            :class:`Effect` terms.
         Y: Response matrix, shape ``(n_obs, k)``, dtype ``float64``. Each column
             is a separate response vector.
         weights: Observation weights. Default: unit weights.
@@ -319,7 +374,8 @@ def solve_batch(
 class Preconditioner:
     """Pre-built fixed-effects preconditioner.
 
-    Built once per design and reused across solves via the persistent
+    Built once per design, at construction or (under ``Adaptive``) at
+    escalation, and reused across solves via the persistent
     :class:`Solver`. Pickleable for offline construction; can also be
     deserialised manually via ``Preconditioner(bytes_payload)`` (the same
     payload produced by ``__reduce__`` / ``pickle.dumps``).
@@ -349,7 +405,7 @@ class Solver:
 
     def __init__(
         self,
-        design: NDArray[np.uint32] | list[Effect],
+        design: Design | NDArray[np.uint32] | list[Effect],
         weights: NDArray[np.float64] | None = None,
         preconditioner: (PreconditionerConfig | Preconditioner | None) = None,
     ) -> None: ...
@@ -369,7 +425,15 @@ class Solver:
         ...
     @property
     def preconditioner(self) -> Preconditioner | None:
-        """Access the cached preconditioner (for serialization or reuse)."""
+        """The preconditioner in use, for serialization or reuse.
+
+        Under ``Adaptive`` this is the Schwarz map once built, and before that
+        the diagonal base carrying the ladder, which escalates when reused.
+        """
+        ...
+    @property
+    def has_escalated(self) -> bool:
+        """Whether an ``Adaptive`` solve has handed off to Schwarz."""
         ...
     @property
     def n_dofs(self) -> int: ...

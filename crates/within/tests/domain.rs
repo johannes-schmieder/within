@@ -2,15 +2,18 @@
 //! public `solve` API for designs that exercise partition-of-unity weights
 //! and disconnected bipartite structure.
 
-use within::observation::ObservationFrame;
 use within::Design;
+
+#[path = "common/orchestrate_helpers.rs"]
+mod common;
+use common::additive;
 
 // Three-factor design: shared DOFs across factor pairs force NonUniform
 // partition weights; verified via the public solve API.
 
 #[test]
 fn test_three_factor_design_solve_converges() {
-    use within::{solve, LsmrOptions, PreconditionerConfig};
+    use within::{solve, LsmrOptions};
 
     let n_obs = 60;
     let n_lev = 5usize;
@@ -18,9 +21,7 @@ fn test_three_factor_design_solve_converges() {
     let fb: Vec<u32> = (0..n_obs).map(|i| ((i / n_lev) % n_lev) as u32).collect();
     let fc: Vec<u32> = (0..n_obs).map(|i| ((i * 3) % n_lev) as u32).collect();
 
-    let frame = ObservationFrame::new(vec![fa.into(), fb.into(), fc.into()], Vec::new())
-        .expect("valid 3-factor frame");
-    let dm = Design::from_frame(frame).expect("valid 3-factor design");
+    let dm = common::make_design(vec![fa, fb, fc]).expect("valid 3-factor design");
 
     assert_eq!(dm.n_factors(), 3);
 
@@ -39,7 +40,7 @@ fn test_three_factor_design_solve_converges() {
         maxiter: 500,
         ..LsmrOptions::default()
     };
-    let precond = PreconditionerConfig::default();
+    let precond = additive();
     let result = solve(cats.view(), &y, None, &params, &precond).expect("solve should not error");
 
     assert!(
@@ -58,7 +59,7 @@ fn test_three_factor_design_solve_converges() {
 /// 2 subdomains — correctness is validated indirectly through convergence.
 #[test]
 fn test_disconnected_design_larger_converges() {
-    use within::{solve, LsmrOptions, PreconditionerConfig};
+    use within::{solve, LsmrOptions};
 
     let fa = [0u32, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3];
     let fb = [0u32, 1, 2, 0, 1, 2, 3, 4, 5, 3, 4, 5];
@@ -77,7 +78,7 @@ fn test_disconnected_design_larger_converges() {
         maxiter: 500,
         ..LsmrOptions::default()
     };
-    let precond = PreconditionerConfig::default();
+    let precond = additive();
     let result = solve(cats.view(), &y, None, &params, &precond).expect("solve should not error");
 
     assert!(
@@ -89,7 +90,7 @@ fn test_disconnected_design_larger_converges() {
 
 #[test]
 fn test_disconnected_design_solve_converges() {
-    use within::{solve, LsmrOptions, PreconditionerConfig};
+    use within::{solve, LsmrOptions};
 
     let n_obs = 4;
     let mut cats = ndarray::Array2::<u32>::zeros((n_obs, 2));
@@ -109,7 +110,7 @@ fn test_disconnected_design_solve_converges() {
         maxiter: 500,
         ..LsmrOptions::default()
     };
-    let precond = PreconditionerConfig::default();
+    let precond = additive();
     let result = solve(cats.view(), &y, None, &params, &precond).expect("solve should not error");
 
     assert!(
@@ -125,9 +126,7 @@ fn test_disconnected_design_solve_converges() {
 
 #[test]
 fn test_single_factor_design_construction() {
-    let frame = ObservationFrame::new(vec![vec![0u32, 1, 2, 0, 1].into()], Vec::new())
-        .expect("valid frame");
-    let dm = Design::from_frame(frame).expect("valid single-factor design");
+    let dm = common::make_design(vec![vec![0, 1, 2, 0, 1]]).expect("valid single-factor design");
 
     assert_eq!(dm.n_factors(), 1, "expected 1 factor");
     assert_eq!(dm.n_dofs(), 3, "expected 3 DOFs (levels 0,1,2)");
@@ -168,12 +167,10 @@ fn test_single_factor_design_solve_without_precond() {
 // 4. Effect-term design API (issue #58)
 // ---------------------------------------------------------------------------
 
-/// Intercept-only `Effect` design vs. the categories path. Both run through the
-/// same `from_frame` locality sort, so rows sum in the same order and the result
-/// is bit-identical — hence the exact `assert_eq`, not a tolerance.
+/// Intercept-only effects and the categories matrix share one row order, so results are bitwise.
 #[test]
 fn test_intercept_only_effects_match_categories_bitwise() {
-    use within::{Effect, LsmrOptions, PreconditionerConfig, Solver};
+    use within::{Effect, LsmrOptions, Solver};
 
     // Non-monotonic dominant factor so the locality sort is genuinely exercised.
     let col0: Vec<u32> = vec![3, 0, 2, 1, 3, 0, 2, 1, 3, 0, 2, 1];
@@ -183,13 +180,10 @@ fn test_intercept_only_effects_match_categories_bitwise() {
         .map(|i| (i as f64 * 1.3 - 2.0).sin() + 0.5)
         .collect();
     let params = LsmrOptions::default();
-    let precond = PreconditionerConfig::default();
+    let precond = additive();
 
-    let categories = Design::from_frame(
-        ObservationFrame::new(vec![col0.clone().into(), col1.clone().into()], Vec::new())
-            .expect("frame"),
-    )
-    .expect("categories design");
+    let matrix = ndarray::Array2::from_shape_fn((n_obs, 2), |(i, f)| [&col0, &col1][f][i]);
+    let categories = Design::from_categories(matrix.view()).expect("categories design");
     let cat = Solver::new(categories, None, &precond)
         .expect("categories solver")
         .solve(&y, &params)
@@ -230,7 +224,7 @@ fn test_intercept_only_effects_match_categories_bitwise() {
 /// converges in a few dozen. Regression guard for the slope-chain blind spot.
 #[test]
 fn test_slope_chain_design_converges_fast() {
-    use within::{Effect, LsmrOptions, PreconditionerConfig, Solver};
+    use within::{Effect, LsmrOptions, Solver};
 
     let (n_firms, wpf, t) = (60usize, 3usize, 4usize);
     let n_workers = n_firms * wpf;
@@ -254,7 +248,7 @@ fn test_slope_chain_design_converges_fast() {
         Effect::new(&worker, true, [&z[..]]).expect("slope effect"),
         Effect::new(&firm, true, []).expect("plain effect"),
     ];
-    let solver = Solver::new(effects, None, PreconditionerConfig::default()).expect("solver build");
+    let solver = Solver::new(effects, None, additive()).expect("solver build");
     let params = LsmrOptions {
         tol: 1e-8,
         maxiter: 500,

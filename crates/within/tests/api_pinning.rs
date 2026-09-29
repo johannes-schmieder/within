@@ -2,6 +2,7 @@
 //! argument shapes: if any call form below stops compiling, the public surface shifted.
 
 use ndarray::Array2;
+use within::config::{LocalSolverConfig, ReductionStrategy, Staleness};
 use within::{solve, solve_batch, LsmrOptions, PreconditionerConfig, Solver};
 
 fn cats() -> Array2<u32> {
@@ -17,7 +18,7 @@ fn precond_input_call_shapes_compile() {
     let setup = Solver::new(categories.view(), None, &cfg).unwrap();
     let prec = setup
         .preconditioner()
-        .expect("default solver has a preconditioner")
+        .expect("solver has a preconditioner")
         .clone();
 
     // Shape 1: bare `None` — resolves through `From<Option<&PreconditionerConfig>>`.
@@ -58,7 +59,7 @@ fn solve_free_function_precond_call_shapes_compile() {
     let setup = Solver::new(categories.view(), None, &cfg).unwrap();
     let prec = setup
         .preconditioner()
-        .expect("default solver has a preconditioner")
+        .expect("solver has a preconditioner")
         .clone();
 
     let _ = solve(categories.view(), &y, None, &lsmr, None).expect("None form");
@@ -85,13 +86,9 @@ fn solver_new_weights_call_shapes_compile() {
     let categories = cats();
     let w_vec: Vec<f64> = vec![1.0; 4];
 
-    // Bare `None` — infers, because `weights` is the concrete `Option<Vec<f64>>`
-    // (no turbofish needed). The persistent solver owns its weights; borrow-based
-    // one-shot weighting lives on the free `solve` function instead.
+    // Bare `None` infers, because `weights` is the concrete `Option<&[f64]>`.
     let _ = Solver::new(categories.view(), None, None).expect("None weights");
-
-    // Owned `Vec<f64>` weights — moved into the solver.
-    let _ = Solver::new(categories.view(), Some(w_vec), None).expect("Vec<f64> weights");
+    let _ = Solver::new(categories.view(), Some(&w_vec), None).expect("borrowed weights");
 }
 
 #[test]
@@ -129,4 +126,18 @@ fn options_are_optional_and_tuned_additive_builds_from_crate_root() {
     let _ = solve(categories.view(), &y, None, None, None).expect("free solve, None options");
     let _ = solve_batch(categories.view(), &ys, None, None, None)
         .expect("free solve_batch, None options");
+}
+
+/// The one place the default's identity is asserted. Variant lists across the test suite name
+/// `Adaptive` explicitly and rely on this to catch a default that moved out from under them.
+#[test]
+fn library_default_is_the_adaptive_ladder() {
+    assert_eq!(
+        PreconditionerConfig::default(),
+        PreconditionerConfig::Adaptive {
+            local_solver: LocalSolverConfig::default(),
+            reduction: ReductionStrategy::default(),
+            stall: Staleness::default(),
+        }
+    );
 }

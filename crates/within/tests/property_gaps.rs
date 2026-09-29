@@ -2,9 +2,11 @@ use ndarray::Array2;
 use proptest::prelude::*;
 use within::{solve, LsmrOptions, Solver};
 
+#[path = "common/orchestrate_helpers.rs"]
+mod common;
 #[path = "common/property_strategies.rs"]
 mod strategies;
-use strategies::{additive_precond, random_fe_problem_strategy};
+use strategies::{any_preconditioner, random_fe_problem_strategy};
 
 /// 4-factor problem: 2–10 levels each, 100–500 observations.
 fn random_4_factor_problem_strategy() -> impl Strategy<Value = (Array2<u32>, Vec<f64>)> {
@@ -56,15 +58,17 @@ fn single_factor_strategy() -> impl Strategy<Value = (Array2<u32>, Vec<f64>)> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 
-    /// A 4-factor problem solved with additive Schwarz should converge.
-    /// This exercises the partition-of-unity construction over C(4,2)=6 domains.
+    /// A 4-factor problem converges under every preconditioner. Under Schwarz
+    /// this exercises the partition-of-unity construction over C(4,2)=6 domains.
     #[test]
-    fn prop_4_factor_convergence((cats, y) in random_4_factor_problem_strategy()) {
+    fn prop_4_factor_convergence(
+        (cats, y) in random_4_factor_problem_strategy(),
+        precond in any_preconditioner(),
+    ) {
         let params = LsmrOptions {
             tol: 1e-7,
             ..LsmrOptions::default()
         };
-        let precond = additive_precond();
         // LSMR converges on the least-squares system min ||y - Dx||^2 for any y.
         let result = solve(cats.view(), &y, None, &params, &precond).unwrap();
         prop_assert!(
@@ -81,12 +85,14 @@ proptest! {
     /// so they share the same locality sort (or its absence) and run in
     /// identical internal row order on any input.
     #[test]
-    fn prop_solve_vs_solver_identical((cats, y) in random_fe_problem_strategy()) {
+    fn prop_solve_vs_solver_identical(
+        (cats, y) in random_fe_problem_strategy(),
+        precond in any_preconditioner(),
+    ) {
         let params = LsmrOptions {
             tol: 1e-7,
             ..LsmrOptions::default()
         };
-        let precond = additive_precond();
 
         // Path A: convenience `solve()` (ingests the view internally)
         let result_a = solve(cats.view(), &y, None, &params, &precond).unwrap();
@@ -112,44 +118,21 @@ proptest! {
     /// Verify demeaned = y - D*x.
     /// After a converged solve, `demeaned[i]` must equal `y[i] - sum_q x[dof(i,q)]`.
     #[test]
-    fn prop_demeaned_identity_all_paths((cats, y) in random_fe_problem_strategy()) {
+    fn prop_demeaned_identity_all_paths(
+        (cats, y) in random_fe_problem_strategy(),
+        precond in any_preconditioner(),
+    ) {
         let params = LsmrOptions {
             tol: 1e-7,
             ..LsmrOptions::default()
         };
-        let precond = additive_precond();
         let result = solve(cats.view(), &y, None, &params, &precond).unwrap();
 
         if !result.converged {
             return Ok(());
         }
 
-        // Manually reconstruct D*x: for each observation, sum the DOF values
-        // for each factor's level.
-        let n_obs = y.len();
-        let n_factors = cats.ncols();
-
-        // Compute factor offsets (same ordering as Design)
-        let mut offsets = vec![0usize; n_factors];
-        for f in 1..n_factors {
-            let n_levels_prev = *cats.column(f - 1).iter().max().unwrap() as usize + 1;
-            offsets[f] = offsets[f - 1] + n_levels_prev;
-        }
-
-        for i in 0..n_obs {
-            let dx_i: f64 = (0..n_factors)
-                .map(|f| {
-                    let level = cats[[i, f]] as usize;
-                    result.x[offsets[f] + level]
-                })
-                .sum();
-            let expected_demeaned = y[i] - dx_i;
-            prop_assert!(
-                (result.demeaned[i] - expected_demeaned).abs() < 1e-8,
-                "demeaned[{}]: got {}, expected {} (y={}, Dx={})",
-                i, result.demeaned[i], expected_demeaned, y[i], dx_i
-            );
-        }
+        common::assert_demeaned_is_residual(cats.view(), &y, &result, 1e-8);
     }
 
     /// Single-factor problems have a diagonal Gramian. Unpreconditioned LSMR

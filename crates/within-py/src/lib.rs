@@ -16,10 +16,10 @@ mod config;
 mod convert;
 mod results;
 
-use api::{solve, solve_batch, PyEffect, PySolver};
+use api::{solve, solve_batch, PyDesign, PyEffect, PySolver};
 use config::{
     PyApproxCholConfig, PyApproxSchurConfig, PyLocalSolverConfig, PyLsmrOptions, PyPreconditioner,
-    PyPreconditionerConfig, PyReductionStrategy, PyScalingConfig, PySchur,
+    PyPreconditionerConfig, PyReductionStrategy, PyScalingConfig, PySchur, PyStaleness,
 };
 use results::{PyBatchSolveResult, PyCoefficientLayout, PySolveResult, PyUnidentifiedDirection};
 
@@ -31,6 +31,7 @@ fn _within(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCoefficientLayout>()?;
     m.add_class::<PyLsmrOptions>()?;
     m.add_class::<PyReductionStrategy>()?;
+    m.add_class::<PyStaleness>()?;
     m.add_class::<PyPreconditionerConfig>()?;
     m.add_class::<PyApproxCholConfig>()?;
     m.add_class::<PyApproxSchurConfig>()?;
@@ -39,6 +40,7 @@ fn _within(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySchur>()?;
     m.add_class::<PyPreconditioner>()?;
     m.add_class::<PySolver>()?;
+    m.add_class::<PyDesign>()?;
     m.add_class::<PyEffect>()?;
     m.add_function(wrap_pyfunction!(solve, m)?)?;
     m.add_function(wrap_pyfunction!(solve_batch, m)?)?;

@@ -1,6 +1,6 @@
 //! Observation space → coefficient space with disjoint per-level destinations.
 
-use crate::domain::{Design, LevelMembership, Loading};
+use crate::domain::{LevelMembership, PreparedDesign};
 use rayon::prelude::*;
 use std::ops::Range;
 
@@ -26,20 +26,19 @@ fn level_sum(
 }
 
 pub(super) fn scatter_apply(
-    design: &Design<'_>,
+    prepared: &PreparedDesign<'_>,
     dst: &mut [f64],
     base: &(impl Fn(usize) -> f64 + Sync),
 ) {
+    let design = &prepared.design;
     debug_assert_eq!(dst.len(), design.n_dofs);
     for (q, term) in design.terms.iter().enumerate() {
         let membership = &design.membership[q];
-        let block = &mut dst[term.offset..term.offset + term.n_dofs()];
-        for (column, loading) in term.columns.iter().enumerate() {
-            let slot = &mut block[column * term.n_levels..(column + 1) * term.n_levels];
-            let value = |row| match loading {
-                Loading::Constant => base(row),
-                Loading::Covariate(k) => design.frame.loading_column(*k as usize)[row] * base(row),
-            };
+        let prepared_term = prepared.term(q);
+        for column in 0..term.n_columns() {
+            let slot = &mut dst[term.column_dofs(column)];
+            let loading = prepared_term.loading(column);
+            let value = |row| loading.map_or_else(|| base(row), |z| z[row] * base(row));
             let apply = |(level, output): (usize, &mut f64)| {
                 *output = level_sum(membership, membership.level_range(level), &value);
             };

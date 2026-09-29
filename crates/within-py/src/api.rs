@@ -1,6 +1,7 @@
 //! Free `#[pyfunction]`s exposed via `within._within`: [`solve`] and
 //! [`solve_batch`].
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArray};
@@ -25,7 +26,7 @@ use crate::results::{
 fn build_and_solve<'a>(
     design: impl IntoDesign<'a>,
     y: &[f64],
-    weights: Option<Vec<f64>>,
+    weights: Option<&[f64]>,
     lsmr: &LsmrOptions,
     precond: impl Into<PreconditionerInput>,
 ) -> Result<(SolveResult, Vec<BuildWarning>), WithinError> {
@@ -42,7 +43,7 @@ fn build_and_solve<'a>(
 fn build_and_solve_batch<'a>(
     design: impl IntoDesign<'a>,
     ys: &[&[f64]],
-    weights: Option<Vec<f64>>,
+    weights: Option<&[f64]>,
     lsmr: &LsmrOptions,
     precond: impl Into<PreconditionerInput>,
 ) -> Result<(BatchSolveResult, Vec<BuildWarning>), WithinError> {
@@ -75,23 +76,24 @@ pub fn solve<'py>(
     let w_view = weights.as_ref().map(|w| w.as_array());
 
     match extract_design(py, design)? {
+        DesignSource::Persistent(design) => run_solve_with_warnings(py, move || {
+            let y_cow = coerce_to_slice(&y_arr);
+            let w_cow = w_view.as_ref().map(coerce_to_slice);
+            build_and_solve(design, &y_cow, w_cow.as_deref(), &params, precond)
+        }),
         DesignSource::Categories(categories) => {
             let cats = categories.as_array();
             run_solve_with_warnings(py, move || {
                 let y_cow = coerce_to_slice(&y_arr);
-                build_and_solve(cats, &y_cow, w_view.map(|w| w.to_vec()), &params, precond)
+                let w_cow = w_view.as_ref().map(coerce_to_slice);
+                build_and_solve(cats, &y_cow, w_cow.as_deref(), &params, precond)
             })
         }
         DesignSource::Effects(terms) => run_solve_with_warnings(py, move || {
-            let effects: Vec<_> = terms.iter().map(PyEffect::as_effect).collect();
+            let effects: Vec<_> = terms.iter().map(|term| term.get().as_effect()).collect();
             let y_cow = coerce_to_slice(&y_arr);
-            build_and_solve(
-                effects,
-                &y_cow,
-                w_view.map(|w| w.to_vec()),
-                &params,
-                precond,
-            )
+            let w_cow = w_view.as_ref().map(coerce_to_slice);
+            build_and_solve(effects, &y_cow, w_cow.as_deref(), &params, precond)
         }),
     }
 }
@@ -115,36 +117,35 @@ pub fn solve_batch<'py>(
     let w_view = weights.as_ref().map(|w| w.as_array());
 
     match extract_design(py, design)? {
+        DesignSource::Persistent(design) => {
+            validate_batch_rows(y_arr.nrows(), design.n_obs())?;
+            run_batch_with_warnings(py, move || {
+                let columns = extract_columns(&y_arr);
+                let col_refs = column_refs(&columns);
+                let w_cow = w_view.as_ref().map(coerce_to_slice);
+                build_and_solve_batch(design, &col_refs, w_cow.as_deref(), &params, precond)
+            })
+        }
         DesignSource::Categories(categories) => {
             let cats = categories.as_array();
             validate_batch_rows(y_arr.nrows(), cats.nrows())?;
             run_batch_with_warnings(py, move || {
                 let columns = extract_columns(&y_arr);
                 let col_refs = column_refs(&columns);
-                build_and_solve_batch(
-                    cats,
-                    &col_refs,
-                    w_view.map(|w| w.to_vec()),
-                    &params,
-                    precond,
-                )
+                let w_cow = w_view.as_ref().map(coerce_to_slice);
+                build_and_solve_batch(cats, &col_refs, w_cow.as_deref(), &params, precond)
             })
         }
         DesignSource::Effects(terms) => {
             if let Some(first) = terms.first() {
-                validate_batch_rows(y_arr.nrows(), first.levels.len())?;
+                validate_batch_rows(y_arr.nrows(), first.get().levels.len())?;
             }
             run_batch_with_warnings(py, move || {
-                let effects: Vec<_> = terms.iter().map(PyEffect::as_effect).collect();
+                let effects: Vec<_> = terms.iter().map(|term| term.get().as_effect()).collect();
                 let columns = extract_columns(&y_arr);
                 let col_refs = column_refs(&columns);
-                build_and_solve_batch(
-                    effects,
-                    &col_refs,
-                    w_view.map(|w| w.to_vec()),
-                    &params,
-                    precond,
-                )
+                let w_cow = w_view.as_ref().map(coerce_to_slice);
+                build_and_solve_batch(effects, &col_refs, w_cow.as_deref(), &params, precond)
             })
         }
     }
@@ -163,7 +164,6 @@ fn validate_batch_rows(y_rows: usize, n_obs: usize) -> PyResult<()> {
 /// Holds its columns natively so the borrowed [`Effect`] can be rebuilt off-GIL.
 #[pyclass(frozen, skip_from_py_object, module = "within._within")]
 #[pyo3(name = "Effect")]
-#[derive(Clone)]
 pub struct PyEffect {
     levels: Vec<u32>,
     intercept: bool,
@@ -207,16 +207,20 @@ impl PyEffect {
     }
 }
 
-/// A solve's design, as interpreted from the Python `design` argument.
+/// A native, categorical, or effect-based design supplied at the Python boundary.
 enum DesignSource<'py> {
+    /// A cheap native clone of an existing persistent Python [`PyDesign`].
+    Persistent(Design<'static>),
     /// An `(n_obs, n_factors)` categories matrix, borrowed from numpy.
     Categories(PyReadonlyArray2<'py, u32>),
-    /// Effect terms, cloned out of Python so they can be rebuilt off-GIL.
-    Effects(Vec<PyEffect>),
+    /// Python-owned effect terms, retained so their native buffers can be borrowed off-GIL.
+    Effects(Vec<Py<PyEffect>>),
 }
 
-/// A 2-D `uint32` categories matrix (borrowed) or a list of [`Effect`] terms (cloned).
 fn extract_design<'py>(py: Python<'_>, design: &Bound<'py, PyAny>) -> PyResult<DesignSource<'py>> {
+    if let Ok(design) = design.cast::<PyDesign>() {
+        return Ok(DesignSource::Persistent(design.get().as_design().clone()));
+    }
     if design.cast::<PyUntypedArray>().is_ok() {
         let categories = readonly_u32_2d("design", design)?;
         warn_c_contiguous(py, &categories.as_array())?;
@@ -224,22 +228,70 @@ fn extract_design<'py>(py: Python<'_>, design: &Bound<'py, PyAny>) -> PyResult<D
     }
     let effects: Vec<Py<PyEffect>> = design.extract().map_err(|_| {
         PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            "design must be a 2-D uint32 array or a list of Effect",
+            "design must be a Design, a 2-D uint32 array, or a list of Effect",
         )
     })?;
-    Ok(DesignSource::Effects(
-        effects
-            .iter()
-            .map(|e| e.bind(py).borrow().clone())
-            .collect(),
-    ))
+    Ok(DesignSource::Effects(effects))
 }
 
-/// Persistent solver reusing preconditioners; the factorization happens once at construction.
+fn extract_owned_design(py: Python<'_>, design: &Bound<'_, PyAny>) -> PyResult<Design<'static>> {
+    match extract_design(py, design)? {
+        DesignSource::Persistent(design) => Ok(design),
+        DesignSource::Categories(categories) => {
+            let categories = categories.as_array();
+            py.detach(move || Design::from_categories(categories).map(Design::into_owned))
+                .map_err(value_err)
+        }
+        DesignSource::Effects(terms) => py
+            .detach(move || {
+                let effects: Vec<_> = terms.iter().map(|term| term.get().as_effect()).collect();
+                Design::new(effects).map(Design::into_owned)
+            })
+            .map_err(value_err),
+    }
+}
+
+/// Persistent fixed-effects design with owned observation storage.
+#[pyclass(frozen, skip_from_py_object, module = "within._within")]
+#[pyo3(name = "Design")]
+pub struct PyDesign {
+    design: Design<'static>,
+}
+
+#[pymethods]
+impl PyDesign {
+    #[new]
+    fn new(py: Python<'_>, design: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            design: extract_owned_design(py, design)?,
+        })
+    }
+
+    #[getter]
+    fn n_obs(&self) -> usize {
+        self.design.n_obs()
+    }
+
+    #[getter]
+    fn n_dofs(&self) -> usize {
+        self.design.n_dofs()
+    }
+}
+
+impl PyDesign {
+    fn as_design(&self) -> &Design<'static> {
+        &self.design
+    }
+}
+
+/// Persistent solver reusing preconditioners; the factorization happens once, at construction
+/// or, under `Adaptive`, at escalation.
 #[pyclass(frozen, module = "within._within")]
 #[pyo3(name = "Solver")]
 pub struct PySolver {
     solver: Solver<'static>,
+    /// How many of `solver.warnings()` have been handed to Python.
+    reported_warnings: AtomicUsize,
 }
 
 #[pymethods]
@@ -253,30 +305,24 @@ impl PySolver {
         preconditioner: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Self> {
         let weights = weights.map(|w| readonly_f64_1d("weights", w)).transpose()?;
-        let weights_vec: Option<Vec<f64>> = weights.as_ref().map(|w| w.as_array().to_vec());
+        let w_view = weights.as_ref().map(|w| w.as_array());
         let precond = resolve_precond_input(preconditioner)?;
 
+        let design = extract_owned_design(py, design)?;
+
         // `BuildError` carries no Python types, so it maps to an exception once the GIL is back.
-        let solver = match extract_design(py, design)? {
-            DesignSource::Categories(categories) => {
-                let cats = categories.as_array();
-                py.detach(move || -> Result<Solver<'static>, BuildError> {
-                    Solver::new(cats.into_design()?.into_owned(), weights_vec, precond)
-                })
-            }
-            DesignSource::Effects(terms) => {
-                py.detach(move || -> Result<Solver<'static>, BuildError> {
-                    let effects: Vec<_> = terms.iter().map(PyEffect::as_effect).collect();
-                    // The solver outlives the terms' buffers, so lower to owned columns first.
-                    let design = Design::new(effects)?.into_owned();
-                    Solver::new(design, weights_vec, precond)
-                })
-            }
-        }
-        .map_err(value_err)?;
+        let solver = py
+            .detach(move || -> Result<Solver<'static>, BuildError> {
+                let w_cow = w_view.as_ref().map(coerce_to_slice);
+                Solver::new(design, w_cow.as_deref(), precond)
+            })
+            .map_err(value_err)?;
 
         emit_build_warnings(py, solver.warnings())?;
-        Ok(Self { solver })
+        Ok(Self {
+            reported_warnings: AtomicUsize::new(solver.warnings().len()),
+            solver,
+        })
     }
 
     /// Solve for a single response vector with the given LSMR tuning.
@@ -292,7 +338,9 @@ impl PySolver {
         let y_cow = coerce_to_slice(&y_arr);
         let params = resolve_lsmr_config(options)?;
 
-        run_solve(py, || self.solver.solve(&y_cow, &params))
+        let result = run_solve(py, || self.solver.solve(&y_cow, &params))?;
+        self.emit_deferred_warnings(py)?;
+        Ok(result)
     }
 
     /// `Y` is `(n_obs, k)` with one response per column.
@@ -320,10 +368,13 @@ impl PySolver {
 
         let params = resolve_lsmr_config(options)?;
 
-        run_batch(py, || self.solver.solve_batch(&col_refs, &params))
+        let result = run_batch(py, || self.solver.solve_batch(&col_refs, &params))?;
+        self.emit_deferred_warnings(py)?;
+        Ok(result)
     }
 
-    /// The built preconditioner, or ``None`` if unconfigured; picklable and reusable.
+    /// The preconditioner in use, or ``None`` if unconfigured; picklable and reusable. Under
+    /// ``Adaptive`` it is the Schwarz map once built, else the diagonal base carrying the ladder.
     #[getter]
     #[pyo3(name = "preconditioner")]
     fn preconditioner_py(&self) -> PyResult<Option<PyPreconditioner>> {
@@ -343,5 +394,25 @@ impl PySolver {
     #[getter]
     fn n_obs(&self) -> usize {
         self.solver.n_obs()
+    }
+
+    /// Whether an ``Adaptive`` solve has handed off to Schwarz; always ``False`` otherwise.
+    #[getter]
+    fn has_escalated(&self) -> bool {
+        self.solver.has_escalated()
+    }
+}
+
+impl PySolver {
+    /// The Schwarz rung is built mid-solve, so the cursor hands each new warning to one caller.
+    fn emit_deferred_warnings(&self, py: Python<'_>) -> PyResult<()> {
+        let warnings = self.solver.warnings();
+        let claimed_from = self
+            .reported_warnings
+            .fetch_max(warnings.len(), Ordering::AcqRel);
+        if claimed_from < warnings.len() {
+            emit_build_warnings(py, &warnings[claimed_from..])?;
+        }
+        Ok(())
     }
 }

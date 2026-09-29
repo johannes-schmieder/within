@@ -9,11 +9,11 @@ use pyo3::prelude::*;
 
 use within::config::{
     ApproxCholConfig, ApproxSchurConfig, LocalSolverConfig, LsmrOptions, PreconditionerConfig,
-    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode,
+    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode, Staleness,
 };
 use within::{Preconditioner, PreconditionerInput};
 
-use crate::convert::IntoPyErr;
+use crate::convert::{value_err, IntoPyErr};
 
 #[pyclass(frozen, module = "within._within")]
 #[pyo3(name = "ApproxCholConfig")]
@@ -216,6 +216,16 @@ pub enum PyPreconditionerConfig {
         reduction: PyReductionStrategy,
     },
     Diagonal(),
+    #[pyo3(constructor = (
+        local_solver=PyLocalSolverConfig::default(),
+        reduction=PyReductionStrategy::Auto,
+        stall=PyStaleness::default()
+    ))]
+    Adaptive {
+        local_solver: PyLocalSolverConfig,
+        reduction: PyReductionStrategy,
+        stall: PyStaleness,
+    },
 }
 
 impl PyPreconditionerConfig {
@@ -229,6 +239,15 @@ impl PyPreconditionerConfig {
             } => PreconditionerConfig::Additive {
                 local_solver: local_solver.to_native(),
                 reduction: reduction.to_native(),
+            },
+            Self::Adaptive {
+                local_solver,
+                reduction,
+                stall,
+            } => PreconditionerConfig::Adaptive {
+                local_solver: local_solver.to_native(),
+                reduction: reduction.to_native(),
+                stall: stall.to_native(),
             },
         }
     }
@@ -244,12 +263,69 @@ impl PyPreconditionerConfig {
                 local_solver: PyLocalSolverConfig::from_native(local_solver),
                 reduction: PyReductionStrategy::from_native(*reduction),
             },
+            PreconditionerConfig::Adaptive {
+                local_solver,
+                reduction,
+                stall,
+            } => Self::Adaptive {
+                local_solver: PyLocalSolverConfig::from_native(local_solver),
+                reduction: PyReductionStrategy::from_native(*reduction),
+                stall: PyStaleness { inner: *stall },
+            },
             _ => {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "unsupported preconditioner configuration",
                 ))
             }
         })
+    }
+}
+
+/// Contraction-stall condition that triggers an `Adaptive` escalation.
+#[pyclass(frozen, eq, from_py_object, module = "within._within")]
+#[pyo3(name = "Staleness")]
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct PyStaleness {
+    inner: Staleness,
+}
+
+#[pymethods]
+impl PyStaleness {
+    #[new]
+    #[pyo3(signature = (window=None, threshold=None))]
+    fn new(window: Option<usize>, threshold: Option<f64>) -> PyResult<Self> {
+        let defaults = Staleness::default();
+        Ok(Self {
+            inner: Staleness::try_new(
+                window.unwrap_or(defaults.window()),
+                threshold.unwrap_or(defaults.threshold()),
+            )
+            .map_err(value_err)?,
+        })
+    }
+
+    #[getter]
+    fn window(&self) -> usize {
+        self.inner.window()
+    }
+
+    #[getter]
+    fn threshold(&self) -> f64 {
+        self.inner.threshold()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Staleness(window={}, threshold={})",
+            self.inner.window(),
+            self.inner.threshold()
+        )
+    }
+}
+
+impl PyStaleness {
+    pub(crate) fn to_native(self) -> Staleness {
+        self.inner
     }
 }
 
@@ -465,7 +541,7 @@ impl PyPreconditioner {
     /// Complete normalized configuration used to build this preconditioner.
     #[getter]
     fn config(&self) -> PyResult<PyPreconditionerConfig> {
-        PyPreconditionerConfig::from_native(self.inner.config())
+        PyPreconditionerConfig::from_native(&self.inner.config())
     }
 }
 
@@ -495,7 +571,8 @@ fn extract_preconditioner_config(
 
     Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
         "preconditioner must be PreconditionerConfig.Off(), PreconditionerConfig.Diagonal(), \
-         PreconditionerConfig.Additive(...), a pre-built Preconditioner, or None",
+         PreconditionerConfig.Additive(...), PreconditionerConfig.Adaptive(...), a pre-built \
+         Preconditioner, or None",
     ))
 }
 

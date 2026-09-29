@@ -6,9 +6,12 @@ use within::{
 
 #[path = "common/property_strategies.rs"]
 mod strategies;
-use strategies::{additive_precond, random_fe_problem_strategy, random_slopes_problem_strategy};
+use strategies::{
+    adaptive, additive, any_preconditioner, random_fe_problem_strategy,
+    random_slopes_problem_strategy,
+};
 
-fn at(term: usize, level: usize, column: usize) -> CoefficientAddress {
+fn at(term: usize, level: u32, column: usize) -> CoefficientAddress {
     CoefficientAddress {
         channel: Channel { term, column },
         level,
@@ -22,15 +25,21 @@ fn default_params() -> LsmrOptions {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 
-#[test]
-    fn prop_preconditioner_serde_roundtrip((cats, _y) in random_fe_problem_strategy()) {
-        let precond = additive_precond();
-
+    #[test]
+    fn prop_preconditioner_serde_roundtrip(
+        (cats, _y) in random_fe_problem_strategy(),
+        precond in prop_oneof![
+            Just(PreconditionerConfig::Diagonal),
+            Just(additive()),
+            Just(adaptive()),
+        ],
+    ) {
         let solver = within::Solver::new(cats.view(), None, &precond).unwrap();
         let fe_precond = solver.preconditioner().unwrap();
 
         let bytes = postcard::to_stdvec(fe_precond).unwrap();
         let deserialized: Preconditioner = postcard::from_bytes(&bytes).unwrap();
+        prop_assert_eq!(deserialized.config(), fe_precond.config());
 
         let n = fe_precond.nrows();
         let x: Vec<f64> = (0..n).map(|i| (i as f64 * 0.5).sin()).collect();
@@ -46,13 +55,15 @@ proptest! {
     }
 
     #[test]
-    fn prop_solver_convergence((cats, y) in random_fe_problem_strategy()) {
+    fn prop_solver_convergence(
+        (cats, y) in random_fe_problem_strategy(),
+        precond in any_preconditioner(),
+    ) {
         // LSMR converges on min ||y - Dx||^2 for any y, so the random y is used directly.
         let params = LsmrOptions {
             tol: 1e-7,
             ..default_params()
         };
-        let precond = additive_precond();
         let result = solve(cats.view(), &y, None, &params, &precond).unwrap();
 
         prop_assert!(
@@ -63,9 +74,11 @@ proptest! {
     }
 
     #[test]
-    fn prop_demeaned_orthogonality((cats, y) in random_fe_problem_strategy()) {
+    fn prop_demeaned_orthogonality(
+        (cats, y) in random_fe_problem_strategy(),
+        precond in any_preconditioner(),
+    ) {
         let params = default_params();
-        let precond = additive_precond();
         let result = solve(cats.view(), &y, None, &params, &precond).unwrap();
 
         prop_assume!(result.converged);
@@ -121,7 +134,7 @@ proptest! {
             maxiter: 2000,
             local_size: Some(10),
         };
-        let result = Solver::new(effects, Some(weights.clone()), PreconditionerConfig::default())
+        let result = Solver::new(effects, Some(weights), PreconditionerConfig::default())
             .expect("build solver")
             .solve(y.as_slice(), &params)
             .expect("solve");
@@ -134,12 +147,13 @@ proptest! {
         for (t, f) in factors.iter().enumerate() {
             let slope_base = usize::from(f.intercept);
             for i in 0..n_obs {
-                let lvl = f.levels[i] as usize;
+                let level = f.levels[i];
                 if f.intercept {
-                    fitted[i] += x[layout.index(at(t, lvl, 0)).unwrap()];
+                    fitted[i] += x[layout.index(at(t, level, 0)).unwrap()];
                 }
                 for (s, col) in f.slopes.iter().enumerate() {
-                    fitted[i] += x[layout.index(at(t, lvl, slope_base + s)).unwrap()] * col[i];
+                    fitted[i] +=
+                        x[layout.index(at(t, level, slope_base + s)).unwrap()] * col[i];
                 }
             }
         }
@@ -150,16 +164,16 @@ proptest! {
         for (t, f) in factors.iter().enumerate() {
             let slope_base = usize::from(f.intercept);
             for i in 0..n_obs {
-                let lvl = f.levels[i] as usize;
+                let level = f.levels[i];
                 let wr = weights[i] * (y[i] - fitted[i]);
                 let wy = weights[i] * y[i];
                 if f.intercept {
-                    let k = layout.index(at(t, lvl, 0)).unwrap();
+                    let k = layout.index(at(t, level, 0)).unwrap();
                     g[k] += wr;
                     g0[k] += wy;
                 }
                 for (s, col) in f.slopes.iter().enumerate() {
-                    let k = layout.index(at(t, lvl, slope_base + s)).unwrap();
+                    let k = layout.index(at(t, level, slope_base + s)).unwrap();
                     g[k] += wr * col[i];
                     g0[k] += wy * col[i];
                 }

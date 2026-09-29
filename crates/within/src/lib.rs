@@ -1,7 +1,8 @@
 #![deny(missing_docs)]
 //! Fixed-effects normal-equation solver. Solves `G x = D^T W y` (with
-//! `G = D^T W D`) for a sparse categorical design `D` via modified LSMR with a
-//! Schwarz preconditioner over factor-pair subdomains.
+//! `G = D^T W D`) for a sparse categorical design `D` via modified LSMR,
+//! preconditioned by default with a diagonal that escalates to additive
+//! Schwarz over factor-pair subdomains on a stalled contraction.
 //!
 //! ```
 //! use ndarray::Array2;
@@ -27,10 +28,13 @@
 //! does not guarantee bitwise reproducibility. Request `ParallelReduction`
 //! explicitly for reproducible additive solves. Cross-machine/build bit identity
 //! and wall-clock diagnostic identity are not guaranteed.
+//!
+//! [`PreconditionerConfig::Adaptive`] reproduces raw coefficients per solve, not
+//! across solves; fitted values agree. The fixed-configuration guarantee above
+//! does not extend to adaptive solves.
 
 pub mod config;
 pub mod error;
-pub mod observation;
 
 pub(crate) mod block_elim;
 pub(crate) mod channel;
@@ -40,15 +44,15 @@ pub(crate) mod linalg;
 pub(crate) mod operator;
 pub(crate) mod solver;
 
-pub use channel::{Channel, ChannelPair};
+pub use channel::{Channel, ChannelPair, CoefficientAddress};
 pub use config::{
     ApproxCholConfig, ApproxSchurConfig, LocalSolverConfig, LsmrOptions, PreconditionerConfig,
-    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode,
+    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode, Staleness, StalenessError,
 };
 pub use domain::{Design, Effect};
-pub use error::{BuildError, BuildWarning, SolveError, WithinError};
+pub use error::{AliasVerdict, BuildError, BuildWarning, SolveError, WithinError};
 pub use operator::schwarz::Preconditioner;
 pub use solver::{
-    solve, solve_batch, BatchSolveResult, CoefficientAddress, CoefficientLayout, IntoDesign,
-    PreconditionerInput, SolveResult, Solver,
+    solve, solve_batch, BatchSolveResult, CoefficientLayout, IntoDesign, PreconditionerInput,
+    SolveResult, Solver,
 };

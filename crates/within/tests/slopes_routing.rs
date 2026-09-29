@@ -2,7 +2,12 @@
 //! factors through balanced/scaled signed subdomains, with frustrated
 //! components solving through their Gremban double cover (#62).
 
+use rstest::rstest;
 use within::{Effect, LsmrOptions, Preconditioner, PreconditionerConfig, SchurMode, Solver};
+
+#[path = "common/orchestrate_helpers.rs"]
+mod common;
+use common::additive;
 
 fn lcg(seed: &mut u64) -> u64 {
     *seed = seed
@@ -36,7 +41,7 @@ fn two_factor_slope_solves_with_bounded_iterations() {
         Effect::new(&f, true, [&z[..]]).expect("slope effect"),
         Effect::new(&g, true, []).expect("plain effect"),
     ];
-    let r = Solver::new(effects, None, PreconditionerConfig::default())
+    let r = Solver::new(effects, None, additive())
         .expect("signed routing builds")
         .solve(&y, &LsmrOptions::default())
         .expect("solve");
@@ -69,7 +74,7 @@ fn unit_trends_plus_time_effects_boundary() {
         Effect::new(&unit, true, [&t[..]]).expect("trend effect"),
         Effect::new(&time, true, []).expect("time effect"),
     ];
-    let r = Solver::new(effects, None, PreconditionerConfig::default())
+    let r = Solver::new(effects, None, additive())
         .expect("PSD-boundary routing builds")
         .solve(&y, &LsmrOptions::default())
         .expect("solve");
@@ -90,7 +95,7 @@ fn frustrated_component_solves_via_cover() {
         Effect::new(&g, true, []).expect("plain effect"),
     ];
 
-    let r = Solver::new(effects, None, PreconditionerConfig::default())
+    let r = Solver::new(effects, None, additive())
         .expect("frustrated component builds via its Gremban cover")
         .solve(&y, &LsmrOptions::default())
         .expect("solve");
@@ -147,7 +152,7 @@ fn frustrated_two_factor_slope_solves_with_bounded_iterations() {
         Effect::new(&f, true, [&z[..]]).expect("slope effect"),
         Effect::new(&g, true, []).expect("plain effect"),
     ];
-    let r = Solver::new(effects, None, PreconditionerConfig::default())
+    let r = Solver::new(effects, None, additive())
         .expect("frustrated routing builds")
         .solve(&y, &LsmrOptions::default())
         .expect("solve");
@@ -169,7 +174,7 @@ fn near_collinear_cross_term_direction_survives_routing() {
         Effect::new(&f, false, [&z1[..]]).unwrap(),
         Effect::new(&f, false, [&z2[..]]).unwrap(),
     ];
-    let r = Solver::new(effects, None, PreconditionerConfig::default())
+    let r = Solver::new(effects, None, additive())
         .expect("near-collinear pair builds")
         .solve(&y, &LsmrOptions::default())
         .expect("solve");
@@ -251,7 +256,7 @@ fn surplus_component_sampled_matches_exact_reduction() {
     }
 }
 
-/// Regression for #98: with the default (additive Schwarz) preconditioner, a
+/// Regression for #98: under additive Schwarz, a
 /// level observed exactly once in a slope-carrying term that is not the first
 /// term used to crash LSMR with a preconditioner one column short of the
 /// operator. That singleton-slope direction is unidentified — a structural-zero
@@ -259,7 +264,7 @@ fn surplus_component_sampled_matches_exact_reduction() {
 /// preconditioner's shape. The solve must succeed and land the same identified
 /// fit the `Off`/`Diagonal` preconditioners already produce.
 #[test]
-fn singleton_level_in_non_first_slope_term_solves_under_default() {
+fn singleton_level_in_non_first_slope_term_solves_under_additive_schwarz() {
     // The firm-slope level-2 column is last, so an omitted one shows up as a shape mismatch.
     let worker = [0u32, 0, 1, 1, 2, 2];
     let firm = [2u32, 0, 0, 1, 1, 0];
@@ -273,19 +278,16 @@ fn singleton_level_in_non_first_slope_term_solves_under_default() {
         ]
     };
 
-    let solver = Solver::new(effects(), None, PreconditionerConfig::default())
-        .expect("default preconditioner builds");
+    let solver = Solver::new(effects(), None, additive()).expect("Schwarz preconditioner builds");
 
     // The preconditioner must match the operator's column count, uncovered ones included.
-    let precond = solver
-        .preconditioner()
-        .expect("default has a preconditioner");
+    let precond = solver.preconditioner().expect("has a preconditioner");
     assert_eq!(precond.ncols(), solver.n_dofs());
     assert_eq!(precond.nrows(), solver.n_dofs());
 
     let r = solver
         .solve(&y, &LsmrOptions::default())
-        .expect("default solve");
+        .expect("Schwarz solve");
     assert!(r.converged);
     assert_eq!(
         r.unidentified
@@ -325,16 +327,17 @@ fn singleton_level_in_non_first_slope_term_solves_under_default() {
     }
 }
 
-/// One slope column per sloped factor, as a function of the year code.
-struct Loadings {
-    what: &'static str,
-    worker_loading: fn(f64) -> f64,
-    firm_loading: fn(f64) -> f64,
-}
-
 /// Dual-factor slopes reduce through the exact dense Schur; the trigger is the loading values.
-#[test]
-fn dual_factor_slopes_build_across_loading_shapes() {
+/// Each case is one slope column per sloped factor, as a function of the year code.
+#[rstest]
+#[case::t_and_t_squared(|t: f64| t, |t: f64| t * t)]
+#[case::t_squared_and_t(|t: f64| t * t, |t: f64| t)]
+#[case::exp_and_t_squared(|t: f64| (0.3 * t).exp(), |t: f64| t * t)]
+#[case::t_and_log(|t: f64| t, |t: f64| (1.0 + t).ln())]
+fn dual_factor_slopes_build_across_loading_shapes(
+    #[case] worker_loading: fn(f64) -> f64,
+    #[case] firm_loading: fn(f64) -> f64,
+) {
     const N_YEARS: usize = 10;
     let n_obs = 50_000;
     let n_indiv = n_obs / N_YEARS;
@@ -345,49 +348,22 @@ fn dual_factor_slopes_build_across_loading_shapes() {
     let firm: Vec<u32> = (0..n_obs).map(|i| (i % n_firm) as u32).collect();
     let t: Vec<f64> = year.iter().map(|&y| y as f64).collect();
 
-    for Loadings {
-        what,
-        worker_loading,
-        firm_loading,
-    } in [
-        Loadings {
-            what: "t / t^2",
-            worker_loading: |t| t,
-            firm_loading: |t| t * t,
-        },
-        Loadings {
-            what: "t^2 / t",
-            worker_loading: |t| t * t,
-            firm_loading: |t| t,
-        },
-        Loadings {
-            what: "exp / t^2",
-            worker_loading: |t| (0.3 * t).exp(),
-            firm_loading: |t| t * t,
-        },
-        Loadings {
-            what: "t / log",
-            worker_loading: |t| t,
-            firm_loading: |t| (1.0 + t).ln(),
-        },
-    ] {
-        let z_worker: Vec<f64> = t.iter().map(|&t| worker_loading(t)).collect();
-        let z_firm: Vec<f64> = t.iter().map(|&t| firm_loading(t)).collect();
-        let y: Vec<f64> = (0..n_obs)
-            .map(|i| {
-                (worker[i] as f64 * 0.017).sin() + 0.4 * z_worker[i] - 0.2 * z_firm[i]
-                    + (i as f64 * 0.31).cos() * 0.1
-            })
-            .collect();
-        let effects = vec![
-            Effect::new(&worker, true, [&z_worker[..]]).expect("worker slope"),
-            Effect::new(&year, true, []).expect("year effect"),
-            Effect::new(&firm, true, [&z_firm[..]]).expect("firm slope"),
-        ];
-        let r = Solver::new(effects, None, PreconditionerConfig::default())
-            .unwrap_or_else(|e| panic!("{what}: build failed: {e}"))
-            .solve(&y, &LsmrOptions::default())
-            .unwrap_or_else(|e| panic!("{what}: solve failed: {e}"));
-        assert!(r.converged, "{what}: did not converge");
-    }
+    let z_worker: Vec<f64> = t.iter().map(|&t| worker_loading(t)).collect();
+    let z_firm: Vec<f64> = t.iter().map(|&t| firm_loading(t)).collect();
+    let y: Vec<f64> = (0..n_obs)
+        .map(|i| {
+            (worker[i] as f64 * 0.017).sin() + 0.4 * z_worker[i] - 0.2 * z_firm[i]
+                + (i as f64 * 0.31).cos() * 0.1
+        })
+        .collect();
+    let effects = vec![
+        Effect::new(&worker, true, [&z_worker[..]]).expect("worker slope"),
+        Effect::new(&year, true, []).expect("year effect"),
+        Effect::new(&firm, true, [&z_firm[..]]).expect("firm slope"),
+    ];
+    let r = Solver::new(effects, None, additive())
+        .expect("build")
+        .solve(&y, &LsmrOptions::default())
+        .expect("solve");
+    assert!(r.converged);
 }

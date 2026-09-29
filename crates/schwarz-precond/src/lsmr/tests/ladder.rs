@@ -1,5 +1,7 @@
 //! Warm starts and escalation: the preconditioner ladder.
 
+use rstest::rstest;
+
 use super::super::*;
 use crate::lsmr::fixtures::*;
 use crate::{Operator, SolveError};
@@ -48,21 +50,21 @@ fn test_mlsmr_warm_tolerance_is_relative_to_original_rhs() {
 
 /// A zero RHS must not shadow warm-start validation: the same bad `x0` has to be
 /// rejected whether or not `b` short-circuits the solve.
-#[test]
-fn test_mlsmr_rejects_bad_warm_start_for_any_rhs() {
+#[rstest]
+#[case::short_x0(&[1.0, 2.0, 3.0], &[0.0, 0.0])]
+#[case::nan_x0(&[1.0, 2.0, 3.0], &[0.0, f64::NAN, 0.0])]
+#[case::short_x0_zero_rhs(&[0.0, 0.0, 0.0], &[0.0, 0.0])]
+#[case::nan_x0_zero_rhs(&[0.0, 0.0, 0.0], &[0.0, f64::NAN, 0.0])]
+fn test_mlsmr_rejects_bad_warm_start_for_any_rhs(#[case] b: &[f64], #[case] x0: &[f64]) {
     let op = IdentityOp { n: 3 };
-    for b in [[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]] {
-        for x0 in [&[0.0, 0.0][..], &[0.0, f64::NAN, 0.0]] {
-            let options = MlsmrOptions {
-                warm_start: Some(x0),
-                ..Default::default()
-            };
-            assert!(matches!(
-                mlsmr(&op, &b, &op, 1e-8, 10, options),
-                Err(SolveError::InvalidInput { .. })
-            ));
-        }
-    }
+    let options = MlsmrOptions {
+        warm_start: Some(x0),
+        ..Default::default()
+    };
+    assert!(matches!(
+        mlsmr(&op, b, &op, 1e-8, 10, options),
+        Err(SolveError::InvalidInput { .. })
+    ));
 }
 
 /// Regression: `A·x₀` overflowing made `b - A·x₀` norm to NaN, which `init` read
@@ -82,6 +84,25 @@ fn test_mlsmr_warm_rejects_overflowing_warm_start_residual() {
     ));
 }
 
+/// `‖b‖` sets the tolerance even when the warm-start residual it is measured against is finite.
+#[test]
+fn test_mlsmr_warm_rejects_overflowing_rhs_norm() {
+    let op = DiagOp(vec![1.0, 1.1]);
+    let m = DiagOp(vec![1e-310; 2]);
+    let x0 = [1.2e308, 1.1e308];
+    let options = MlsmrOptions {
+        warm_start: Some(&x0),
+        ..Default::default()
+    };
+    let err = mlsmr(&op, &[1.3e308; 2], &m, 1e-10, 10, options)
+        .err()
+        .expect("an infinite ‖b‖ certified the warm start");
+    assert!(
+        matches!(&err, SolveError::InvalidInput { message, .. } if message.contains("rhs norm")),
+        "{err}"
+    );
+}
+
 #[test]
 fn test_mlsmr_zero_rhs_corrects_non_exact_warm_start() {
     let op = IdentityOp { n: 3 };
@@ -93,28 +114,32 @@ fn test_mlsmr_zero_rhs_corrects_non_exact_warm_start() {
     let result = mlsmr(&op, &[0.0, 0.0, 0.0], &op, 1e-10, 10, options).expect("warm correction");
 
     assert!(result.converged);
+    // `b = 0` leaves `‖b − A x₀‖` as the only scale, so the residual leg is satisfiable.
+    assert_eq!(result.stop_reason, LsmrStopReason::ResidualTolerance);
     assert!(vec_norm(&result.x) < 1e-12);
+    // `‖Aᵀb‖ = 0` here, so the audit's reference falls back to the stream's own.
+    assert!(result.normal_eq_residual.is_finite());
     assert!(result.iterations > 0);
 }
 
-#[test]
-fn test_mlsmr_exact_warm_start_is_returned_untouched() {
-    let cases: [(&dyn Operator, &[f64], &[f64]); 2] = [
-        (&IdentityOp { n: 3 }, &[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]),
-        (&ZeroSecondRow, &[0.0, 0.0], &[0.0, 7.0]),
-    ];
-    for (op, b, x0) in cases {
-        let options = MlsmrOptions {
-            warm_start: Some(x0),
-            ..Default::default()
-        };
-        let m = IdentityOp { n: op.ncols() };
-        let result = mlsmr(op, b, &m, 1e-10, 50, options).expect("exact warm start");
-        assert_eq!(result.stop_reason, LsmrStopReason::WarmStartExact);
-        assert!(result.converged);
-        assert_eq!(result.x, x0);
-        assert_eq!(result.iterations, 0);
-    }
+#[rstest]
+#[case::identity(&IdentityOp { n: 3 }, &[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0])]
+#[case::null_direction(&ZeroSecondRow, &[0.0, 0.0], &[0.0, 7.0])]
+fn test_mlsmr_exact_warm_start_is_returned_untouched(
+    #[case] op: &dyn Operator,
+    #[case] b: &[f64],
+    #[case] x0: &[f64],
+) {
+    let options = MlsmrOptions {
+        warm_start: Some(x0),
+        ..Default::default()
+    };
+    let m = IdentityOp { n: op.ncols() };
+    let result = mlsmr(op, b, &m, 1e-10, 50, options).expect("exact warm start");
+    assert_eq!(result.stop_reason, LsmrStopReason::WarmStartExact);
+    assert!(result.converged);
+    assert_eq!(result.x, x0);
+    assert_eq!(result.iterations, 0);
 }
 
 #[test]
@@ -136,12 +161,49 @@ fn test_mlsmr_converged_solve_is_never_escalated() {
     assert_ne!(result.stop_reason, LsmrStopReason::Escalated);
 }
 
+/// An escalation is a stop like any other: a warm-started one reports its residuals against the
+/// original `b`, not against the restart's own initial residual.
+#[test]
+fn test_warm_escalated_stop_is_measured_against_the_original_rhs() {
+    let (op, b) = vandermonde_ls();
+    let (tol, window) = (1e-12, Some(12));
+    let m = jacobi(&op);
+    let cold = mlsmr(&op, &b, &m, tol, 4, MlsmrOptions::default()).expect("cold rung");
+
+    let warm = |escalation| {
+        mlsmr(
+            &op,
+            &b,
+            &m,
+            tol,
+            3,
+            MlsmrOptions {
+                warm_start: Some(&cold.x),
+                escalation,
+                local_size: window,
+            },
+        )
+        .expect("warm rung")
+    };
+    // Same three iterations either way; only the exit taken differs.
+    let escalated = warm(Some(&FixedIterations(3)));
+    let exhausted = warm(None);
+
+    assert_eq!(escalated.stop_reason, LsmrStopReason::Escalated);
+    assert_eq!(exhausted.stop_reason, LsmrStopReason::MaxIterations);
+    assert_eq!(escalated.iterations, exhausted.iterations);
+    assert!(
+        (escalated.normal_eq_residual - exhausted.normal_eq_residual).abs()
+            <= 1e-12 * exhausted.normal_eq_residual,
+        "escalated stop reported {} against the restart's base, not {}",
+        escalated.normal_eq_residual,
+        exhausted.normal_eq_residual
+    );
+}
+
 #[test]
 fn test_mlsmr_ladder_warm_starts_and_escalates() {
-    let op = DenseOp::vandermonde(30, 12);
-    let b: Vec<f64> = (0..op.rows)
-        .map(|i| (1.0 + i as f64 / (op.rows - 1) as f64).ln())
-        .collect();
+    let (op, b) = vandermonde_ls();
     let (tol, window) = (1e-9, Some(12));
     let weak = IdentityOp { n: op.cols };
     let strong = jacobi(&op);
@@ -214,15 +276,110 @@ fn test_staleness_escalates_only_the_stalling_preconditioner() {
 }
 
 #[test]
-fn test_staleness_rejects_invalid_configuration() {
+fn test_staleness_default_exposes_its_fields() {
+    let default = Staleness::default();
+    assert_eq!(default.window(), 4);
+    assert_eq!(default.threshold(), 0.7);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn test_staleness_serde_round_trips() {
+    let default = Staleness::default();
+    let bytes = postcard::to_stdvec(&default).expect("serialize");
+    assert_eq!(
+        postcard::from_bytes::<Staleness>(&bytes).expect("deserialize"),
+        default
+    );
+}
+
+#[cfg(feature = "serde")]
+#[rstest]
+#[case::zero_window(0, 0.7)]
+#[case::threshold_one(4, 1.0)]
+fn test_staleness_serde_validates(#[case] window: usize, #[case] threshold: f64) {
+    let bytes = postcard::to_stdvec(&(window, threshold)).expect("serialize");
+    assert!(postcard::from_bytes::<Staleness>(&bytes).is_err());
+}
+
+#[test]
+fn test_staleness_rejects_a_zero_window() {
     assert!(matches!(
         Staleness::try_new(0, 0.7),
         Err(StalenessError::ZeroWindow)
     ));
-    for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.0, 1.5] {
-        assert!(matches!(
-            Staleness::try_new(4, threshold),
-            Err(StalenessError::InvalidThreshold { .. })
-        ));
-    }
+}
+
+#[rstest]
+fn test_staleness_rejects_an_invalid_threshold(
+    #[values(f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.0, 1.5)] threshold: f64,
+) {
+    assert!(matches!(
+        Staleness::try_new(4, threshold),
+        Err(StalenessError::InvalidThreshold { .. })
+    ));
+}
+
+/// A budget-exhausted warm start reports against `‖Aᵀb‖` like every other exit. `x₀ = 0.9 x*`
+/// makes `rhs = 0.1 b` exactly, so the un-rebased stream reference is 10× too small.
+#[test]
+fn test_mlsmr_maxiter_residuals_are_rebased_onto_the_original_rhs() {
+    let op = DenseOp::vandermonde(30, 12);
+    let x_true: Vec<f64> = (0..op.cols).map(|j| 1.0 / (1.0 + j as f64)).collect();
+    let mut b = vec![0.0; op.rows];
+    op.apply(&x_true, &mut b).expect("apply");
+    let x0: Vec<f64> = x_true.iter().map(|v| v * 0.9).collect();
+
+    let result = mlsmr(
+        &op,
+        &b,
+        &IdentityOp { n: op.cols },
+        1e-15,
+        3,
+        MlsmrOptions {
+            warm_start: Some(&x0),
+            ..Default::default()
+        },
+    )
+    .expect("warm solve");
+
+    assert_eq!(result.stop_reason, LsmrStopReason::MaxIterations);
+    assert!(!result.converged);
+
+    let expected = normal_equation_residual(&op, &result.x, &b)
+        / normal_equation_residual(&op, &vec![0.0; op.cols], &b);
+    assert!(
+        (result.normal_eq_residual - expected).abs() <= 1e-9 * expected,
+        "reported {} vs true relative {expected}",
+        result.normal_eq_residual,
+    );
+
+    let mut ax = vec![0.0; op.rows];
+    op.apply(&result.x, &mut ax).expect("apply");
+    let r: Vec<f64> = b.iter().zip(&ax).map(|(bi, ai)| bi - ai).collect();
+    let true_normr = vec_norm(&r);
+    assert!((result.residual_norm - true_normr).abs() <= 1e-9 * true_normr);
+}
+
+/// The cold audit's metric product `⟨Aᵀb, M⁻¹Aᵀb⟩` overflows at `‖b‖ ≳ 1e154` unless the
+/// gradient is scaled first, which failed every warm-started solve at that scale as soon as it
+/// converged.
+#[test]
+fn test_mlsmr_warm_start_audits_at_extreme_magnitude() {
+    let b = [1e160, 5e159];
+    let x0 = [9e159, 4.5e159];
+    let result = mlsmr(
+        &IdentityOp { n: 2 },
+        &b,
+        &IdentityOp { n: 2 },
+        1e-15,
+        5,
+        MlsmrOptions {
+            warm_start: Some(&x0),
+            ..Default::default()
+        },
+    )
+    .expect("the audit must stay representable");
+
+    assert!(result.converged, "{:?}", result.stop_reason);
 }

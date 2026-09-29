@@ -1,9 +1,5 @@
 //! Solver and preconditioner configuration types.
 //!
-//! `Option<&PreconditionerConfig>` accepts `None` (default Additive Schwarz),
-//! `Some(Off)` (identity), `Some(Additive(_))` (tuned), or
-//! `Some(Diagonal)` (Jacobi).
-//!
 //! Stability policy: enums that may gain variants (the preconditioner strategy
 //! set) stay `#[non_exhaustive]`, so adding a variant is non-breaking — external
 //! `match` sites already carry a wildcard arm. Option structs commit to public
@@ -13,7 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use schwarz_precond::ReductionStrategy;
+use crate::error::BuildError;
+
+pub use schwarz_precond::{ReductionStrategy, Staleness, StalenessError};
 
 /// Default `n_keep` threshold below which a Schur domain tries the exact dense backend.
 pub(crate) const DEFAULT_DENSE_SCHUR_THRESHOLD: usize = 24;
@@ -78,6 +76,20 @@ pub struct LocalSolverConfig {
     pub ridge: f64,
 }
 
+impl LocalSolverConfig {
+    /// Separate from any build so a deferred escalation can reject the config at construction.
+    pub(crate) fn validate(&self) -> Result<(), BuildError> {
+        if !self.ridge.is_finite() || self.ridge < 0.0 {
+            return Err(BuildError::InvalidRidge { value: self.ridge });
+        }
+        let tolerance = self.scaling.tolerance;
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(BuildError::InvalidScalingTolerance { value: tolerance });
+        }
+        Ok(())
+    }
+}
+
 impl Default for LocalSolverConfig {
     fn default() -> Self {
         Self {
@@ -109,7 +121,7 @@ pub struct ScalingConfig {
 pub enum ScalingFailure {
     /// Clamp residual deficits and record a [`BuildWarning`](crate::BuildWarning).
     Warn,
-    /// Fail with [`BuildError::UnscalableComponent`](crate::BuildError::UnscalableComponent).
+    /// Fail with [`BuildError::UnscalableComponent`].
     Error,
 }
 
@@ -153,13 +165,23 @@ pub enum PreconditionerConfig {
     },
     /// Diagonal/Jacobi; a zero diagonal takes the pseudo-inverse, pinning that coordinate to 0.
     Diagonal,
+    /// Diagonal first; additive Schwarz is built at, and used from, the first stalled contraction.
+    Adaptive {
+        /// Local solver configuration for the escalated Schwarz factorization.
+        local_solver: LocalSolverConfig,
+        /// Strategy for combining overlapping subdomain contributions.
+        reduction: ReductionStrategy,
+        /// Contraction-stall condition that triggers escalation.
+        stall: Staleness,
+    },
 }
 
 impl Default for PreconditionerConfig {
     fn default() -> Self {
-        Self::Additive {
+        Self::Adaptive {
             local_solver: LocalSolverConfig::default(),
             reduction: ReductionStrategy::default(),
+            stall: Staleness::default(),
         }
     }
 }

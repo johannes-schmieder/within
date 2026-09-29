@@ -12,10 +12,10 @@ use crate::channel::{Channel, ChannelPair};
 use crate::config::LocalSolverConfig;
 use crate::{BuildError, BuildWarning};
 
-use super::{find_all_active_levels, BlockDiagonals, CrossTab, Design};
+use super::{CrossTab, PreparedDesign};
 
 mod sddm;
-use crate::domain::Loading;
+use crate::domain::Column;
 use sddm::{convert, NotScalable};
 pub(crate) use sddm::{CoordinateMap, Grounding, LocalComponent, MatrixForm, SddmMatrix};
 
@@ -34,17 +34,14 @@ pub(crate) struct LocalDomain {
 
 /// Same-factor channel pairs are exactly orthogonal after whitening, so never enumerated.
 pub(crate) fn build_local_domains(
-    design: &Design<'_>,
-    weights: Option<&[f64]>,
+    prepared: &PreparedDesign<'_>,
     config: &LocalSolverConfig,
 ) -> Result<(Vec<LocalDomain>, Vec<BuildWarning>), BuildError> {
     use rayon::prelude::*;
 
-    if !config.ridge.is_finite() || config.ridge < 0.0 {
-        return Err(BuildError::InvalidRidge {
-            value: config.ridge,
-        });
-    }
+    let design = &prepared.design;
+
+    config.validate()?;
 
     let channels: Vec<Channel> = (0..design.n_factors())
         .flat_map(|term| design.channels(term))
@@ -59,24 +56,18 @@ pub(crate) fn build_local_domains(
                 .map(move |&cols| ChannelPair { rows, cols })
         })
         .collect();
-    let all_active = find_all_active_levels(design);
-
     let per_pair: Vec<(Vec<LocalDomain>, Vec<BuildWarning>)> = pairs
         .par_iter()
         .map(|&pair| {
-            let Some((full_ct, full_diag, l2g)) =
-                CrossTab::build_for_pair_with_active(design, weights, pair, &all_active)
-            else {
-                return Ok((Vec::new(), Vec::new()));
-            };
-            let class = if matches!(design.loading(pair.rows), Loading::Constant)
-                && matches!(design.loading(pair.cols), Loading::Constant)
+            let (full_ct, l2g) = CrossTab::build_for_pair(prepared, pair);
+            let class = if design.column(pair.rows) == Column::Intercept
+                && design.column(pair.cols) == Column::Intercept
             {
                 ComponentClass::KnownLaplacian
             } else {
                 ComponentClass::General
             };
-            split_into_subdomains(pair, class, full_ct, full_diag, &l2g, config)
+            split_into_subdomains(prepared, pair, class, full_ct, &l2g, config)
         })
         .collect::<Result<_, BuildError>>()?;
     let mut domain_pairs = Vec::new();
@@ -89,7 +80,7 @@ pub(crate) fn build_local_domains(
     // A slope channel breaks `1/√c`'s equal-informativeness assumption (#94), so stay uniform.
     if !channels
         .iter()
-        .any(|&c| design.loading(c).covariate().is_some())
+        .any(|&c| design.column(c) != Column::Intercept)
     {
         compute_partition_weights(&mut domain_pairs, design.n_dofs);
     }
@@ -99,36 +90,42 @@ pub(crate) fn build_local_domains(
 
 /// Dead singletons (zero diagonal, an exact-zero design column) produce no subdomain.
 fn split_into_subdomains(
+    prepared: &PreparedDesign<'_>,
     pair: ChannelPair,
     class: ComponentClass,
     full_ct: CrossTab,
-    full_diag: BlockDiagonals,
     l2g: &[u32],
     config: &LocalSolverConfig,
 ) -> Result<(Vec<LocalDomain>, Vec<BuildWarning>), BuildError> {
+    let row_diag = prepared.channel_diagonal(pair.rows);
+    let col_diag = prepared.channel_diagonal(pair.cols);
+    debug_assert_eq!(
+        (row_diag.len(), col_diag.len()),
+        (full_ct.n_rows(), full_ct.n_cols())
+    );
     let n_rows_full = full_ct.n_rows();
     let components = full_ct.bipartite_connected_components();
 
-    let (cross_tabs, diagonals): (Vec<CrossTab>, Vec<Vec<f64>>) = if components.len() == 1 {
-        let flat = full_diag.rows.into_iter().chain(full_diag.cols).collect();
-        (vec![full_ct], vec![flat])
+    let cross_tabs: Vec<CrossTab> = if components.len() == 1 {
+        vec![full_ct]
     } else {
         let mut row_remap = vec![u32::MAX; full_ct.n_rows()];
         let mut col_remap = vec![u32::MAX; full_ct.n_cols()];
-        let cross_tabs = components
+        components
             .iter()
             .map(|comp| full_ct.extract_component(comp, &mut row_remap, &mut col_remap))
-            .collect();
-        let diagonals = components
-            .iter()
-            .map(|comp| full_diag.extract_component(comp))
-            .collect();
-        (cross_tabs, diagonals)
+            .collect()
     };
 
     let mut domains = Vec::with_capacity(components.len());
     let mut warnings = Vec::new();
-    for ((comp, comp_ct), comp_diag) in components.iter().zip(cross_tabs).zip(diagonals) {
+    for (comp, comp_ct) in components.iter().zip(cross_tabs) {
+        let comp_diag: Vec<f64> = comp
+            .rows
+            .iter()
+            .map(|&i| row_diag[i])
+            .chain(comp.cols.iter().map(|&i| col_diag[i]))
+            .collect();
         if comp_diag.iter().all(|&v| v == 0.0) {
             continue;
         }
@@ -205,28 +202,22 @@ fn compute_partition_weights(domain_pairs: &mut [LocalDomain], n_dofs: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Design;
-    use crate::observation::ObservationFrame;
+    use crate::domain::{Design, PreparedDesign};
     use crate::Effect;
 
-    fn make_test_design() -> Design<'static> {
-        let frame = ObservationFrame::new(
-            vec![
-                vec![0u32, 1, 2, 0, 1, 2].into(),
-                vec![0u32, 1, 0, 1, 0, 1].into(),
-                vec![0u32, 0, 1, 1, 0, 1].into(),
-            ],
-            Vec::new(),
-        )
-        .expect("valid frame");
-        Design::from_frame(frame).expect("valid test design")
+    fn make_test_design() -> PreparedDesign<'static> {
+        PreparedDesign::from_levels_for_test(vec![
+            vec![0, 1, 2, 0, 1, 2],
+            vec![0, 1, 0, 1, 0, 1],
+            vec![0, 0, 1, 1, 0, 1],
+        ])
     }
 
     #[test]
     fn test_full_cover_domain_count() {
         let dm = make_test_design();
-        let (domain_pairs, _) = build_local_domains(&dm, None, &LocalSolverConfig::default())
-            .expect("plain domains build");
+        let (domain_pairs, _) =
+            build_local_domains(&dm, &LocalSolverConfig::default()).expect("plain domains build");
         // 3 factor pairs; each pair may produce multiple components
         assert!(domain_pairs.len() >= 3);
     }
@@ -234,9 +225,9 @@ mod tests {
     #[test]
     fn test_partition_of_unity() {
         let dm = make_test_design();
-        let (domain_pairs, _) = build_local_domains(&dm, None, &LocalSolverConfig::default())
-            .expect("plain domains build");
-        let n_dofs = dm.n_dofs;
+        let (domain_pairs, _) =
+            build_local_domains(&dm, &LocalSolverConfig::default()).expect("plain domains build");
+        let n_dofs = dm.design.n_dofs;
         // Two-sided PoU: squared weights must sum to 1 at every DOF.
         let mut weight_sq_sum = vec![0.0; n_dofs];
         for ld in &domain_pairs {
@@ -265,8 +256,9 @@ mod tests {
             Effect::new(&levels_c, true, []).expect("effect c"),
         ])
         .expect("valid slope design");
+        let design = PreparedDesign::unweighted_for_test(design);
 
-        let (domain_pairs, _) = build_local_domains(&design, None, &LocalSolverConfig::default())
+        let (domain_pairs, _) = build_local_domains(&design, &LocalSolverConfig::default())
             .expect("slope domains build");
 
         for ld in &domain_pairs {
@@ -280,7 +272,7 @@ mod tests {
         }
 
         // Non-vacuity: without a shared DOF, uniform vs 1/√c weights are indistinguishable.
-        let mut counts = vec![0u32; design.n_dofs];
+        let mut counts = vec![0u32; design.design.n_dofs];
         for ld in &domain_pairs {
             for &idx in ld.core.global_indices() {
                 counts[idx as usize] += 1;
@@ -295,9 +287,9 @@ mod tests {
     #[test]
     fn test_domains_cover_all_dofs() {
         let dm = make_test_design();
-        let (domain_pairs, _) = build_local_domains(&dm, None, &LocalSolverConfig::default())
-            .expect("plain domains build");
-        let mut covered = vec![false; dm.n_dofs];
+        let (domain_pairs, _) =
+            build_local_domains(&dm, &LocalSolverConfig::default()).expect("plain domains build");
+        let mut covered = vec![false; dm.design.n_dofs];
         for ld in &domain_pairs {
             for &idx in ld.core.global_indices() {
                 covered[idx as usize] = true;

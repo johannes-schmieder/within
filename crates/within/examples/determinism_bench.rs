@@ -48,7 +48,7 @@ fn main() {
                         .iter()
                         .map(|column| Effect::new(column, true, []).unwrap())
                         .collect::<Vec<_>>(),
-                    Some(weights.clone()),
+                    Some(&weights),
                     &PreconditionerConfig::Additive {
                         local_solver: LocalSolverConfig::default(),
                         reduction: ReductionStrategy::ParallelReduction,

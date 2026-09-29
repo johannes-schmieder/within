@@ -1,12 +1,13 @@
 use ndarray::Array2;
 use proptest::prelude::*;
-use within::{solve, solve_batch, Channel, CoefficientAddress, LsmrOptions};
+use rstest::rstest;
+use within::{solve, solve_batch, Channel, CoefficientAddress, LsmrOptions, PreconditionerConfig};
 
 #[path = "common/property_strategies.rs"]
 mod strategies;
-use strategies::{additive_precond, random_fe_problem_strategy};
+use strategies::{any_preconditioner, random_fe_problem_strategy};
 
-fn at(term: usize, level: usize, column: usize) -> CoefficientAddress {
+fn at(term: usize, level: u32, column: usize) -> CoefficientAddress {
     CoefficientAddress {
         channel: Channel { term, column },
         level,
@@ -22,13 +23,20 @@ fn tight_params() -> LsmrOptions {
     }
 }
 
-/// L2 agreement with a mixed absolute+relative tolerance: returns the actual
-/// discrepancy and the tolerance it must stay under. A near-saturated design
-/// drives the residual (hence `expected`) toward zero, where a purely relative
-/// check amplifies machine-precision noise into a spurious failure; the `atol`
-/// floor absorbs that regime while `rtol` still catches real divergence.
-fn l2_close(actual: &[f64], expected: &[f64]) -> (f64, f64) {
-    const ATOL: f64 = 1e-9;
+/// The stop contract `‖√w r‖ ≤ tol ‖√w y‖` as a bound on the unweighted `‖r‖` a solve may leave.
+fn residual_bound(y: &[f64], w: Option<&[f64]>) -> f64 {
+    let (norm_sq, min_w) = match w {
+        None => (y.iter().map(|v| v * v).sum::<f64>(), 1.0),
+        Some(w) => (
+            y.iter().zip(w).map(|(v, w)| w * v * v).sum::<f64>(),
+            w.iter().copied().fold(f64::INFINITY, f64::min),
+        ),
+    };
+    tight_params().tol * (norm_sq / min_w).sqrt()
+}
+
+/// `(|Δ|, tol)`: two solves agree within their residual bounds `floor`, plus `RTOL` relative.
+fn l2_close(actual: &[f64], expected: &[f64], floor: f64) -> (f64, f64) {
     const RTOL: f64 = 1e-6;
     let num = actual
         .iter()
@@ -37,7 +45,7 @@ fn l2_close(actual: &[f64], expected: &[f64]) -> (f64, f64) {
         .sum::<f64>()
         .sqrt();
     let expected_norm = expected.iter().map(|e| e * e).sum::<f64>().sqrt();
-    (num, ATOL + RTOL * expected_norm)
+    (num, floor + RTOL * expected_norm)
 }
 
 proptest! {
@@ -49,9 +57,9 @@ proptest! {
     fn prop_response_scaling_equivariance(
         (cats, y) in random_fe_problem_strategy(),
         c in prop_oneof![-8.0f64..=-0.25, 0.25f64..=8.0],
+        precond in any_preconditioner(),
     ) {
         let params = tight_params();
-        let precond = additive_precond();
 
         let base = solve(cats.view(), &y, None, &params, &precond).unwrap();
         prop_assert!(base.converged);
@@ -61,7 +69,8 @@ proptest! {
         prop_assert!(scaled.converged);
 
         let expected: Vec<f64> = base.demeaned.iter().map(|v| c * v).collect();
-        let (num, tol) = l2_close(&scaled.demeaned, &expected);
+        let floor = residual_bound(&y_scaled, None) + c.abs() * residual_bound(&y, None);
+        let (num, tol) = l2_close(&scaled.demeaned, &expected, floor);
         prop_assert!(
             num <= tol,
             "response-scaling equivariance violated: |Δ| = {num:.3e} > tol {tol:.3e} (c={c})"
@@ -78,9 +87,9 @@ proptest! {
             (Just(cats), Just(y), proptest::collection::vec(0.2f64..3.0, n))
         }),
         k in 0.25f64..=6.0,
+        precond in any_preconditioner(),
     ) {
         let params = tight_params();
-        let precond = additive_precond();
 
         let base = solve(cats.view(), &y, Some(w.as_slice()), &params, &precond).unwrap();
         prop_assert!(base.converged);
@@ -89,7 +98,8 @@ proptest! {
         let scaled = solve(cats.view(), &y, Some(w_scaled.as_slice()), &params, &precond).unwrap();
         prop_assert!(scaled.converged);
 
-        let (num, tol) = l2_close(&scaled.demeaned, &base.demeaned);
+        let floor = residual_bound(&y, Some(&w_scaled)) + residual_bound(&y, Some(&w));
+        let (num, tol) = l2_close(&scaled.demeaned, &base.demeaned, floor);
         prop_assert!(
             num <= tol,
             "weight-scaling invariance violated: |Δ| = {num:.3e} > tol {tol:.3e} (k={k})"
@@ -108,9 +118,9 @@ proptest! {
                 proptest::collection::vec(proptest::collection::vec(-10.0f64..10.0, n), 2..=4),
             )
         }),
+        precond in any_preconditioner(),
     ) {
         let params = tight_params();
-        let precond = additive_precond();
 
         let refs: Vec<&[f64]> = ys.iter().map(Vec::as_slice).collect();
         let batch = solve_batch(cats.view(), &refs, None, &params, &precond).unwrap();
@@ -119,7 +129,7 @@ proptest! {
         for (j, y) in ys.iter().enumerate() {
             let single = solve(cats.view(), y, None, &params, &precond).unwrap();
             prop_assert!(single.converged);
-            let (num, tol) = l2_close(batch.demeaned(j), &single.demeaned);
+            let (num, tol) = l2_close(batch.demeaned(j), &single.demeaned, 2.0 * residual_bound(y, None));
             prop_assert!(
                 num <= tol,
                 "batch vs column-wise residual mismatch (column {j}): |Δ| = {num:.3e} > tol {tol:.3e}"
@@ -133,9 +143,11 @@ proptest! {
     /// exactly `0` — so assert that directly (the equivariance and residual
     /// checks are gauge-invariant and cannot see it).
     #[test]
-    fn prop_unidentified_slots_are_zero((cats, y) in random_fe_problem_strategy()) {
+    fn prop_unidentified_slots_are_zero(
+        (cats, y) in random_fe_problem_strategy(),
+        precond in any_preconditioner(),
+    ) {
         let params = tight_params();
-        let precond = additive_precond();
         let result = solve(cats.view(), &y, None, &params, &precond).unwrap();
         prop_assert!(result.converged);
 
@@ -144,7 +156,7 @@ proptest! {
             prop_assert_eq!(
                 result.x[slot],
                 0.0,
-                "unidentified slot (term {}, level {}, col {}) = {}, expected exactly 0",
+                "unidentified slot (term {}, level {:?}, col {}) = {}, expected exactly 0",
                 u.channel.term,
                 u.level,
                 u.channel.column,
@@ -160,18 +172,26 @@ proptest! {
 /// thing the gauge-invariant optimality and residual checks cannot verify, and
 /// the cheap guard against a weighting/labeling misconception shared between the
 /// solver and a self-referential oracle.
-#[test]
-fn saturated_single_factor_recovers_level_means() {
+#[rstest]
+fn saturated_single_factor_recovers_level_means(
+    #[values(
+        PreconditionerConfig::Off,
+        PreconditionerConfig::Diagonal,
+        strategies::additive(),
+        strategies::adaptive()
+    )]
+    precond: PreconditionerConfig,
+) {
     // Level means: {1,3}→2, {2,4,6}→4, {5}→5.
     let cats = Array2::from_shape_vec((6, 1), vec![0u32, 0, 1, 1, 1, 2]).unwrap();
     let y = vec![1.0, 3.0, 2.0, 4.0, 6.0, 5.0];
     let params = tight_params();
-    let precond = additive_precond();
     let result = solve(cats.view(), &y, None, &params, &precond).unwrap();
     assert!(result.converged);
 
     for (level, &mean) in [2.0, 4.0, 5.0].iter().enumerate() {
-        let slot = result.layout.index(at(0, level, 0)).unwrap();
+        let label = u32::try_from(level).expect("fixture level fits u32");
+        let slot = result.layout.index(at(0, label, 0)).unwrap();
         assert!(
             (result.x[slot] - mean).abs() < 1e-6,
             "level {level}: coefficient {} != level mean {mean}",

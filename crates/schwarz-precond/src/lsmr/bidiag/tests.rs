@@ -1,7 +1,117 @@
 //! White-box checks on the bidiagonalization itself.
 
-use super::{dot, Bidiagonalization, GolubKahan};
-use crate::lsmr::fixtures::DenseOp;
+use rstest::rstest;
+
+use super::{alpha_from_vp, dot, par_dot, Bidiagonalization, GolubKahan};
+use crate::lsmr::fixtures::{DenseOp, DiagOp};
+use crate::{Operator, SolveError};
+
+/// A NaN `vp` clamped to α = 0 via `f64::max`; a product bound overflowed to ∞ or underflowed to 0.
+#[rstest]
+#[case::nan(&[1.0, f64::NAN], &[1.0, 1.0])]
+#[case::infinity(&[1.0, f64::INFINITY], &[1.0, 1.0])]
+#[case::indefinite(&[-1e100], &[1e100])]
+#[case::overflowing_bound(&[-1e302, f64::MAX, f64::MAX], &[1.0, 0.0, 0.0])]
+#[case::underflowing_bound(&[-2e300, 1e308], &[1e-316, 0.0])]
+fn alpha_from_vp_rejects_non_finite_and_indefinite_pairs(#[case] v: &[f64], #[case] p: &[f64]) {
+    assert!(
+        matches!(
+            alpha_from_vp(v, p).map_err(SolveError::from),
+            Err(SolveError::InvalidInput { .. })
+        ),
+        "{v:?}·{p:?} accepted"
+    );
+}
+
+#[rstest]
+#[case::unit_scale(&[1.0, 1.0], &[1.0, -1.0 - 1e-12])]
+#[case::tiny_scale(&[1e-100, 1e-100], &[1e-100, -1.000000000001e-100])]
+#[case::extreme_scales(&[1e-316, 1e-316], &[1e308, -1.000000000001e308])]
+fn alpha_from_vp_clamps_a_pair_within_root_epsilon(#[case] v: &[f64], #[case] p: &[f64]) {
+    assert_eq!(alpha_from_vp(v, p).expect("within √ε"), 0.0, "{v:?}·{p:?}");
+}
+
+/// `cos(v, p̃) ≈ 1e-328` underflows a re-sum normalized to 1, though `α ≈ 1e-158` does not.
+#[test]
+fn a_tiny_cosine_keeps_its_gradient_length() {
+    let alpha = alpha_from_vp(&[1e-158, 0.0], &[1e-158, 1e170]).expect("positive pair");
+    assert!((alpha / 1e-158 - 1.0).abs() < 1e-12, "{alpha:e}");
+}
+
+/// A `vp` whose terms round to subnormals takes its sign from the scaled re-sum.
+#[test]
+fn a_negative_subnormal_pair_keeps_its_gradient_length() {
+    let t = 2f64.powi(-537);
+    let alpha = alpha_from_vp(&[t; 3], &[1.49 * t, 1.49 * t, -2.9 * t]).expect("positive pair");
+    assert!(
+        (alpha / (0.08f64.sqrt() * t) - 1.0).abs() < 1e-10,
+        "{alpha:e}"
+    );
+}
+
+/// A `vp` rounded below zero is 0 however the fallback's normalized re-sum rounds.
+#[test]
+fn a_negatively_rounded_pair_clamps_however_the_resum_rounds() {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut draw = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+    for _ in 0..40 {
+        // Past the parallel threshold, so `vp` and the re-sum associate differently.
+        let v: Vec<f64> = (0..20_000).map(|_| draw()).collect();
+        let mut p: Vec<f64> = (0..20_000).map(|_| draw()).collect();
+        let c = dot(&v, &p) / dot(&v, &v);
+        p.iter_mut().zip(&v).for_each(|(pi, vi)| *pi -= c * vi);
+        if par_dot(&v, &p) < 0.0 {
+            assert_eq!(alpha_from_vp(&v, &p).expect("within √ε"), 0.0);
+        }
+    }
+}
+
+/// `beta == 0.0` and `alpha > 0.0` are both false for NaN; unguarded, it poisons the run.
+#[test]
+fn a_non_finite_operator_norm_is_an_error() {
+    let result = crate::lsmr::lsmr(&DiagOp(vec![f64::NAN, 1.0]), &[1.0, 1.0], 1e-10, 50, None);
+    assert!(matches!(result, Err(SolveError::InvalidInput { .. })));
+}
+
+/// A finite adjoint keeps `init` clean, so the overflow reaches the `step` guard on β.
+#[test]
+fn an_overflow_after_initialization_is_an_error() {
+    struct OverflowingForward;
+    impl Operator for OverflowingForward {
+        fn nrows(&self) -> usize {
+            2
+        }
+        fn ncols(&self) -> usize {
+            2
+        }
+        fn apply(&self, _x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+            y.fill(f64::MAX);
+            Ok(())
+        }
+        fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+            y.copy_from_slice(x);
+            Ok(())
+        }
+    }
+    let (mut bidiag, first) = GolubKahan::init(
+        &OverflowingForward,
+        &[1.0, 1.0],
+        crate::lsmr::vec_norm(&[1.0, 1.0]),
+        0,
+    )
+    .expect("finite init");
+    assert!(first.alpha > 0.0);
+    let err = bidiag.step().err().expect("an overflowing β was accepted");
+    assert!(
+        matches!(&err, SolveError::InvalidInput { message, .. } if message.contains("β")),
+        "{err}"
+    );
+}
 
 #[test]
 fn scalar_reductions_and_fused_updates_are_bit_identical_across_workers() {
@@ -55,7 +165,8 @@ fn local_reorth_keeps_the_window_vectors_orthogonal() {
     // Run the bidiagonalization directly so we can capture v_k after each
     // step. Mirrors the body of `lsmr_from_bidiag` minus the recurrence.
     let collect_vs = |window_size: usize| -> Vec<Vec<f64>> {
-        let (mut bidiag, _) = GolubKahan::init(&op, &b, window_size).expect("init");
+        let (mut bidiag, _) =
+            GolubKahan::init(&op, &b, crate::lsmr::vec_norm(&b), window_size).expect("init");
         let mut vs = vec![bidiag.v().to_vec()];
         for _ in 0..n_iters {
             bidiag.step().expect("step");

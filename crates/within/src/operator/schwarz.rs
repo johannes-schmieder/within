@@ -8,25 +8,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::block_elim::BlockElimSolver;
-use crate::config::{LocalSolverConfig, PreconditionerConfig};
-use crate::domain::Loading;
-use crate::domain::{Design, LocalDomain};
+use crate::config::{LocalSolverConfig, PreconditionerConfig, ReductionStrategy, Staleness};
+use crate::domain::{LocalDomain, PreparedDesign};
+use crate::operator::gauge::GaugeConstraint;
 use crate::{BuildError, BuildWarning};
 
 #[cfg(test)]
 mod tests;
 
+/// The additive Schwarz map's description: what the builder builds and a built map records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SchwarzConfig {
+    pub(crate) local_solver: LocalSolverConfig,
+    pub(crate) reduction: ReductionStrategy,
+}
+
 /// Concrete additive Schwarz type used in the parent crate.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct FeSchwarz {
     inner: SchwarzPreconditioner<BlockElimSolver>,
-    config: PreconditionerConfig,
-}
-
-impl FeSchwarz {
-    fn config(&self) -> &PreconditionerConfig {
-        &self.config
-    }
+    config: SchwarzConfig,
 }
 
 impl std::fmt::Debug for FeSchwarz {
@@ -97,22 +98,18 @@ impl Operator for DiagonalPreconditioner {
 }
 
 /// `n_dofs` may exceed the span of subdomain indices; an uncovered column resolves to `0`.
-pub(crate) fn build_additive_with_strategy(
+pub(crate) fn build_additive(
     domains: Vec<LocalDomain>,
-    config: &LocalSolverConfig,
-    strategy: schwarz_precond::ReductionStrategy,
+    config: &SchwarzConfig,
     n_dofs: usize,
 ) -> Result<FeSchwarz, BuildError> {
     let entries = domains
         .into_par_iter()
-        .map(|domain| build_entry(domain, config))
+        .map(|domain| build_entry(domain, &config.local_solver))
         .collect::<Result<Vec<_>, BuildError>>()?;
     Ok(FeSchwarz {
-        inner: SchwarzPreconditioner::with_n_dofs(entries, n_dofs, strategy),
-        config: PreconditionerConfig::Additive {
-            local_solver: config.clone(),
-            reduction: strategy,
-        },
+        inner: SchwarzPreconditioner::with_n_dofs(entries, n_dofs, config.reduction),
+        config: config.clone(),
     })
 }
 
@@ -131,13 +128,26 @@ pub(crate) fn build_entry(
 pub struct Preconditioner {
     inner: Variant,
     build_duration: Duration,
+    /// Cross-term nulls every apply keeps out of the solve space, `P M⁻¹ P`; a property of the
+    /// design the solver attaches, so it is rebuilt rather than serialized.
+    #[serde(skip)]
+    pub(crate) gauge: Option<Arc<GaugeConstraint>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Variant {
-    // Keep Additive first: postcard encodes by declaration order and the fixture depends on it.
+    // Append only: postcard encodes by declaration order and the fixtures depend on it.
     Additive(FeSchwarz),
     Diagonal(DiagonalPreconditioner),
+    Adaptive(AdaptiveLadder),
+}
+
+/// An unescalated `Adaptive` map: the diagonal plus what a reusing solver needs to escalate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AdaptiveLadder {
+    base: DiagonalPreconditioner,
+    pub(crate) stall: Staleness,
+    pub(crate) escalated: SchwarzConfig,
 }
 
 impl Preconditioner {
@@ -146,15 +156,42 @@ impl Preconditioner {
         match &self.inner {
             Variant::Additive(_) => "Additive",
             Variant::Diagonal(_) => "Diagonal",
+            Variant::Adaptive(_) => "Adaptive",
         }
     }
 
-    /// Complete configuration used to build this preconditioner.
-    pub fn config(&self) -> &PreconditionerConfig {
-        const DIAGONAL: PreconditionerConfig = PreconditionerConfig::Diagonal;
+    /// The ladder a reusing solver resumes, while this map has not escalated.
+    pub(crate) fn ladder(&self) -> Option<&AdaptiveLadder> {
         match &self.inner {
-            Variant::Additive(p) => p.config(),
-            Variant::Diagonal(_) => &DIAGONAL,
+            Variant::Adaptive(ladder) => Some(ladder),
+            Variant::Additive(_) | Variant::Diagonal(_) => None,
+        }
+    }
+
+    /// Drop the ladder for a design with no factor pair to escalate to, keeping its diagonal.
+    pub(crate) fn settle(self) -> Self {
+        match self.inner {
+            Variant::Adaptive(ladder) => Self {
+                inner: Variant::Diagonal(ladder.base),
+                ..self
+            },
+            Variant::Additive(_) | Variant::Diagonal(_) => self,
+        }
+    }
+
+    /// The configuration that rebuilds this map.
+    pub fn config(&self) -> PreconditionerConfig {
+        match &self.inner {
+            Variant::Additive(p) => PreconditionerConfig::Additive {
+                local_solver: p.config.local_solver.clone(),
+                reduction: p.config.reduction,
+            },
+            Variant::Diagonal(_) => PreconditionerConfig::Diagonal,
+            Variant::Adaptive(ladder) => PreconditionerConfig::Adaptive {
+                local_solver: ladder.escalated.local_solver.clone(),
+                reduction: ladder.escalated.reduction,
+                stall: ladder.stall,
+            },
         }
     }
 
@@ -180,64 +217,69 @@ impl Preconditioner {
     }
 }
 
-impl Operator for Preconditioner {
-    fn nrows(&self) -> usize {
+impl Preconditioner {
+    fn base(&self) -> &dyn Operator {
         match &self.inner {
-            Variant::Additive(p) => p.nrows(),
-            Variant::Diagonal(p) => p.nrows(),
-        }
-    }
-
-    fn ncols(&self) -> usize {
-        match &self.inner {
-            Variant::Additive(p) => p.ncols(),
-            Variant::Diagonal(p) => p.ncols(),
-        }
-    }
-
-    fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), schwarz_precond::SolveError> {
-        match &self.inner {
-            Variant::Additive(p) => p.apply(x, y),
-            Variant::Diagonal(p) => p.apply(x, y),
-        }
-    }
-
-    fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), schwarz_precond::SolveError> {
-        match &self.inner {
-            Variant::Additive(p) => p.apply_adjoint(x, y),
-            Variant::Diagonal(p) => p.apply_adjoint(x, y),
+            Variant::Additive(p) => p,
+            Variant::Diagonal(p) => p,
+            Variant::Adaptive(ladder) => &ladder.base,
         }
     }
 }
 
-fn build_diagonal(
-    design: &Design<'_>,
-    weights: Option<&[f64]>,
-) -> Result<DiagonalPreconditioner, BuildError> {
-    let mut diag = vec![0.0; design.n_dofs];
+impl Operator for Preconditioner {
+    fn nrows(&self) -> usize {
+        self.base().nrows()
+    }
 
-    for (factor_idx, term) in design.terms.iter().enumerate() {
-        let levels = design.frame.level_column(factor_idx);
-        let w = |uid: usize| weights.map_or(1.0, |ws| ws[uid]);
-        for (column, loading) in term.columns.iter().enumerate() {
-            let base = term.column_base(column);
-            let slice = &mut diag[base..base + term.n_levels];
-            match loading {
-                Loading::Constant => {
-                    for (uid, &level) in levels.iter().enumerate() {
-                        slice[level as usize] += w(uid);
-                    }
-                }
-                Loading::Covariate(z_col) => {
-                    let z = design.frame.loading_column(*z_col as usize);
-                    for (uid, &level) in levels.iter().enumerate() {
-                        // Keep `w * z * z` left-to-right: a zero weight kills a huge `z` first.
-                        slice[level as usize] += w(uid) * z[uid] * z[uid];
-                    }
-                }
-            }
+    fn ncols(&self) -> usize {
+        self.base().ncols()
+    }
+
+    fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), schwarz_precond::SolveError> {
+        match &self.gauge {
+            Some(gauge) => gauge.constrain(x, y, |p, y| self.base().apply(p, y)),
+            None => self.base().apply(x, y),
         }
     }
+
+    fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), schwarz_precond::SolveError> {
+        self.apply(x, y)
+    }
+}
+
+/// Build the diagonal/Jacobi map.
+pub(crate) fn build_diagonal(prepared: &PreparedDesign<'_>) -> Result<Preconditioner, BuildError> {
+    let build_started = Instant::now();
+    let diagonal = diagonal_map(prepared)?;
+    Ok(Preconditioner {
+        inner: Variant::Diagonal(diagonal),
+        build_duration: build_started.elapsed(),
+        gauge: None,
+    })
+}
+
+/// Build the diagonal base of an `Adaptive` strategy; the Schwarz rung is left to a stalled solve.
+pub(crate) fn build_adaptive(
+    prepared: &PreparedDesign<'_>,
+    stall: Staleness,
+    escalated: SchwarzConfig,
+) -> Result<Preconditioner, BuildError> {
+    let build_started = Instant::now();
+    let base = diagonal_map(prepared)?;
+    Ok(Preconditioner {
+        inner: Variant::Adaptive(AdaptiveLadder {
+            base,
+            stall,
+            escalated,
+        }),
+        build_duration: build_started.elapsed(),
+        gauge: None,
+    })
+}
+
+fn diagonal_map(prepared: &PreparedDesign<'_>) -> Result<DiagonalPreconditioner, BuildError> {
+    let mut diag = prepared.gram_diagonal();
 
     // A zero diagonal is an unidentified DOF, so the pseudo-inverse keeps it in the null space.
     for (index, d) in diag.iter_mut().enumerate() {
@@ -256,47 +298,22 @@ fn build_diagonal(
     })
 }
 
-/// Build a [`Preconditioner`] from a design and optional weights, plus any warnings.
-pub(crate) fn build_preconditioner(
-    design: &Design<'_>,
-    weights: Option<&[f64]>,
-    config: Option<&PreconditionerConfig>,
+/// Build the additive Schwarz map plus its warnings; `None` when the design has no factor-pair
+/// subdomain to build on, where plain LSMR is the fallback.
+pub(crate) fn build_schwarz(
+    prepared: &PreparedDesign<'_>,
+    config: &SchwarzConfig,
 ) -> Result<(Option<Preconditioner>, Vec<BuildWarning>), BuildError> {
-    use crate::domain::build_local_domains;
-
-    // Weights are pre-validated by the sole caller, whose permutation preserves length and sign.
-    let default_cfg = PreconditionerConfig::default();
-    let resolved = config.unwrap_or(&default_cfg);
-    // Measure preconditioner build time
     let build_started = Instant::now();
-    let (inner, warnings) = match resolved {
-        PreconditionerConfig::Off => {
-            return Ok((None, Vec::new()));
-        }
-        PreconditionerConfig::Additive {
-            local_solver,
-            reduction,
-        } => {
-            let (domains, warnings) = build_local_domains(design, weights, local_solver)?;
-            if domains.is_empty() {
-                // No factor-pair subdomains means no useful Schwarz; fall back to plain LSMR.
-                return Ok((None, warnings));
-            }
-            let preconditioner =
-                build_additive_with_strategy(domains, local_solver, *reduction, design.n_dofs)?;
-            (Variant::Additive(preconditioner), warnings)
-        }
-        PreconditionerConfig::Diagonal => {
-            let preconditioner = build_diagonal(design, weights)?;
-            (Variant::Diagonal(preconditioner), Vec::new())
-        }
+    let (domains, warnings) = crate::domain::build_local_domains(prepared, &config.local_solver)?;
+    if domains.is_empty() {
+        return Ok((None, warnings));
+    }
+    let schwarz = build_additive(domains, config, prepared.design.n_dofs)?;
+    let preconditioner = Preconditioner {
+        inner: Variant::Additive(schwarz),
+        build_duration: build_started.elapsed(),
+        gauge: None,
     };
-    let build_duration = build_started.elapsed();
-    Ok((
-        Some(Preconditioner {
-            inner,
-            build_duration,
-        }),
-        warnings,
-    ))
+    Ok((Some(preconditioner), warnings))
 }
