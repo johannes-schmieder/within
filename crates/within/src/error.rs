@@ -10,6 +10,12 @@ pub use schwarz_precond::SolveError;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BuildError {
+    /// Checked reproducible-index allocation failed.
+    #[error("allocation failed at {context}")]
+    Allocation {
+        /// Allocation site.
+        context: &'static str,
+    },
     /// No observations provided.
     #[error("no observations provided")]
     EmptyObservations,

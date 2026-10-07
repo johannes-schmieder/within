@@ -297,3 +297,17 @@ MIT
 - Gao, Y., Kyng, R. & Spielman, D. A. (2025). AC(k): Robust Solution of Laplacian Equations by Randomized Approximate Cholesky Factorization. *SIAM Journal on Scientific Computing*.
 - Toselli & Widlund (2005). *Domain Decomposition Methods — Algorithms and Theory*. Springer.
 - Xu, J. (1992). Iterative Methods by Space Decomposition and Subspace Correction. *SIAM Review*, 34(4), 581--613.
+
+### Reproducible Rust execution
+
+`Solver::new(...).with_reproducible()?` prepares one shared stable row index
+per unsorted term and fixes each adjoint coefficient's summation order. It
+also converts additive preconditioners to `ReductionStrategy::Ordered`: local
+solves run in bounded parallel windows, with contributions combined in domain
+order. Cloned/prebuilt handles keep their original policy and scratch pool.
+The default solver and reduction policy remain unchanged. Reproducibility
+requires each user-provided local solver to repeat its own arithmetic.
+
+`Ordered` is appended to the Rust and Python reduction enums; existing serialized
+variants retain their indices. Rust clients matching the enum exhaustively need
+an arm for the added variant. No mandatory fields were added to solve options.

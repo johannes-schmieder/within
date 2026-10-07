@@ -64,6 +64,12 @@ pub enum LocalSolveError {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SolveError {
+    /// Checked scratch allocation failed before publishing any output.
+    #[error("scratch allocation failed at {context}")]
+    Allocation {
+        /// Allocation site.
+        context: &'static str,
+    },
     /// A local subdomain solve failed during a preconditioner apply.
     #[error("subdomain {subdomain} local solve failed: {source}")]
     LocalSolveFailed {

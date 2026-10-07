@@ -410,3 +410,52 @@ fn test_internal_locality_sort_is_transparent() {
         common::assert_solutions_close(&sorted.demeaned, &oracle.demeaned, 1e-7);
     }
 }
+
+#[test]
+fn reproducible_prebuilt_handles_detach_policy_and_preserve_serialization() {
+    let a: Vec<u32> = (0..120).map(|i| (i / 12) as u32).collect();
+    let b: Vec<u32> = (0..120).map(|i| (i % 6) as u32).collect();
+    let effects = || {
+        vec![
+            Effect::new(&a, true, []).unwrap(),
+            Effect::new(&b, true, []).unwrap(),
+        ]
+    };
+    let original = Solver::new(effects(), None, PreconditionerConfig::default()).unwrap();
+    let handle = original.preconditioner().unwrap().clone();
+    let old_config = handle.config().clone();
+    let solver = Solver::new(effects(), None, &handle)
+        .unwrap()
+        .with_reproducible()
+        .unwrap()
+        .with_reproducible()
+        .unwrap();
+    assert!(solver.reproducible());
+    assert_eq!(handle.config(), &old_config);
+    assert!(matches!(
+        solver.preconditioner().unwrap().config(),
+        PreconditionerConfig::Additive {
+            reduction: within::ReductionStrategy::Ordered,
+            ..
+        }
+    ));
+    let bytes = postcard::to_stdvec(solver.preconditioner().unwrap()).unwrap();
+    let reused: within::Preconditioner = postcard::from_bytes(&bytes).unwrap();
+    let solver = Solver::new(effects(), None, reused)
+        .unwrap()
+        .with_reproducible()
+        .unwrap();
+    let y: Vec<_> = (0..120).map(|i| (i % 17) as f64).collect();
+    let one = solver.solve(&y, None).unwrap();
+    let batch = solver.solve_batch(&[&y, &y], None).unwrap();
+    assert_eq!(one.x, batch.x[..one.x.len()]);
+    assert_eq!(one.x, batch.x[one.x.len()..]);
+    assert_eq!(one.demeaned, batch.demeaned[..y.len()]);
+    let bad_first = [f64::NAN; 120];
+    let bad_second = [f64::INFINITY; 120];
+    assert!(solver
+        .solve_batch(&[&bad_first, &bad_second], None)
+        .unwrap_err()
+        .to_string()
+        .contains("NaN"));
+}

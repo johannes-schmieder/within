@@ -14,6 +14,7 @@ use crate::config::{LsmrOptions, PreconditionerConfig};
 use crate::domain::{Design, Effect};
 use crate::observation::ObservationFrame;
 use crate::operator::design::gather_apply;
+use crate::operator::design::StableAdjoint;
 use crate::operator::schwarz::{build_preconditioner, Preconditioner};
 use crate::operator::DesignOperator;
 use crate::{BuildError, BuildWarning, SolveError, WithinError};
@@ -310,6 +311,7 @@ pub struct Solver<'a> {
     /// during construction).
     sqrt_weights: Option<Vec<f64>>,
     preconditioner: Option<Preconditioner>,
+    stable_adjoint: Option<StableAdjoint>,
     reparam: Option<SlopeReparam>,
     warnings: Vec<BuildWarning>,
 }
@@ -405,9 +407,25 @@ impl<'a> Solver<'a> {
             design,
             sqrt_weights,
             preconditioner,
+            stable_adjoint: None,
             reparam,
             warnings,
         })
+    }
+
+    /// Fix adjoint and Schwarz accumulation order independently of task completion.
+    /// Indices are prepared once and shared by all RHS; default construction is unchanged.
+    pub fn with_reproducible(mut self) -> Result<Self, BuildError> {
+        if self.stable_adjoint.is_none() {
+            self.stable_adjoint = Some(StableAdjoint::new(&self.design)?);
+            self.preconditioner = self.preconditioner.map(Preconditioner::into_reproducible);
+        }
+        Ok(self)
+    }
+
+    /// Whether coefficient-owned adjoints and ordered additive execution are enabled.
+    pub fn reproducible(&self) -> bool {
+        self.stable_adjoint.is_some()
     }
 
     /// Non-fatal events from the preconditioner build; empty when reusing a
@@ -445,7 +463,14 @@ impl<'a> Solver<'a> {
         let y_internal = self.design.permute_obs_in(y);
         let y: &[f64] = &y_internal;
 
-        let rect_op = DesignOperator::new(&self.design, self.sqrt_weights.as_deref());
+        let rect_op = match self.stable_adjoint.as_ref() {
+            Some(stable) => DesignOperator::with_stable(
+                &self.design,
+                self.sqrt_weights.as_deref(),
+                Some(stable),
+            ),
+            None => DesignOperator::new(&self.design, self.sqrt_weights.as_deref()),
+        };
         let b = rect_op.weighted_rhs(y);
         let b: &[f64] = &b;
 
@@ -538,10 +563,15 @@ impl<'a> Solver<'a> {
         let n_rhs = ys.len();
 
         // Collecting into `Result` fails fast on the first per-RHS error, not during the fold.
-        let solutions: Vec<RhsSolution> = ys
-            .par_iter()
-            .map(|y| self.solve_rhs(y, lsmr))
-            .collect::<Result<Vec<_>, _>>()?;
+        let solutions: Vec<RhsSolution> = if self.reproducible() {
+            // Indexed collection completes each RHS, then selects the first input error.
+            let attempts: Vec<_> = ys.par_iter().map(|y| self.solve_rhs(y, lsmr)).collect();
+            attempts.into_iter().collect::<Result<_, _>>()?
+        } else {
+            ys.par_iter()
+                .map(|y| self.solve_rhs(y, lsmr))
+                .collect::<Result<_, _>>()?
+        };
 
         let mut x = Vec::with_capacity(self.design.n_dofs * n_rhs);
         let mut demeaned = Vec::with_capacity(self.design.n_obs * n_rhs);

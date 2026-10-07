@@ -158,6 +158,19 @@ impl Preconditioner {
         }
     }
 
+    /// Factor-sharing reproducible handle; configuration and effective reduction agree.
+    pub(crate) fn into_reproducible(mut self) -> Self {
+        if let Variant::Additive(p) = &mut self.inner {
+            p.inner = p
+                .inner
+                .with_reduction_strategy(schwarz_precond::ReductionStrategy::Ordered);
+            if let PreconditionerConfig::Additive { reduction, .. } = &mut p.config {
+                *reduction = schwarz_precond::ReductionStrategy::Ordered;
+            }
+        }
+        self
+    }
+
     // `within` does not re-export `schwarz_precond::Operator`, so these are the only public way.
     /// Number of rows of the underlying linear operator.
     pub fn nrows(&self) -> usize {

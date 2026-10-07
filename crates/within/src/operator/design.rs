@@ -9,6 +9,8 @@ use crate::domain::Design;
 
 mod gather;
 mod scatter;
+mod stable;
+pub(crate) use stable::StableAdjoint;
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +27,7 @@ pub(crate) struct DesignOperator<'a> {
     sqrt_weights: Option<&'a [f64]>,
     /// Sized once to the largest term's block, so it allocates per operator, not per iteration.
     scatter_scratch: Vec<AtomicF64>,
+    stable: Option<&'a StableAdjoint>,
     /// Debug-only reentry sentinel: a concurrent `apply_adjoint` would race the scratch writes.
     #[cfg(debug_assertions)]
     adjoint_active: AtomicBool,
@@ -42,11 +45,24 @@ impl<'a> DesignOperator<'a> {
                 design.n_obs
             );
         }
+        Self::with_stable(design, sqrt_weights, None)
+    }
+
+    pub(crate) fn with_stable(
+        design: &'a Design<'a>,
+        sqrt_weights: Option<&'a [f64]>,
+        stable: Option<&'a StableAdjoint>,
+    ) -> Self {
         let max_block = design.terms.iter().map(|t| t.n_dofs()).max().unwrap_or(0);
         Self {
             design,
             sqrt_weights,
-            scatter_scratch: (0..max_block).map(|_| AtomicF64::new(0.0)).collect(),
+            scatter_scratch: if stable.is_some() {
+                Vec::new()
+            } else {
+                (0..max_block).map(|_| AtomicF64::new(0.0)).collect()
+            },
+            stable,
             #[cfg(debug_assertions)]
             adjoint_active: AtomicBool::new(false),
         }
@@ -107,6 +123,10 @@ impl Operator for DesignOperator<'_> {
         debug_assert_eq!(x.len(), self.design.n_obs);
         debug_assert_eq!(y.len(), self.design.n_dofs);
         y.fill(0.0);
+        if let Some(stable) = self.stable {
+            stable.apply(self.design, self.sqrt_weights, x, y);
+            return Ok(());
+        }
         // No lock needed: `solve_batch` builds one operator per RHS, so calls are sequential.
         match self.sqrt_weights {
             Some(sw) => scatter_apply(self.design, &self.scatter_scratch, y, &|i| sw[i] * x[i]),

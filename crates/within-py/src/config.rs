@@ -260,6 +260,7 @@ pub enum PyReductionStrategy {
     Auto = 0,
     AtomicScatter = 1,
     ParallelReduction = 2,
+    Ordered = 3,
 }
 
 impl PyReductionStrategy {
@@ -268,6 +269,7 @@ impl PyReductionStrategy {
             ReductionStrategy::Auto => Self::Auto,
             ReductionStrategy::AtomicScatter => Self::AtomicScatter,
             ReductionStrategy::ParallelReduction => Self::ParallelReduction,
+            ReductionStrategy::Ordered => Self::Ordered,
         }
     }
 
@@ -276,6 +278,7 @@ impl PyReductionStrategy {
             Self::Auto => ReductionStrategy::Auto,
             Self::AtomicScatter => ReductionStrategy::AtomicScatter,
             Self::ParallelReduction => ReductionStrategy::ParallelReduction,
+            Self::Ordered => ReductionStrategy::Ordered,
         }
     }
 }

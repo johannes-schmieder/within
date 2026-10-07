@@ -17,8 +17,8 @@ use crate::error::SolveError;
 use crate::local_solve::{LocalSolver, SubdomainEntry};
 
 use super::buffers::{
-    AdditiveSweepBuffers, BufferPool, LocalSolveScratch, SchwarzBuffers, WorkerBufferStack,
-    WorkerReductionBuffers,
+    AdditiveSweepBuffers, BufferPool, LocalSolveScratch, OrderedScratch, SchwarzBuffers,
+    WorkerBufferStack, WorkerReductionBuffers,
 };
 use super::planning::ReductionPlan;
 
@@ -60,6 +60,9 @@ impl<S: LocalSolver> AdditiveExecutor<S> {
     ) -> Result<(), SolveError> {
         let mut bufs = self.buf_pool.take(plan.strategy)?;
         let apply_result = match &mut bufs {
+            SchwarzBuffers::Ordered { slots } => {
+                self.apply_ordered(plan.allow_inner_parallelism, r, z, slots)
+            }
             SchwarzBuffers::Atomic {
                 accum,
                 scratch_pool,
@@ -71,6 +74,72 @@ impl<S: LocalSolver> AdditiveExecutor<S> {
         // `put` is infallible and never overwrites the real `apply_result`.
         self.buf_pool.put(bufs, &apply_result);
         apply_result
+    }
+
+    /// A detached executor shares immutable factors, but starts a fresh scratch pool.
+    pub(super) fn detached(&self) -> Self {
+        Self::new(
+            Arc::clone(&self.subdomains),
+            self.n_dofs(),
+            self.buf_pool.max_scratch_size(),
+        )
+    }
+
+    fn apply_ordered(
+        &self,
+        allow_inner_parallelism: bool,
+        r: &[f64],
+        z: &mut [f64],
+        slots: &mut Vec<OrderedScratch>,
+    ) -> Result<(), SolveError> {
+        z.fill(0.0);
+        let width = rayon::current_num_threads()
+            .min(self.subdomains.len())
+            .max(1);
+        // Discard capacities from a wider prior pool so admission uses this worker budget.
+        if slots.len() > width {
+            *slots = Vec::new();
+        }
+        slots
+            .try_reserve_exact(width - slots.len())
+            .map_err(|_| SolveError::Allocation {
+                context: "additive.ordered.slots",
+            })?;
+        while slots.len() < width {
+            slots.push(OrderedScratch::new(self.buf_pool.max_scratch_size())?);
+        }
+        for (window, entries) in self.subdomains.chunks(width).enumerate() {
+            entries
+                .par_iter()
+                .zip(slots.par_iter_mut())
+                .for_each(|(entry, slot)| {
+                    slot.error = None;
+                    if entry.is_empty() {
+                        return;
+                    }
+                    entry.core().restrict_weighted(r, &mut slot.r);
+                    slot.error = entry
+                        .solver()
+                        .solve_local(&mut slot.r, &mut slot.z, allow_inner_parallelism)
+                        .err();
+                });
+            // Report the first failing domain in input order, independent of completion.
+            for (index, slot) in slots[..entries.len()].iter_mut().enumerate() {
+                if let Some(source) = slot.error.take() {
+                    z.fill(0.0);
+                    return Err(SolveError::LocalSolveFailed {
+                        subdomain: window * width + index,
+                        source,
+                    });
+                }
+            }
+            for (entry, slot) in entries.iter().zip(slots.iter()) {
+                if !entry.is_empty() {
+                    entry.core().prolongate_weighted_add(&slot.z, z);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn apply_atomic(

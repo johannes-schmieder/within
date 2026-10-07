@@ -22,12 +22,16 @@ pub enum ReductionStrategy {
     AtomicScatter,
     /// Private per-task buffers combined by a parallel chunk reduction; O(P · n_dofs).
     ParallelReduction,
+    /// Parallel local solves with contributions committed in subdomain order.
+    /// Scratch is bounded by min(worker count, subdomain count), without a global accumulator.
+    Ordered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ResolvedReductionStrategy {
     AtomicScatter,
     ParallelReduction,
+    Ordered,
 }
 
 impl ResolvedReductionStrategy {
@@ -35,6 +39,7 @@ impl ResolvedReductionStrategy {
         match self {
             Self::AtomicScatter => ReductionStrategy::AtomicScatter,
             Self::ParallelReduction => ReductionStrategy::ParallelReduction,
+            Self::Ordered => ReductionStrategy::Ordered,
         }
     }
 }
@@ -109,6 +114,7 @@ impl AdditiveScheduler {
         allow_inner_parallelism: bool,
     ) -> ResolvedReductionStrategy {
         match configured {
+            ReductionStrategy::Ordered => ResolvedReductionStrategy::Ordered,
             ReductionStrategy::AtomicScatter => ResolvedReductionStrategy::AtomicScatter,
             ReductionStrategy::ParallelReduction => ResolvedReductionStrategy::ParallelReduction,
             ReductionStrategy::Auto => {

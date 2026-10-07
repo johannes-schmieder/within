@@ -146,6 +146,15 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
         self.reduction_plan().strategy.as_public()
     }
 
+    /// Return a factor-sharing handle with a detached scratch pool and explicit policy.
+    pub fn with_reduction_strategy(&self, strategy: ReductionStrategy) -> Self {
+        Self {
+            reduction_strategy: strategy,
+            scheduler: self.scheduler,
+            executor: self.executor.detached(),
+        }
+    }
+
     /// Operator apply that propagates local-solver failures.
     pub fn apply(&self, r: &[f64], z: &mut [f64]) -> Result<(), SolveError> {
         let n_dofs = self.executor.n_dofs();

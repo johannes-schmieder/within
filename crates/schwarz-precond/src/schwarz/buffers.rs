@@ -46,6 +46,13 @@ impl BufferPool {
         let mut pool = self.inner.lock().map_err(|_| SolveError::Synchronization {
             context: "additive.buf_pool.lock.pop",
         })?;
+        if strategy == ResolvedReductionStrategy::Ordered {
+            // A handle can move to a smaller pool; discard old wider ordered capacities.
+            let workers = rayon::current_num_threads();
+            pool.retain(
+                |buf| !matches!(buf, SchwarzBuffers::Ordered { slots } if slots.len() > workers),
+            );
+        }
         if let Some(idx) = pool.iter().position(|bufs| bufs.strategy() == strategy) {
             return Ok(pool.swap_remove(idx));
         }
@@ -112,7 +119,35 @@ impl AdditiveSweepBuffers {
 }
 
 /// Pooled buffers that vary by reduction strategy.
+pub(super) struct OrderedScratch {
+    pub(super) r: Vec<f64>,
+    pub(super) z: Vec<f64>,
+    pub(super) error: Option<crate::error::LocalSolveError>,
+}
+
+impl OrderedScratch {
+    pub(super) fn new(size: usize) -> Result<Self, SolveError> {
+        let zeros = || {
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(size)
+                .map_err(|_| SolveError::Allocation {
+                    context: "additive.ordered.scratch",
+                })?;
+            values.resize(size, 0.0);
+            Ok(values)
+        };
+        Ok(Self {
+            r: zeros()?,
+            z: zeros()?,
+            error: None,
+        })
+    }
+}
+
 pub(super) enum SchwarzBuffers {
+    /// Consecutive indexed local-solve slots; no atomic or global reduction bank.
+    Ordered { slots: Vec<OrderedScratch> },
     /// Shared atomic accumulator plus a pool of per-worker local-solve scratch.
     Atomic {
         accum: Vec<AtomicU64>,
@@ -125,6 +160,7 @@ pub(super) enum SchwarzBuffers {
 impl SchwarzBuffers {
     fn new(strategy: ResolvedReductionStrategy, n_dofs: usize, max_scratch_size: usize) -> Self {
         match strategy {
+            ResolvedReductionStrategy::Ordered => Self::Ordered { slots: Vec::new() },
             ResolvedReductionStrategy::AtomicScatter => Self::Atomic {
                 accum: (0..n_dofs).map(|_| AtomicU64::new(0)).collect(),
                 scratch_pool: Vec::new(),
@@ -137,6 +173,7 @@ impl SchwarzBuffers {
 
     fn strategy(&self) -> ResolvedReductionStrategy {
         match self {
+            Self::Ordered { .. } => ResolvedReductionStrategy::Ordered,
             Self::Atomic { .. } => ResolvedReductionStrategy::AtomicScatter,
             Self::Reduction { .. } => ResolvedReductionStrategy::ParallelReduction,
         }
@@ -263,6 +300,28 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    fn ordered_pool_discards_all_cached_wider_buffers_and_checks_capacity() {
+        let pool = BufferPool::new(64, 8);
+        for _ in 0..4 {
+            let slots = (0..8).map(|_| OrderedScratch::new(8).unwrap()).collect();
+            pool.put(SchwarzBuffers::Ordered { slots }, &Ok(()));
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                let taken = pool.take(ResolvedReductionStrategy::Ordered).unwrap();
+                assert!(matches!(taken, SchwarzBuffers::Ordered { slots } if slots.is_empty()));
+                assert!(pool.inner.lock().unwrap().is_empty());
+            });
+        assert!(matches!(
+            OrderedScratch::new(usize::MAX),
+            Err(SolveError::Allocation { .. })
+        ));
+    }
 
     /// On `put` with `Err`, the pool must drop the buffer so the next caller
     /// gets a freshly-zeroed allocation rather than inheriting stale atomic
