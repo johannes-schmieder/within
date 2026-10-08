@@ -4,6 +4,88 @@ use crate::block_elim::csr_matrix::CsrMatrix;
 use crate::config::{ApproxCholConfig, SchurMode, DEFAULT_DENSE_SCHUR_THRESHOLD};
 
 #[test]
+fn backsub_preserves_row_arithmetic_in_sequential_and_parallel_recovery() {
+    // Exceed the parallel threshold and end in a partial chunk. Row-dependent
+    // RHS values make skipped, duplicated or misplaced rows observable.
+    let nrows = PAR_BACKSUB_THRESHOLD + 17;
+    let source = [-1.0, 1.0, 1.0, 1.0 - 2.0_f64.powi(-27)];
+    let mut cross = CsrBlock {
+        indptr: vec![0],
+        indices: Vec::new(),
+        data: Vec::new(),
+        nrows,
+        ncols: source.len(),
+    };
+    let mut rhs = Vec::with_capacity(nrows);
+    let mut diagonal = Vec::with_capacity(nrows);
+    let mut expected = Vec::with_capacity(nrows);
+    for i in 0..nrows {
+        let (entries, sum): (&[(u32, f64)], f64) = match i % 5 {
+            0 => (&[], 0.0),
+            1 => (&[(1, 2.0)], 2.0),
+            // Left-to-right gives (2^54 + 1) - 2^54 = 0, not 1.
+            2 => (
+                &[(0, -2.0_f64.powi(54)), (1, 1.0), (2, -2.0_f64.powi(54))],
+                0.0,
+            ),
+            // The product rounds to 1 before addition. FMA would give -2^-54.
+            3 => (&[(0, 1.0), (3, 1.0 + 2.0_f64.powi(-27))], 0.0),
+            _ => (&[(0, -2.0), (1, 3.0), (2, 5.0)], 10.0),
+        };
+        for &(column, value) in entries {
+            cross.indices.push(column);
+            cross.data.push(value);
+        }
+        cross.indptr.push(cross.indices.len() as u32);
+        let base = if matches!(i % 5, 2 | 3) {
+            0.0
+        } else {
+            i as f64 * 0.25
+        };
+        let scale = [0.25, 0.5, 1.0][i % 3];
+        rhs.push(base);
+        diagonal.push(scale);
+        expected.push((base + scale * sum).to_bits());
+    }
+    assert!(cross.is_structurally_valid());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for parallel in [false, true] {
+        let mut output = vec![f64::NAN; nrows];
+        pool.install(|| {
+            backsub_block_from_scaled_rhs(&mut output, &rhs, &cross, &diagonal, &source, parallel);
+        });
+        assert_eq!(
+            output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn backsub_with_no_kept_columns_preserves_empty_row_arithmetic() {
+    let cross = CsrBlock::from_dense_table(&[], 3, 0);
+    let mut output = [f64::NAN; 3];
+    backsub_block_from_scaled_rhs(
+        &mut output,
+        &[-0.0, 1.0, -2.0],
+        &cross,
+        &[0.5, 1.0, 2.0],
+        &[],
+        true,
+    );
+    assert_eq!(
+        output.map(f64::to_bits),
+        [0.0_f64, 1.0, -2.0].map(f64::to_bits)
+    );
+}
+
+#[test]
 fn test_subtract_mean_empty() {
     let mut data = vec![1.0, 2.0, 3.0];
     subtract_mean(&mut data, 0);
