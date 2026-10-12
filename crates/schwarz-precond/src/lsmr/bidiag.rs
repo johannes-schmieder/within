@@ -364,6 +364,10 @@ pub(super) trait Bidiagonalization {
     fn v(&self) -> &[f64];
     /// `‖rhs − A x‖`, staging `rhs − A x` for [`restart`](Self::restart); clobbers the stream.
     fn residual_norm(&mut self, x: &[f64], rhs: &[f64]) -> Result<f64, SolveError>;
+    /// `‖Aᵀr‖` for the residual staged by [`residual_norm`](Self::residual_norm).
+    fn plain_gradient(&mut self, _residual_norm: f64) -> Result<Option<Magnitude>, SolveError> {
+        Ok(None)
+    }
     /// Seed a fresh sequence from the staged residual and the `β₁` `residual_norm` returned.
     fn restart(&mut self, beta: f64) -> Result<BidiagStep, SolveError>;
     /// Spend the stream for the `rhs − A x` that [`residual_norm`](Self::residual_norm) staged.
@@ -419,6 +423,18 @@ impl<A: Operator + ?Sized> Bidiagonalization for GolubKahan<'_, A> {
 
     fn residual_norm(&mut self, x: &[f64], rhs: &[f64]) -> Result<f64, SolveError> {
         residual_into(self.operator, x, rhs, &mut self.bufs.u)
+    }
+
+    fn plain_gradient(&mut self, residual_norm: f64) -> Result<Option<Magnitude>, SolveError> {
+        let bufs = &mut self.bufs;
+        let image = adjoint_image(
+            self.operator,
+            &bufs.u,
+            residual_norm,
+            &mut bufs.av,
+            &mut bufs.atu,
+        )?;
+        Ok(Some(image.norm()))
     }
 
     fn into_residual(self) -> Vec<f64> {
@@ -479,6 +495,18 @@ impl<A: Operator + ?Sized, M: Operator + ?Sized> Bidiagonalization
 
     fn residual_norm(&mut self, x: &[f64], rhs: &[f64]) -> Result<f64, SolveError> {
         residual_into(self.operator, x, rhs, &mut self.bufs.u)
+    }
+
+    fn plain_gradient(&mut self, residual_norm: f64) -> Result<Option<Magnitude>, SolveError> {
+        let bufs = &mut self.bufs;
+        let image = adjoint_image(
+            self.operator,
+            &bufs.u,
+            residual_norm,
+            &mut bufs.av,
+            &mut bufs.atu,
+        )?;
+        Ok(Some(image.norm()))
     }
 
     fn into_residual(self) -> Vec<f64> {
@@ -647,18 +675,19 @@ impl<'a, A: Operator + ?Sized, M: Operator + ?Sized> StagedStart<'a, A, M> {
     }
 
     /// `‖Âᵀ rhs‖ = ‖Aᵀ rhs‖·√(ĝᵀM⁻¹ĝ)` for unit `ĝ ∥ Aᵀ rhs`, on scratch that spares the staged `u`.
-    pub(super) fn metric_gradient_norm(
+    pub(super) fn gradient_references(
         &mut self,
         rhs: &[f64],
         rhs_norm: f64,
-    ) -> Result<Magnitude, SolveError> {
+    ) -> Result<(Magnitude, Magnitude), SolveError> {
         let stream = &mut self.0;
         let bufs = &mut stream.bufs;
         let (g, mv) = (&mut bufs.atu, &mut bufs.v);
         let image = adjoint_image(stream.operator, rhs, rhs_norm, &mut bufs.av, g)?;
         if !image.g_norm.is_finite() {
-            return Ok(Magnitude::from(image.g_norm));
+            return Ok((Magnitude::from(image.g_norm), image.norm()));
         }
+        let plain = image.norm();
         // `gᵀM⁻¹g` overflows past `‖g‖ ≈ 1e154`, but `M⁻¹` of a subnormal `g` made unit may too.
         let scale = if image.g_norm.is_normal() {
             image.g_norm
@@ -668,17 +697,21 @@ impl<'a, A: Operator + ?Sized, M: Operator + ?Sized> StagedStart<'a, A, M> {
         normalize(g, scale);
         stream.preconditioner.apply(g, mv)?;
         let alpha = alpha_from_vp(mv, g)?;
-        Ok(Magnitude::product(ldexp(1.0, image.k), scale) * Magnitude::from(alpha))
+        Ok((
+            Magnitude::product(ldexp(1.0, image.k), scale) * Magnitude::from(alpha),
+            plain,
+        ))
     }
 
     /// Seed the sequence from the staged `u` with `β₁ = ‖u‖`, yielding the stream and `(α₁, β₁)`.
     pub(super) fn restart(
         self,
         beta: f64,
-    ) -> Result<(ModifiedGolubKahan<'a, A, M>, BidiagStep), SolveError> {
+    ) -> Result<(ModifiedGolubKahan<'a, A, M>, BidiagStep, Magnitude), SolveError> {
         let mut stream = self.0;
         let step1 = stream.restart(beta)?;
-        Ok((stream, step1))
+        let plain = Magnitude::product(par_norm(&stream.bufs.p_tilde), beta);
+        Ok((stream, step1, plain))
     }
 }
 

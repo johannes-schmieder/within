@@ -42,7 +42,7 @@ pub(crate) fn vec_norm(v: &[f64]) -> f64 {
 pub struct LsmrResult {
     /// Solution vector.
     pub x: Vec<f64>,
-    /// Whether a tolerance stop matched `‖b − A x‖`, which misses drift within `range(A)`.
+    /// Whether a tolerance stop survived its applicable recomputed-residual and plain-gradient audits.
     pub converged: bool,
     /// Total number of iterations performed.
     pub iterations: usize,
@@ -71,7 +71,7 @@ pub enum LsmrStopReason {
     MaxIterations,
     /// The warm start already solved the system: `b − A x0` was exactly zero.
     WarmStartExact,
-    /// A tolerance stop, and each restart from it, that `‖b − A x‖` refuted.
+    /// A tolerance stop, and each restart from it, refuted by a residual or plain-gradient audit.
     FalseConvergence,
     /// The [`EscalationHandler`] requested a handoff to a stronger preconditioner.
     Escalated,
@@ -244,7 +244,11 @@ pub fn lsmr<A: Operator + ?Sized>(
     let local_size = local_size.unwrap_or(0);
     let (bidiag, step1) = GolubKahan::init(operator, b, b_norm, local_size)?;
     let criteria = ConvergenceCriteria::new(b_norm, tol);
-    lsmr_from_bidiag(bidiag, step1, b, None, criteria, maxiter, None)
+    let start = SolveStart {
+        x0: None,
+        reference: NormalEqReference::cold(step1, Magnitude::product(step1.alpha, step1.beta)),
+    };
+    lsmr_from_bidiag(bidiag, step1, b, start, criteria, maxiter, None)
 }
 
 /// Preconditioned LSMR with `M ≈ AᵀA`, one `M⁻¹` apply per iteration; `M⁻¹` must be nonsingular.
@@ -320,51 +324,69 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
         });
     };
 
-    let metric = match warm_start {
+    let references = match warm_start {
         None => None,
-        Some(_) => Some(staged.metric_gradient_norm(b, b_norm)?),
+        Some(_) if b_norm > 0.0 => Some(staged.gradient_references(b, b_norm)?),
+        Some(_) => None,
     };
-    let (bidiag, step1) = staged.restart(rhs_norm)?;
-    let warm_start = warm_start.zip(metric).map(|(x0, metric)| WarmStart {
-        x0,
-        reference: NormalEqReference::warm(metric, step1),
-    });
+    let (bidiag, step1, cold_plain_reference) = staged.restart(rhs_norm)?;
+    let reference = references.map_or_else(
+        || NormalEqReference::cold(step1, cold_plain_reference),
+        |(metric, plain)| NormalEqReference::warm(metric, plain, step1, cold_plain_reference),
+    );
+    let start = SolveStart {
+        x0: warm_start,
+        reference,
+    };
     let reference_norm = if b_norm > 0.0 { b_norm } else { rhs_norm };
     let criteria = ConvergenceCriteria::new(reference_norm, tol);
-    lsmr_from_bidiag(bidiag, step1, b, warm_start, criteria, maxiter, escalation)
+    lsmr_from_bidiag(bidiag, step1, b, start, criteria, maxiter, escalation)
 }
 
 /// Restarts from a refuted tolerance stop before the solve is refused outright.
 const MAX_RESTARTS: usize = 2;
 
-/// `‖Aᵀb‖` in the stream's metric, fixed for the solve so every pass reports against it.
+/// Fixed metric and plain `‖Aᵀb‖` references for reporting and exit auditing.
 #[derive(Clone, Copy)]
-struct NormalEqReference(Magnitude);
+struct NormalEqReference {
+    metric: Magnitude,
+    plain: Magnitude,
+}
 
 impl NormalEqReference {
     /// A cold stream's first `(α₁, β₁)` is `‖Aᵀb‖` already, though the product may not be a double.
-    fn cold(step1: BidiagStep) -> Self {
-        Self(Magnitude::product(step1.alpha, step1.beta))
+    fn cold(step1: BidiagStep, plain: Magnitude) -> Self {
+        Self {
+            metric: Magnitude::product(step1.alpha, step1.beta),
+            plain,
+        }
     }
 
-    /// A reference that carries no information falls back to the cold `α₁β₁`.
-    fn warm(metric: Magnitude, step1: BidiagStep) -> Self {
-        if metric.is_normal() {
-            Self(metric)
-        } else {
-            Self::cold(step1)
+    /// Each unusable warm reference falls back independently to its cold-stream counterpart.
+    fn warm(metric: Magnitude, plain: Magnitude, step1: BidiagStep, cold_plain: Magnitude) -> Self {
+        let cold = Self::cold(step1, cold_plain);
+        Self {
+            metric: if metric.is_normal() {
+                metric
+            } else {
+                cold.metric
+            },
+            plain: if plain.is_normal() { plain } else { cold.plain },
         }
     }
 
     fn relative(self, estimate: Magnitude) -> f64 {
-        debug_assert!(self.0.is_normal(), "a zero α₁ returns before any report");
-        (estimate / self.0).to_f64()
+        debug_assert!(
+            self.metric.is_normal(),
+            "a zero α₁ returns before any report"
+        );
+        (estimate / self.metric).to_f64()
     }
 }
 
-/// A warm start and its `‖Aᵀb‖`, since the stream's `(α₁, β₁)` measures `b − A x₀` instead.
-struct WarmStart<'a> {
-    x0: &'a [f64],
+/// Initial iterate and fixed references; warm streams measure `b − A x₀`, not `b`.
+struct SolveStart<'a> {
+    x0: Option<&'a [f64]>,
     reference: NormalEqReference,
 }
 
@@ -373,16 +395,14 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
     mut bidiag: B,
     mut step1: BidiagStep,
     b: &[f64],
-    warm_start: Option<WarmStart<'_>>,
+    start: SolveStart<'_>,
     criteria: ConvergenceCriteria,
     maxiter: usize,
     escalation: Option<&dyn EscalationPolicy>,
 ) -> Result<LsmrResult, SolveError> {
     let n = bidiag.v().len();
-    let reference = warm_start
-        .as_ref()
-        .map_or_else(|| NormalEqReference::cold(step1), |w| w.reference);
-    let mut base: Option<Cow<'_, [f64]>> = warm_start.map(|w| Cow::Borrowed(w.x0));
+    let reference = start.reference;
+    let mut base: Option<Cow<'_, [f64]>> = start.x0.map(Cow::Borrowed);
     let mut iterations = 0;
     let mut restarts = 0;
     loop {
@@ -482,6 +502,16 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
         ) {
             let residual_norm = bidiag.residual_norm(&result.x, b)?;
             result.converged = criteria.corroborates_residual(residual_norm, result.residual_norm);
+            if result.converged && stop_reason == LsmrStopReason::NormalEquationTolerance {
+                if let Some(current) = bidiag.plain_gradient(residual_norm)? {
+                    result.converged = criteria.corroborates_normal_eq(
+                        residual_norm,
+                        current,
+                        reference.plain,
+                        result.normal_eq_residual,
+                    );
+                }
+            }
             if !result.converged
                 && residual_norm.is_finite()
                 && restarts < MAX_RESTARTS

@@ -6,7 +6,7 @@ use super::super::magnitude::Magnitude;
 use super::super::recurrence::ConvergenceCriteria;
 use super::super::{
     lsmr_from_bidiag, mlsmr, EscalationHandler, EscalationPolicy, LsmrResult, LsmrStopReason,
-    MlsmrOptions, NormalEqReference,
+    MlsmrOptions, NormalEqReference, SolveStart,
 };
 use crate::lsmr::fixtures::{DenseOp, DiagOp, FixedIterations};
 use crate::SolveError;
@@ -33,6 +33,9 @@ impl Bidiagonalization for ScriptedStream<'_> {
             .true_residuals
             .next()
             .expect("a scripted residual per pass"))
+    }
+    fn plain_gradient(&mut self, _residual_norm: f64) -> Result<Option<Magnitude>, SolveError> {
+        panic!("a residual-tolerance stop must not request a plain-gradient audit")
     }
     fn restart(&mut self, _beta: f64) -> Result<BidiagStep, SolveError> {
         Ok(BidiagStep {
@@ -75,7 +78,10 @@ fn scripted_run(
         stream,
         step1,
         &[1.0, 1.0],
-        None,
+        SolveStart {
+            x0: None,
+            reference: NormalEqReference::cold(step1, Magnitude::product(step1.alpha, step1.beta)),
+        },
         criteria,
         maxiter,
         escalation,
@@ -166,7 +172,68 @@ fn a_report_only_moves_to_a_usable_reference(#[case] metric: f64, #[case] expect
         beta: 1.0,
     };
     assert_eq!(
-        NormalEqReference::warm(Magnitude::from(metric), step1).relative(Magnitude::from(1.0)),
+        NormalEqReference::warm(
+            Magnitude::from(metric),
+            Magnitude::from(metric),
+            step1,
+            Magnitude::from(3.0),
+        )
+        .relative(Magnitude::from(1.0)),
+        expected
+    );
+}
+
+#[test]
+fn warm_references_fall_back_independently() {
+    let step1 = BidiagStep {
+        alpha: 2.0,
+        beta: 1.0,
+    };
+
+    let plain_fallback = NormalEqReference::warm(
+        Magnitude::from(4.0),
+        Magnitude::from(0.0),
+        step1,
+        Magnitude::from(3.0),
+    );
+    assert_eq!(
+        plain_fallback.relative(Magnitude::from(1.0)),
+        0.25,
+        "an unusable plain reference must not discard a usable metric reference"
+    );
+    assert_eq!((plain_fallback.plain / Magnitude::from(3.0)).to_f64(), 1.0);
+
+    let metric_fallback = NormalEqReference::warm(
+        Magnitude::from(0.0),
+        Magnitude::from(5.0),
+        step1,
+        Magnitude::from(3.0),
+    );
+    assert_eq!(metric_fallback.relative(Magnitude::from(1.0)), 0.5);
+    assert_eq!((metric_fallback.plain / Magnitude::from(5.0)).to_f64(), 1.0);
+}
+
+#[rstest]
+#[case::vanished_residual(0.0, 1.0, 1.0, 1e-30, true)]
+#[case::absolute_plain_drop(1.0, 1e-9, 1.0, 1e-30, true)]
+#[case::metric_agreement(1.0, 1e-2, 1.0, 1e-4, true)]
+#[case::neither_plain_leg(1.0, 1e-2, 1.0, 1e-6, false)]
+#[case::unmeasurable_plain_audit(1.0, f64::NAN, 1.0, 1e-6, true)]
+fn each_plain_gradient_audit_leg_is_explicit(
+    #[case] residual: f64,
+    #[case] current: f64,
+    #[case] reference: f64,
+    #[case] metric_relative: f64,
+    #[case] expected: bool,
+) {
+    let criteria = ConvergenceCriteria::new(1.0, 1e-10);
+    assert_eq!(
+        criteria.corroborates_normal_eq(
+            residual,
+            Magnitude::from(current),
+            Magnitude::from(reference),
+            metric_relative,
+        ),
         expected
     );
 }

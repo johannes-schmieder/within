@@ -175,12 +175,12 @@ fn test_mlsmr_rank_deficient_system() {
     assert!(normal_equation_residual(&RankDeficientOp, &result.x, &b) < 1e-10);
 }
 
-/// `M⁻¹` must be nonsingular; the true-residual audit cannot see a direction it removed.
+/// A preconditioner with a null direction cannot certify the direction it removed.
 #[rstest]
 #[case(&[1.0, 0.0])]
 #[case(&[1.0, 1.0, 0.0])]
 #[case(&[1e20, 0.0])]
-fn a_singular_preconditioner_certifies_the_direction_it_annihilates(#[case] m: &[f64]) {
+fn a_singular_preconditioner_cannot_certify_the_direction_it_annihilates(#[case] m: &[f64]) {
     let a = IdentityOp { n: m.len() };
     let b = vec![1.0; m.len()];
     let result = mlsmr(
@@ -193,7 +193,8 @@ fn a_singular_preconditioner_certifies_the_direction_it_annihilates(#[case] m: &
     )
     .expect("singular-preconditioner solve");
 
-    assert!(result.converged, "{:?}", result.stop_reason);
+    assert!(!result.converged, "{:?}", result.stop_reason);
+    assert_eq!(result.stop_reason, LsmrStopReason::FalseConvergence);
     let residual = normal_equation_residual(&a, &result.x, &b);
     assert!(
         (residual - 1.0).abs() < 1e-9,
