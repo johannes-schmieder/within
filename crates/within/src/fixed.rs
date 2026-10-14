@@ -145,6 +145,92 @@ impl PairReplacement {
     }
 }
 
+/// Owned, runtime-only construction plan tied to one solver's topology and weights.
+/// Preparing this plan does not replace any incumbent factors. Dropping a plan
+/// or a failed build leaves the originating solver usable without a restart.
+pub struct OwnedPairBuild {
+    shared: Arc<SchwarzPreconditioner<BlockElimSolver>>,
+    selected: Vec<usize>,
+    nomination: PairNomination,
+    n_dofs: usize,
+    reduction: crate::ReductionStrategy,
+    source: Arc<()>,
+    started: Instant,
+}
+
+impl OwnedPairBuild {
+    /// Pair and component dimensions fixed during preparation.
+    pub fn nomination(&self) -> PairNomination {
+        self.nomination
+    }
+
+    /// Construct all nominated components transactionally on the calling worker.
+    /// Preparation plus construction has exactly the synchronous builder's
+    /// checkpoint order. The caller admits factors and holds the factory's
+    /// resource/cancellation state for this entire operation.
+    pub fn build(
+        self,
+        factory: &dyn FixedReducedInverseFactory,
+    ) -> Result<PairReplacement, BuildError> {
+        factory.checkpoint(32)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.shared.subdomains().len())
+            .map_err(|_| BuildError::Allocation {
+                context: "pair replacement entries",
+            })?;
+        let mut work = work::ApplyWork::new(self.n_dofs, self.shared.subdomains().len());
+        let mut selected = self.selected.into_iter().peekable();
+        for (index, entry) in self.shared.subdomains().iter().enumerate() {
+            factory.checkpoint(128)?;
+            let solver = if selected.peek() == Some(&index) {
+                selected.next();
+                let cross = entry
+                    .solver()
+                    .categorical_cross_tab()
+                    .expect("nominated categorical component");
+                let inverse = factory.build(PairComponent {
+                    n_eliminated: cross.c.nrows,
+                    n_retained: cross.c.ncols,
+                    row_ptr: &cross.c.indptr,
+                    columns: &cross.c.indices,
+                    weights: &cross.c.data,
+                })?;
+                PairLocalSolver::Replacement(entry.solver().with_fixed_inverse(inverse, factory)?)
+            } else {
+                PairLocalSolver::Incumbent {
+                    source: self.shared.clone(),
+                    index,
+                }
+            };
+            work.add(solver.inner(), &mut |units| factory.checkpoint(units))?;
+            let globals = copy_admitted(entry.global_indices(), factory)?;
+            let partition = match entry.partition_weights() {
+                PartitionWeights::Uniform(n) => PartitionWeights::Uniform(*n),
+                PartitionWeights::NonUniform(weights) => {
+                    PartitionWeights::NonUniform(copy_admitted(weights, factory)?)
+                }
+            };
+            let core = SubdomainCore::with_partition_weights(globals, partition)
+                .map_err(BuildError::Preconditioner)?;
+            entries
+                .push(SubdomainEntry::try_new(core, solver).map_err(BuildError::Preconditioner)?);
+        }
+        let preconditioner =
+            SchwarzPreconditioner::try_with_n_dofs(entries, self.n_dofs, self.reduction, |work| {
+                factory.checkpoint(work)
+            })?;
+        Ok(PairReplacement {
+            source: self.source,
+            identity: Arc::new(()),
+            preconditioner,
+            build_duration: self.started.elapsed(),
+            nomination: self.nomination,
+            work,
+        })
+    }
+}
+
 /// Runtime-only local action; incumbent factors are shared, never cloned.
 pub(crate) enum PairLocalSolver {
     Incumbent {
@@ -217,69 +303,35 @@ impl Solver<'_> {
         &self,
         factory: &dyn FixedReducedInverseFactory,
     ) -> Result<Option<PairReplacement>, BuildError> {
+        self.prepare_pair_replacement(factory)?
+            .map(|plan| plan.build(factory))
+            .transpose()
+    }
+
+    /// Prepare an owned nominated-pair plan. The returned plan shares immutable
+    /// factors/topology and the exact solver identity without borrowing the
+    /// solver or its observation columns, so another worker can own construction.
+    /// The factory's admission checkpoints cover nomination and plan metadata.
+    pub fn prepare_pair_replacement(
+        &self,
+        factory: &dyn FixedReducedInverseFactory,
+    ) -> Result<Option<OwnedPairBuild>, BuildError> {
         let started = Instant::now();
         let Some((base, nomination, selected)) = self.pair_entries(Some(factory))? else {
             return Ok(None);
         };
         let shared = Arc::new(base.inner.clone());
-        factory.checkpoint(32)?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(base.inner.subdomains().len())
-            .map_err(|_| BuildError::Allocation {
-                context: "pair replacement entries",
-            })?;
-        let mut work = work::ApplyWork::new(self.n_dofs(), base.inner.subdomains().len());
-        let mut selected = selected.into_iter().peekable();
-        for (index, entry) in base.inner.subdomains().iter().enumerate() {
-            factory.checkpoint(128)?;
-            let solver = if selected.peek() == Some(&index) {
-                selected.next();
-                let cross = entry
-                    .solver()
-                    .categorical_cross_tab()
-                    .expect("nominated categorical component");
-                let inverse = factory.build(PairComponent {
-                    n_eliminated: cross.c.nrows,
-                    n_retained: cross.c.ncols,
-                    row_ptr: &cross.c.indptr,
-                    columns: &cross.c.indices,
-                    weights: &cross.c.data,
-                })?;
-                PairLocalSolver::Replacement(entry.solver().with_fixed_inverse(inverse, factory)?)
-            } else {
-                PairLocalSolver::Incumbent {
-                    source: shared.clone(),
-                    index,
-                }
-            };
-            work.add(solver.inner(), &mut |units| factory.checkpoint(units))?;
-            let globals = copy_admitted(entry.global_indices(), factory)?;
-            let partition = match entry.partition_weights() {
-                PartitionWeights::Uniform(n) => PartitionWeights::Uniform(*n),
-                PartitionWeights::NonUniform(weights) => {
-                    PartitionWeights::NonUniform(copy_admitted(weights, factory)?)
-                }
-            };
-            let core = SubdomainCore::with_partition_weights(globals, partition)
-                .map_err(BuildError::Preconditioner)?;
-            entries
-                .push(SubdomainEntry::try_new(core, solver).map_err(BuildError::Preconditioner)?);
-        }
         let PreconditionerConfig::Additive { reduction, .. } = &base.config else {
             unreachable!("additive variant has additive configuration")
         };
-        let preconditioner =
-            SchwarzPreconditioner::try_with_n_dofs(entries, self.n_dofs(), *reduction, |work| {
-                factory.checkpoint(work)
-            })?;
-        Ok(Some(PairReplacement {
-            source: self.replacement_source.get_or_init(|| Arc::new(())).clone(),
-            identity: Arc::new(()),
-            preconditioner,
-            build_duration: started.elapsed(),
+        Ok(Some(OwnedPairBuild {
+            shared,
+            selected,
             nomination,
-            work,
+            n_dofs: self.n_dofs(),
+            reduction: *reduction,
+            source: self.replacement_source.get_or_init(|| Arc::new(())).clone(),
+            started,
         }))
     }
 

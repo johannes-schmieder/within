@@ -279,3 +279,100 @@ fn failed_partial_iteration_consumes_budget_and_keeps_last_accepted_iterate() {
         assert!(!failed.converged);
     }
 }
+
+#[test]
+fn categorical_seed_preserves_original_rhs_scale_gauge_and_budget() {
+    let solver = Solver::new(
+        categorical(),
+        Some((0..60).map(|i| 0.2 + (i % 7) as f64).collect()),
+        config(),
+    )
+    .unwrap()
+    .with_reproducible()
+    .unwrap();
+    let y: Vec<f64> = (0..60)
+        .map(|i| 1000.0 + (i % 6) as f64 + ((i * 13) % 17) as f64 / 19.0)
+        .collect();
+    let seed: Vec<f64> = (0..solver.n_dofs())
+        .map(|i| 50.0 + i as f64 / 3.0)
+        .collect();
+    let mut session = solver
+        .start_session_categorical_seeded(&y, &seed, &options(80))
+        .unwrap();
+    let cold = solver.start_session(&y, &options(80)).unwrap();
+    assert_eq!(session.b, cold.b);
+    assert_eq!(session.y, cold.y);
+    assert_eq!(session.remaining_iterations(), 80);
+    let initial = session.snapshot();
+    assert_eq!(initial.x, seed);
+    for i in 0..60 {
+        let fit = seed[i % 6] + seed[6 + (i / 6) % 5] + seed[11 + (i / 6) % 5];
+        assert!((initial.demeaned[i] - (y[i] - fit)).abs() < 2e-13);
+    }
+    // Duplicate factors admit a gauge shift. It must remain in the supplied
+    // coordinates while the eventual fitted projection is independently correct.
+    let gauge: Vec<f64> = seed
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if (6..11).contains(&i) {
+                v + 17.0
+            } else if i >= 11 {
+                v - 17.0
+            } else {
+                v
+            }
+        })
+        .collect();
+    let gauge_initial = solver
+        .start_session_categorical_seeded(&y, &gauge, &options(80))
+        .unwrap()
+        .snapshot();
+    assert_eq!(gauge_initial.x, gauge);
+    for (a, b) in initial.demeaned.iter().zip(gauge_initial.demeaned) {
+        assert!((a - b).abs() < 2e-13);
+    }
+    session.run_action(None, 1, None).unwrap();
+    let replacement = solver
+        .build_pair_replacement(&ProjectedFactory)
+        .unwrap()
+        .unwrap();
+    session.run_action(Some(&replacement), 79, None).unwrap();
+    let actual = session.finish();
+    let expected = solver.solve(&y, &options(80)).unwrap();
+    assert!(actual.converged && actual.iterations <= 80);
+    for (a, b) in actual.demeaned.iter().zip(expected.demeaned) {
+        assert!((a - b).abs() < 1e-8);
+    }
+    let zeros = vec![0.0; solver.n_dofs()];
+    let mut zero = solver
+        .start_session_categorical_seeded(&y, &zeros, &options(80))
+        .unwrap();
+    let mut cold = solver.start_session(&y, &options(80)).unwrap();
+    zero.run_action(None, 80, None).unwrap();
+    cold.run_action(None, 80, None).unwrap();
+    let (zero, cold) = (zero.finish(), cold.finish());
+    assert_eq!(zero.x, cold.x);
+    assert_eq!(zero.demeaned, cold.demeaned);
+    assert_eq!(zero.iterations, cold.iterations);
+    assert_eq!(zero.residual.to_bits(), cold.residual.to_bits());
+    assert!(solver
+        .start_session_categorical_seeded(&y, &[0.0], &options(80))
+        .is_err());
+    let mut bad = zeros;
+    bad[0] = f64::NAN;
+    assert!(solver
+        .start_session_categorical_seeded(&y, &bad, &options(80))
+        .is_err());
+    let levels = [0, 0, 1, 1];
+    let z = [1.0, 2.0, 3.0, 4.0];
+    let slope = Solver::new(
+        vec![Effect::new(&levels, true, [&z[..]]).unwrap()],
+        None,
+        PreconditionerConfig::Off,
+    )
+    .unwrap();
+    assert!(slope
+        .start_session_categorical_seeded(&z, &vec![0.0; slope.n_dofs()], &options(80))
+        .is_err());
+}

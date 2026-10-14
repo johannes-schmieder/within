@@ -11,6 +11,8 @@ use schwarz_precond::{lsmr as lsmr_solve, mlsmr, MlsmrOptions};
 
 use crate::channel::Channel;
 use crate::config::{LsmrOptions, PreconditionerConfig};
+use crate::domain::collinearity::detect_collinear_slopes;
+use crate::domain::level_moments::TermMoments;
 use crate::domain::{Design, Effect};
 use crate::observation::ObservationFrame;
 use crate::operator::design::gather_apply;
@@ -215,8 +217,7 @@ pub struct SolveResult {
     pub x: Vec<f64>,
     /// Per-level directions the data cannot identify.
     pub unidentified: Vec<CoefficientAddress>,
-    /// Non-fatal preconditioner-build warnings (see [`Solver::warnings`]);
-    /// empty when a pre-built preconditioner was reused.
+    /// Non-fatal build warnings (see [`Solver::warnings`]).
     pub warnings: Vec<BuildWarning>,
     /// Address ↔ flat-`x`-index translation for this design's coefficients.
     pub layout: CoefficientLayout,
@@ -256,8 +257,7 @@ pub struct BatchSolveResult {
     /// Per-level directions the data cannot identify, shared across all RHS:
     /// identification depends only on the design and weights, never on `y`.
     pub unidentified: Vec<CoefficientAddress>,
-    /// Non-fatal preconditioner-build warnings, shared across all RHS; see
-    /// [`SolveResult::warnings`].
+    /// Non-fatal build warnings, shared across all RHS; see [`SolveResult::warnings`].
     pub warnings: Vec<BuildWarning>,
     /// Address ↔ flat-`x`-index translation for this design's coefficients.
     pub layout: CoefficientLayout,
@@ -345,6 +345,18 @@ struct RhsSolution {
     time_solve: f64,
 }
 
+/// Optional diagnostic screening of raw slope covariates against other terms.
+/// This policy never changes whitening rank tolerance or coefficient recovery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SlopeScreening {
+    /// Retain the default cross-term diagnostic warnings and shared moments.
+    #[default]
+    Enabled,
+    /// Skip cross-term diagnostics and build whitening moments one term at a time.
+    /// This retains the earlier constructor's warnings and temporary storage scope.
+    Disabled,
+}
+
 impl<'a> Solver<'a> {
     /// Construct a solver.
     ///
@@ -368,6 +380,19 @@ impl<'a> Solver<'a> {
         weights: Option<Vec<f64>>,
         preconditioner: impl Into<PreconditionerInput>,
     ) -> Result<Self, BuildError> {
+        Self::new_with_screening(design, weights, preconditioner, SlopeScreening::Enabled)
+    }
+
+    /// Construct a solver with an explicit slope-diagnostic policy.
+    /// `Disabled` avoids the cross-term screen's work and memory while retaining
+    /// the same per-term whitening and numerical rank decisions. The established
+    /// [`Self::new`] constructor keeps screening enabled.
+    pub fn new_with_screening(
+        design: impl IntoDesign<'a>,
+        weights: Option<Vec<f64>>,
+        preconditioner: impl Into<PreconditionerInput>,
+        screening: SlopeScreening,
+    ) -> Result<Self, BuildError> {
         let mut design = design.into_design()?;
         design.validate_weights(weights.as_deref())?;
 
@@ -377,10 +402,26 @@ impl<'a> Solver<'a> {
             None => weights,
         };
 
-        // Reparametrize the slope columns (if any) before the preconditioner reads the frame.
-        let reparam = SlopeReparam::build(&mut design, weights.as_deref());
+        let (reparam, mut warnings) = match screening {
+            SlopeScreening::Enabled => {
+                // The diagnostic and whitening readers both need raw loadings.
+                let moments = TermMoments::build(&design, weights.as_deref());
+                let warnings = moments
+                    .as_ref()
+                    .map(|m| detect_collinear_slopes(&design, weights.as_deref(), m))
+                    .unwrap_or_default();
+                let reparam = moments
+                    .as_ref()
+                    .and_then(|m| SlopeReparam::build(&mut design, m));
+                (reparam, warnings)
+            }
+            SlopeScreening::Disabled => (
+                SlopeReparam::build_unscreened(&mut design, weights.as_deref()),
+                Vec::new(),
+            ),
+        };
 
-        let (preconditioner, warnings) = match preconditioner.into() {
+        let (preconditioner, build_warnings) = match preconditioner.into() {
             PreconditionerInput::Default => {
                 build_preconditioner(&design, weights.as_deref(), None)?
             }
@@ -398,6 +439,8 @@ impl<'a> Solver<'a> {
                 (Some(p), Vec::new())
             }
         };
+
+        warnings.extend(build_warnings);
 
         let sqrt_weights = weights.map(|mut w| {
             for wi in &mut w {
@@ -432,8 +475,8 @@ impl<'a> Solver<'a> {
         self.stable_adjoint.is_some()
     }
 
-    /// Non-fatal events from the preconditioner build; empty when reusing a
-    /// pre-built preconditioner (its warnings were reported when it was built).
+    /// Non-fatal events from design screening and the preconditioner build; a reused
+    /// pre-built preconditioner contributes none (its own were reported when built).
     pub fn warnings(&self) -> &[BuildWarning] {
         &self.warnings
     }
@@ -670,8 +713,33 @@ pub fn solve_batch<'a, 'o>(
     lsmr: impl Into<Option<&'o LsmrOptions>>,
     preconditioner: impl Into<PreconditionerInput>,
 ) -> Result<BatchSolveResult, WithinError> {
+    solve_batch_with_screening(
+        design,
+        ys,
+        weights,
+        lsmr,
+        preconditioner,
+        SlopeScreening::Enabled,
+    )
+}
+
+/// Solve a batch with an explicit slope-diagnostic policy, retaining the
+/// established one-shot allocation lifetimes and setup/solve timing boundaries.
+pub fn solve_batch_with_screening<'a, 'o>(
+    design: impl IntoDesign<'a>,
+    ys: &[&[f64]],
+    weights: Option<&[f64]>,
+    lsmr: impl Into<Option<&'o LsmrOptions>>,
+    preconditioner: impl Into<PreconditionerInput>,
+    screening: SlopeScreening,
+) -> Result<BatchSolveResult, WithinError> {
     let t_start = Instant::now();
-    let solver = Solver::new(design, weights.map(|w| w.to_vec()), preconditioner)?;
+    let solver = Solver::new_with_screening(
+        design,
+        weights.map(|w| w.to_vec()),
+        preconditioner,
+        screening,
+    )?;
     let time_setup = t_start.elapsed().as_secs_f64();
     let mut result = solver.solve_batch(ys, lsmr)?;
     result.time_setup += time_setup;

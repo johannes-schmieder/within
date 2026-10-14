@@ -47,12 +47,14 @@ pub use domain::{Design, Effect};
 pub use error::{BuildError, BuildWarning, SolveError, WithinError};
 pub use operator::schwarz::Preconditioner;
 pub use solver::{
-    solve, solve_batch, ActionProgress, BatchSolveResult, CoefficientAddress, CoefficientLayout,
-    IntoDesign, PreconditionerInput, SolveResult, SolveSession, Solver,
+    solve, solve_batch, solve_batch_with_screening, ActionProgress, BatchSolveResult,
+    CoefficientAddress, CoefficientLayout, IntoDesign, PreconditionerInput, SlopeScreening,
+    SolveResult, SolveSession, Solver,
 };
 
 pub use fixed::{
-    FixedReducedInverse, FixedReducedInverseFactory, PairComponent, PairNomination, PairReplacement,
+    FixedReducedInverse, FixedReducedInverseFactory, OwnedPairBuild, PairComponent, PairNomination,
+    PairReplacement,
 };
 
 pub use schwarz_precond::LocalSolveError;

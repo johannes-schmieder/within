@@ -90,6 +90,38 @@ impl<'a> Solver<'a> {
             replacement_identity: None,
         })
     }
+    /// Begin a categorical solve at finite, full coefficient coordinates in the
+    /// existing term-major/original-level layout. The original response and
+    /// weighted RHS remain the stopping references; the first action recomputes
+    /// the exact correction residual. No Krylov iterations are consumed here.
+    /// The caller must deduct any prefix iteration work from `options.maxiter`.
+    /// Slope-bearing designs are rejected, so no solve-basis conversion or gauge
+    /// projection is implicit in this interface.
+    pub fn start_session_categorical_seeded(
+        &self,
+        y: &[f64],
+        initial_coefficients: &[f64],
+        options: &LsmrOptions,
+    ) -> Result<SolveSession<'_, 'a>, SolveError> {
+        if self.reparam.is_some()
+            || self.design.terms.iter().any(|term| {
+                term.columns.len() != 1 || term.columns.iter().any(|c| c.covariate().is_some())
+            })
+        {
+            return Err(invalid(
+                "categorical seed requires one constant column per term",
+            ));
+        }
+        if initial_coefficients.len() != self.n_dofs()
+            || initial_coefficients.iter().any(|value| !value.is_finite())
+        {
+            return Err(invalid("categorical seed must have n_dofs finite entries"));
+        }
+        let mut session = self.start_session(y, options)?;
+        session.x.copy_from_slice(initial_coefficients);
+        session.ran = true;
+        Ok(session)
+    }
 }
 
 impl SolveSession<'_, '_> {

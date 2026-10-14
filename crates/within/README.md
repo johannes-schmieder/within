@@ -99,7 +99,7 @@ MIT
 ### Optional fixed pair backends and solve sessions
 
 `Solver::pair_nomination` selects a categorical pair by its largest retained
-component dimension, then total local dimension, then original factor indices.
+component dimension, then total retained dimension, then original factor indices.
 Only components strictly above the configured dense threshold are eligible.
 `build_pair_replacement` accepts a `FixedReducedInverseFactory` and constructs
 all eligible components transactionally. Unchanged components share their
@@ -136,3 +136,26 @@ moves. They are runtime-only. Existing preconditioner wire formats and ordinary
 `solve`/`solve_batch` execution remain unchanged; external reduced factors cannot
 be serialized. Only callers opting into the new action can change their
 numerical solve path.
+
+`prepare_pair_replacement` splits the same transactional builder at its ownership
+boundary. Its `OwnedPairBuild` shares immutable incumbent factors and the exact
+solver identity, and can move to another worker after borrowed observations or
+the solver are dropped. `OwnedPairBuild::build` resumes the same construction
+checkpoint sequence. Admission and cancellation remain the factory's responsibility.
+
+`start_session_categorical_seeded(y, coefficients, options)` starts a categorical
+session from full coefficients in original term/level order. It preserves the
+original response and stopping scales, recomputes the first correction residual,
+and consumes no Krylov iteration itself. The caller deducts prior projection work
+from `options.maxiter`. No gauge normalization is imposed; slope terms and invalid
+coefficient vectors are rejected.
+
+### Slope diagnostics policy
+
+`Solver::new` and `solve_batch` keep cross-term slope-collinearity warnings enabled.
+`Solver::new_with_screening` and `solve_batch_with_screening` accept an explicit
+`SlopeScreening` policy. `Disabled` skips the diagnostic screen and constructs
+whitening moments one slope term at a time, retaining the earlier constructor's
+warnings and temporary-storage scope. Both policies use the same per-term rank
+tolerance, whitening arithmetic and coefficient recovery. Diagnostic warnings do
+not drop cross-term columns or establish their numerical rank.

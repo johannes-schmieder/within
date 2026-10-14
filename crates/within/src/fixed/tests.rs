@@ -360,3 +360,70 @@ fn metadata_budget_rejection_precedes_factory_and_leaves_solver_exact() {
         postcard::to_stdvec(solver.preconditioner().unwrap()).unwrap()
     );
 }
+
+#[test]
+fn owned_plan_survives_borrowed_inputs_and_preserves_checkpoints_and_application() {
+    use std::cell::RefCell;
+    struct Recording(RefCell<Vec<u64>>);
+    impl FixedReducedInverseFactory for Recording {
+        fn checkpoint(&self, work: u64) -> Result<(), BuildError> {
+            self.0.borrow_mut().push(work);
+            Ok(())
+        }
+        fn build(&self, c: PairComponent<'_>) -> Result<Arc<dyn FixedReducedInverse>, BuildError> {
+            ProjectedFactory.build(c)
+        }
+    }
+    let build = |separate: bool| {
+        let recorder = Recording(RefCell::new(Vec::new()));
+        let a: Vec<u32> = (0..4).flat_map(|i| [i; 4]).collect();
+        let b: Vec<u32> = (0..4).flat_map(|_| 0..4).collect();
+        let solver = Solver::new(
+            vec![
+                Effect::new(&a, true, []).unwrap(),
+                Effect::new(&b, true, []).unwrap(),
+            ],
+            None,
+            PreconditionerConfig::Additive {
+                local_solver: LocalSolverConfig {
+                    dense_threshold: 2,
+                    ..Default::default()
+                },
+                reduction: crate::ReductionStrategy::Ordered,
+            },
+        )
+        .unwrap();
+        let replacement = if separate {
+            let plan = solver.prepare_pair_replacement(&recorder).unwrap().unwrap();
+            assert_eq!(plan.nomination(), solver.pair_nomination().unwrap());
+            drop(solver);
+            drop(a);
+            drop(b);
+            // The owned plan can cross a worker boundary after all input borrows end.
+            let before = recorder.0.into_inner();
+            let (replacement, after) = std::thread::spawn(move || {
+                let recorder = Recording(RefCell::new(Vec::new()));
+                (plan.build(&recorder).unwrap(), recorder.0.into_inner())
+            })
+            .join()
+            .unwrap();
+            let mut all = before;
+            all.extend(after);
+            return (replacement, all);
+        } else {
+            solver.build_pair_replacement(&recorder).unwrap().unwrap()
+        };
+        (replacement, recorder.0.into_inner())
+    };
+    let (sync, sync_work) = build(false);
+    let (owned, owned_work) = build(true);
+    assert_eq!(sync_work, owned_work);
+    let rhs: Vec<f64> = (0..8).map(|i| i as f64 / 7.0).collect();
+    let mut a = vec![0.0; 8];
+    let mut b = vec![0.0; 8];
+    sync.apply(&rhs, &mut a).unwrap();
+    owned.apply(&rhs, &mut b).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(sync.apply_work_bound(), owned.apply_work_bound());
+    assert_eq!(sync.apply_storage_bound(), owned.apply_storage_bound());
+}
