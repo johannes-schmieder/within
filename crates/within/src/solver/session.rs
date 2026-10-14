@@ -92,7 +92,7 @@ impl<'a> Solver<'a> {
     }
 }
 
-impl<'s, 'a> SolveSession<'s, 'a> {
+impl SolveSession<'_, '_> {
     /// Iterations still available from the original solve budget, including after
     /// an error. A partially executed failed step consumes one iteration.
     pub fn remaining_iterations(&self) -> usize {

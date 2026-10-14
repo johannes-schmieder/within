@@ -177,6 +177,59 @@ fn wrapped_action_matches_dense_congruence_with_uneven_weights_and_partition_met
 }
 
 #[test]
+fn nomination_tie_uses_total_retained_dimension_not_total_local_size() {
+    // A has ten levels, B six, C seven. AB has two complete 5-by-3
+    // components; AC has components 5-by-3, 1-by-3, and 4-by-1;
+    // BC has components 3-by-3 and 3-by-4. All primary scores are 3.
+    // Retained sums are respectively 6, 5, 6, so AB wins the index tie.
+    // Total local sizes instead rank AC (17) above AB (16) and BC (13).
+    let mut columns = vec![Vec::<u32>::new(); 3];
+    for a in 0..5 {
+        for b in 0..3 {
+            for c in 0..3 {
+                columns[0].push(a);
+                columns[1].push(b);
+                columns[2].push(c);
+            }
+        }
+    }
+    for b in 3..6 {
+        for c in 3..6 {
+            columns[0].push(5);
+            columns[1].push(b);
+            columns[2].push(c);
+        }
+        for a in 6..10 {
+            columns[0].push(a);
+            columns[1].push(b);
+            columns[2].push(6);
+        }
+    }
+    let solver = Solver::new(
+        Design::from_levels_for_test(columns),
+        None,
+        PreconditionerConfig::Additive {
+            local_solver: LocalSolverConfig {
+                dense_threshold: 2,
+                ..Default::default()
+            },
+            reduction: crate::ReductionStrategy::Ordered,
+        },
+    )
+    .unwrap();
+    let nomination = solver.pair_nomination().unwrap();
+    assert_eq!(nomination.factors, (0, 1));
+    assert_eq!(nomination.max_retained, 3);
+    assert_eq!(nomination.total_retained, 6);
+    assert_eq!(nomination.replacement_components, 2);
+    let replacement = solver
+        .build_pair_replacement(&ProjectedFactory)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.nomination(), nomination);
+}
+
+#[test]
 fn nomination_preserves_small_components_and_is_transactional() {
     // Two large connected components and one tiny component. Both factors tie
     // with the third redundant factor; original indices decide the nomination.

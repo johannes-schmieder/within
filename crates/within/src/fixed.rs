@@ -91,8 +91,8 @@ pub struct PairNomination {
     pub factors: (usize, usize),
     /// Largest retained component dimension (the primary score).
     pub max_retained: usize,
-    /// Total local dimension over this pair's components (the secondary score).
-    pub total_levels: usize,
+    /// Total retained dimension over this pair's components (the secondary score).
+    pub total_retained: usize,
     /// Number of components strictly above the incumbent dense threshold.
     pub replacement_components: usize,
 }
@@ -200,9 +200,9 @@ pub(crate) fn copy_admitted<T: Copy>(
 
 type NominatedEntries<'a> = (&'a FeSchwarz, PairNomination, Vec<usize>);
 
-impl<'a> Solver<'a> {
+impl Solver<'_> {
     /// Nominate the categorical pair with largest `max_c min(L_ac, L_bc)`;
-    /// ties prefer larger total dimension, then smaller original factor indices.
+    /// ties prefer larger total retained dimension, then smaller original factor indices.
     /// Components at or below the existing dense threshold are never replaced.
     pub fn pair_nomination(&self) -> Option<PairNomination> {
         self.pair_entries(None)
@@ -325,16 +325,16 @@ impl<'a> Solver<'a> {
                 pairs.push(PairNomination {
                     factors,
                     max_retained: 0,
-                    total_levels: 0,
+                    total_retained: 0,
                     replacement_components: 0,
                 });
                 pairs.len() - 1
             });
             let candidate = &mut pairs[index];
             candidate.max_retained = candidate.max_retained.max(cross.c.ncols);
-            candidate.total_levels = candidate
-                .total_levels
-                .checked_add(cross.n_local())
+            candidate.total_retained = candidate
+                .total_retained
+                .checked_add(cross.c.ncols)
                 .ok_or_else(|| BuildError::LocalSolverBuild("pair size overflow".into()))?;
             if cross.c.ncols > local_solver.dense_threshold {
                 candidate.replacement_components += 1;
@@ -346,8 +346,13 @@ impl<'a> Solver<'a> {
             if candidate.replacement_components == 0 {
                 continue;
             }
-            let score =
-                |p: PairNomination| (p.max_retained, p.total_levels, std::cmp::Reverse(p.factors));
+            let score = |p: PairNomination| {
+                (
+                    p.max_retained,
+                    p.total_retained,
+                    std::cmp::Reverse(p.factors),
+                )
+            };
             if best.is_none_or(|current| score(candidate) > score(current)) {
                 best = Some(candidate);
             }
