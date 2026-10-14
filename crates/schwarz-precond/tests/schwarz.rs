@@ -674,3 +674,41 @@ fn with_n_dofs_pads_uncovered_tail_and_applies_zero() {
     // Covered DOFs: 1.0 * (4.0 / 2.0) = 2.0; uncovered tail stays exactly 0.
     assert_eq!(z, vec![2.0, 2.0, 0.0, 0.0]);
 }
+
+#[test]
+fn controlled_constructor_checks_inside_large_index_scan_and_preserves_action() {
+    let n = 513;
+    let entries = || {
+        vec![make_entry(
+            SubdomainCore::uniform((0..n as u32).collect()),
+            UniformDiagLocalSolver::new(n, 2.0),
+        )]
+    };
+    let mut charges = Vec::new();
+    let controlled =
+        SchwarzPreconditioner::try_with_n_dofs(entries(), n, ReductionStrategy::Ordered, |work| {
+            charges.push(work);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert_eq!(charges, vec![32, 512, 512, 512, 512, 4]);
+    let ordinary = SchwarzPreconditioner::with_n_dofs(entries(), n, ReductionStrategy::Ordered);
+    let input: Vec<f64> = (0..n).map(|i| i as f64 / 13.0).collect();
+    let mut expected = vec![0.0; n];
+    let mut actual = vec![0.0; n];
+    ordinary.apply(&input, &mut expected).unwrap();
+    controlled.apply(&input, &mut actual).unwrap();
+    assert_eq!(expected, actual);
+    let mut steps = 0;
+    let rejected =
+        SchwarzPreconditioner::try_with_n_dofs(entries(), n, ReductionStrategy::Ordered, |_| {
+            steps += 1;
+            if steps == 3 {
+                Err("cancelled in index scan")
+            } else {
+                Ok(())
+            }
+        });
+    assert!(rejected.is_err());
+    assert_eq!(steps, 3);
+}

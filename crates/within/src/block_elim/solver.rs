@@ -348,6 +348,24 @@ impl BlockElimSolver {
         ))
     }
 
+    pub(crate) fn apply_work_bound(
+        &self,
+        checkpoint: &mut dyn FnMut(u64) -> Result<(), BuildError>,
+    ) -> Result<Option<u64>, BuildError> {
+        let reduced = self.reduced_factor.apply_work_bound(checkpoint)?;
+        // Two CSR sweeps; full/reduced compensated mean projections; diagonal,
+        // sign/coordinate and partition congruences; reduced copies and cover
+        // embedding; restriction/prolongation. Dense/approximate factor work is
+        // accounted separately from its actual serialized storage.
+        Ok(reduced.and_then(|reduced| {
+            (self.n_internal as u64)
+                .checked_add(self.scratch_size() as u64)?
+                .checked_mul(64)?
+                .checked_add((self.cross_tab.c.nnz() as u64).checked_mul(16)?)?
+                .checked_add(reduced)
+        }))
+    }
+
     pub(crate) fn categorical_cross_tab(&self) -> Option<&CrossTab> {
         (matches!(self.coordinates, CoordinateMap::Canonical)
             && self.reduced_factor.grounding() == Some(Grounding::Floating))

@@ -24,6 +24,7 @@ pub struct MlsmrContinuation {
     rhs: Vec<f64>,
     offset: Option<Vec<f64>>,
     completed: usize,
+    started: usize,
     terminal: Option<LsmrResult>,
 }
 
@@ -106,13 +107,22 @@ impl MlsmrContinuation {
             rhs,
             offset: warm_start.map(<[f64]>::to_vec),
             completed: 0,
+            started: 0,
             terminal,
         })
+    }
+
+    /// Number of steps started, including a step that failed partway through.
+    /// Initialization and terminal certification do not start additional steps.
+    pub fn iterations_started(&self) -> usize {
+        self.started
     }
 
     /// Advance at most `maxiter` additional steps. A cap or escalation pause
     /// retains all recurrence state exactly. A tolerance audit is terminal,
     /// because certification consumes the bidiagonalization scratch vectors.
+    /// Escalation handlers are scoped to each call; use `None` or a stateless
+    /// policy when stopping decisions must also match an uninterrupted call.
     pub fn advance<A: Operator + ?Sized, M: Operator + ?Sized>(
         &mut self,
         operator: &A,
@@ -133,6 +143,7 @@ impl MlsmrContinuation {
         let mut iterations = 0;
         let mut reason = LsmrStopReason::MaxIterations;
         for _ in 0..maxiter {
+            self.started += 1;
             let step = bidiag.step()?;
             self.convergence.observe(step);
             let rotation = self.recurrence.step(step);

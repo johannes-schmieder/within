@@ -93,7 +93,8 @@ impl<'a> Solver<'a> {
 }
 
 impl<'s, 'a> SolveSession<'s, 'a> {
-    /// Iterations still available from the original solve budget.
+    /// Iterations still available from the original solve budget, including after
+    /// an error. A partially executed failed step consumes one iteration.
     pub fn remaining_iterations(&self) -> usize {
         self.options
             .maxiter
@@ -157,6 +158,10 @@ impl<'s, 'a> SolveSession<'s, 'a> {
             self.continuation = None;
         }
         let started = Instant::now();
+        let previously_started = self
+            .continuation
+            .as_ref()
+            .map_or(0, MlsmrContinuation::iterations_started);
         let attempt = (|| {
             if self.continuation.is_none() {
                 self.continuation = Some(MlsmrContinuation::new(
@@ -174,6 +179,13 @@ impl<'s, 'a> SolveSession<'s, 'a> {
                 .advance(&operator, preconditioner, cap, escalation)
         })();
         self.time_solve += started.elapsed().as_secs_f64();
+        let consumed = self
+            .continuation
+            .as_ref()
+            .map_or(0, MlsmrContinuation::iterations_started)
+            .saturating_sub(previously_started);
+        self.progress.iterations = consumed;
+        self.progress.total_iterations += consumed;
         let result = match attempt {
             Ok(result) => result,
             Err(error) => {
@@ -186,7 +198,7 @@ impl<'s, 'a> SolveSession<'s, 'a> {
         self.ran = true;
         self.progress = ActionProgress {
             iterations: result.iterations,
-            total_iterations: self.progress.total_iterations + result.iterations,
+            total_iterations: self.progress.total_iterations,
             converged: result.converged,
             residual: result.normal_eq_residual,
             stop_reason: result.stop_reason,
@@ -211,6 +223,8 @@ impl<'s, 'a> SolveSession<'s, 'a> {
     /// Recover coefficients and unweighted observation residuals from the current
     /// iterate. A failed session is explicitly marked unconverged.
     pub fn finish(mut self) -> SolveResult {
+        self.continuation = None;
+        self.b = Vec::new();
         let x = std::mem::take(&mut self.x);
         self.result(x)
     }

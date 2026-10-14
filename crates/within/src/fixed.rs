@@ -1,6 +1,5 @@
 //! Optional runtime-only fixed reduced inverses for categorical pair components.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +12,8 @@ use crate::block_elim::BlockElimSolver;
 use crate::domain::Loading;
 use crate::operator::schwarz::{FeSchwarz, Variant};
 use crate::{BuildError, Channel, PreconditionerConfig, Solver};
+
+pub(crate) mod work;
 
 /// A fixed linear reduced inverse. Implementations must be symmetric positive
 /// semidefinite with kernel exactly the constant vector, in the Euclidean
@@ -36,6 +37,12 @@ pub trait FixedReducedInverse: Send + Sync {
     fn dimension(&self) -> usize;
     /// Scratch elements required by an application.
     fn scratch_len(&self) -> usize;
+    /// Conservative logical-operation bound for one application, including
+    /// scratch initialization and the complete fixed cycle. `None` declines
+    /// work-capped admission; it does not affect explicit applications.
+    fn apply_work_bound(&self) -> Option<u64> {
+        None
+    }
     /// Apply the same fixed inverse on every call, replacing `rhs` with its image.
     fn apply_in_place(&self, rhs: &mut [f64], scratch: &mut [f64]) -> Result<(), LocalSolveError>;
 }
@@ -64,7 +71,8 @@ pub trait FixedReducedInverseFactory {
     /// Bounded construction checkpoint, including nomination and metadata copies.
     /// `work_units` is a conservative primitive-work charge: 128 per metadata
     /// entry, 32 before allocation and bytes per copy chunk (at most 1024).
-    /// Copy charges also cover the final scheduler's index scan. The caller
+    /// Scheduler construction separately checks each 128-index chunk; factor
+    /// work inspection checks each 16 encoded bytes (512 work units). The caller
     /// must admit the metadata memory envelope before starting construction.
     fn checkpoint(&self, _work_units: u64) -> Result<(), BuildError> {
         Ok(())
@@ -99,6 +107,7 @@ pub struct PairReplacement {
     pub(crate) preconditioner: SchwarzPreconditioner<PairLocalSolver>,
     build_duration: Duration,
     nomination: PairNomination,
+    work: work::ApplyWork,
 }
 
 impl PairReplacement {
@@ -109,6 +118,25 @@ impl PairReplacement {
     /// Pair and component-size information used for nomination.
     pub fn nomination(&self) -> PairNomination {
         self.nomination
+    }
+
+    /// Conservative work for the entire replacement action, including unchanged
+    /// local factors and Schwarz buffers/reductions. `None` means a backend did
+    /// not declare a bound or arithmetic overflowed. Query under the same Rayon
+    /// pool as application; all factor metadata was scanned during construction.
+    pub fn apply_work_bound(&self) -> Option<u64> {
+        self.work.bound(self.preconditioner.reduction_strategy())
+    }
+
+    /// Conservative bytes for one active Schwarz application and its cache of
+    /// at most four pooled banks, including local/global buffers and incumbent
+    /// permutation scratch. Immutable factors and backend-owned storage are
+    /// excluded: the factory must admit them separately. Query under the intended
+    /// Rayon pool; multiplying by the concurrent RHS count safely covers shared
+    /// cache and active banks. `None` means size arithmetic overflow.
+    pub fn apply_storage_bound(&self) -> Option<u64> {
+        self.work
+            .storage_bound(self.preconditioner.reduction_strategy())
     }
 
     /// Apply the complete replacement Schwarz action, including all unchanged pairs.
@@ -201,9 +229,12 @@ impl<'a> Solver<'a> {
             .map_err(|_| BuildError::Allocation {
                 context: "pair replacement entries",
             })?;
+        let mut work = work::ApplyWork::new(self.n_dofs(), base.inner.subdomains().len());
+        let mut selected = selected.into_iter().peekable();
         for (index, entry) in base.inner.subdomains().iter().enumerate() {
             factory.checkpoint(128)?;
-            let solver = if selected.binary_search(&index).is_ok() {
+            let solver = if selected.peek() == Some(&index) {
+                selected.next();
                 let cross = entry
                     .solver()
                     .categorical_cross_tab()
@@ -222,6 +253,7 @@ impl<'a> Solver<'a> {
                     index,
                 }
             };
+            work.add(solver.inner(), &mut |units| factory.checkpoint(units))?;
             let globals = copy_admitted(entry.global_indices(), factory)?;
             let partition = match entry.partition_weights() {
                 PartitionWeights::Uniform(n) => PartitionWeights::Uniform(*n),
@@ -237,13 +269,17 @@ impl<'a> Solver<'a> {
         let PreconditionerConfig::Additive { reduction, .. } = &base.config else {
             unreachable!("additive variant has additive configuration")
         };
-        let preconditioner = SchwarzPreconditioner::with_n_dofs(entries, self.n_dofs(), *reduction);
+        let preconditioner =
+            SchwarzPreconditioner::try_with_n_dofs(entries, self.n_dofs(), *reduction, |work| {
+                factory.checkpoint(work)
+            })?;
         Ok(Some(PairReplacement {
             source: self.replacement_source.get_or_init(|| Arc::new(())).clone(),
             identity: Arc::new(()),
             preconditioner,
             build_duration: started.elapsed(),
             nomination,
+            work,
         }))
     }
 
@@ -260,86 +296,141 @@ impl<'a> Solver<'a> {
         let PreconditionerConfig::Additive { local_solver, .. } = &base.config else {
             return Ok(None);
         };
-        let mut pairs: BTreeMap<(usize, usize), (PairNomination, Vec<usize>)> = BTreeMap::new();
-        for (index, entry) in base.inner.subdomains().iter().enumerate() {
-            if let Some(factory) = factory {
-                factory.checkpoint(128)?;
-            }
-            let solver = entry.solver();
-            let Some(cross) = solver.categorical_cross_tab() else {
+        checkpoint(factory, 32)?;
+        let count = base.inner.subdomains().len();
+        let mut pairs: Vec<PairNomination> = Vec::new();
+        pairs
+            .try_reserve_exact(count)
+            .map_err(|_| BuildError::Allocation {
+                context: "pair nomination metadata",
+            })?;
+        for entry in base.inner.subdomains() {
+            checkpoint(factory, 128)?;
+            let Some(factors) = self.entry_pair(entry, factory)? else {
                 continue;
             };
-            let indices = entry.global_indices();
-            let (Some(a), Some(b)) = (
-                indices.first().and_then(|&i| self.channel_at(i as usize)),
-                indices
-                    .get(cross.c.nrows)
-                    .and_then(|&i| self.channel_at(i as usize)),
-            ) else {
-                return Ok(None);
-            };
-            if a.term == b.term
-                || !matches!(self.design.loading(a), Loading::Constant)
-                || !matches!(self.design.loading(b), Loading::Constant)
-            {
-                continue;
+            let cross = entry
+                .solver()
+                .categorical_cross_tab()
+                .expect("eligible pair");
+            let mut found = None;
+            for (index, pair) in pairs.iter().enumerate() {
+                checkpoint(factory, 32)?;
+                if pair.factors == factors {
+                    found = Some(index);
+                    break;
+                }
             }
-            let factors = (a.term.min(b.term), a.term.max(b.term));
-            let (candidate, selected) = pairs.entry(factors).or_insert((
-                PairNomination {
+            let index = found.unwrap_or_else(|| {
+                pairs.push(PairNomination {
                     factors,
                     max_retained: 0,
                     total_levels: 0,
                     replacement_components: 0,
-                },
-                Vec::new(),
-            ));
+                });
+                pairs.len() - 1
+            });
+            let candidate = &mut pairs[index];
             candidate.max_retained = candidate.max_retained.max(cross.c.ncols);
-            candidate.total_levels += cross.n_local();
+            candidate.total_levels = candidate
+                .total_levels
+                .checked_add(cross.n_local())
+                .ok_or_else(|| BuildError::LocalSolverBuild("pair size overflow".into()))?;
             if cross.c.ncols > local_solver.dense_threshold {
                 candidate.replacement_components += 1;
-                selected
-                    .try_reserve(1)
-                    .map_err(|_| BuildError::Allocation {
-                        context: "pair nomination components",
-                    })?;
+            }
+        }
+        let mut best: Option<PairNomination> = None;
+        for candidate in pairs {
+            checkpoint(factory, 64)?;
+            if candidate.replacement_components == 0 {
+                continue;
+            }
+            let score =
+                |p: PairNomination| (p.max_retained, p.total_levels, std::cmp::Reverse(p.factors));
+            if best.is_none_or(|current| score(candidate) > score(current)) {
+                best = Some(candidate);
+            }
+        }
+        let Some(nomination) = best else {
+            return Ok(None);
+        };
+        checkpoint(factory, 32)?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(nomination.replacement_components)
+            .map_err(|_| BuildError::Allocation {
+                context: "pair nomination components",
+            })?;
+        for (index, entry) in base.inner.subdomains().iter().enumerate() {
+            checkpoint(factory, 64)?;
+            if self.entry_pair(entry, factory)? == Some(nomination.factors)
+                && entry.solver().n_kept() > local_solver.dense_threshold
+            {
                 selected.push(index);
             }
         }
-        // BTreeMap order makes exact ties choose the lexicographically first pair.
-        let mut best: Option<(PairNomination, Vec<usize>)> = None;
-        for (candidate, selected) in pairs.into_values() {
-            if let Some(factory) = factory {
-                factory.checkpoint(128)?;
-            }
-            if selected.is_empty() {
-                continue;
-            }
-            if best.as_ref().is_none_or(|(current, _)| {
-                (candidate.max_retained, candidate.total_levels)
-                    > (current.max_retained, current.total_levels)
-            }) {
-                best = Some((candidate, selected));
-            }
-        }
-        Ok(best.map(|(nomination, selected)| (base, nomination, selected)))
+        Ok(Some((base, nomination, selected)))
     }
 
-    fn channel_at(&self, index: usize) -> Option<Channel> {
+    fn entry_pair(
+        &self,
+        entry: &SubdomainEntry<BlockElimSolver>,
+        factory: Option<&dyn FixedReducedInverseFactory>,
+    ) -> Result<Option<(usize, usize)>, BuildError> {
+        let Some(cross) = entry.solver().categorical_cross_tab() else {
+            return Ok(None);
+        };
+        let indices = entry.global_indices();
+        let (Some(&first), Some(&second)) = (indices.first(), indices.get(cross.c.nrows)) else {
+            return Ok(None);
+        };
+        let (Some(a), Some(b)) = (
+            self.channel_at(first as usize, factory)?,
+            self.channel_at(second as usize, factory)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok((a.term != b.term
+            && matches!(self.design.loading(a), Loading::Constant)
+            && matches!(self.design.loading(b), Loading::Constant))
+        .then_some((a.term.min(b.term), a.term.max(b.term))))
+    }
+
+    fn channel_at(
+        &self,
+        index: usize,
+        factory: Option<&dyn FixedReducedInverseFactory>,
+    ) -> Result<Option<Channel>, BuildError> {
         if index >= self.n_dofs() {
-            return None;
+            return Ok(None);
         }
-        let term = self
-            .design
-            .terms
-            .partition_point(|term| term.offset <= index)
-            .checked_sub(1)?;
+        let (mut low, mut high) = (0, self.design.terms.len());
+        while low < high {
+            checkpoint(factory, 32)?;
+            let middle = low + (high - low) / 2;
+            if self.design.terms[middle].offset <= index {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let Some(term) = low.checked_sub(1) else {
+            return Ok(None);
+        };
         let meta = &self.design.terms[term];
-        Some(Channel {
+        Ok(Some(Channel {
             term,
             column: (index - meta.offset) / meta.n_levels,
-        })
+        }))
     }
+}
+
+fn checkpoint(
+    factory: Option<&dyn FixedReducedInverseFactory>,
+    work: u64,
+) -> Result<(), BuildError> {
+    factory.map_or(Ok(()), |factory| factory.checkpoint(work))
 }
 
 #[cfg(test)]

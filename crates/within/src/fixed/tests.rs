@@ -12,6 +12,9 @@ impl FixedReducedInverse for ProjectedDiagonal {
     fn scratch_len(&self) -> usize {
         0
     }
+    fn apply_work_bound(&self) -> Option<u64> {
+        (self.0 as u64).checked_mul(16)
+    }
     fn apply_in_place(&self, rhs: &mut [f64], _: &mut [f64]) -> Result<(), LocalSolveError> {
         let mean = rhs.iter().sum::<f64>() / rhs.len() as f64;
         for (i, value) in rhs.iter_mut().enumerate() {

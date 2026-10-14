@@ -34,6 +34,17 @@ pub(crate) enum ReducedFactor {
 }
 
 impl ReducedFactor {
+    pub(crate) fn apply_work_bound(
+        &self,
+        checkpoint: &mut dyn FnMut(u64) -> Result<(), BuildError>,
+    ) -> Result<Option<u64>, BuildError> {
+        match self {
+            Self::External(inverse) => Ok(inverse.apply_work_bound()),
+            Self::Direct { factor, .. } => crate::fixed::work::factor_work(factor, checkpoint),
+            Self::Cover { inner, .. } => crate::fixed::work::factor_work(inner, checkpoint),
+        }
+    }
+
     /// The gauge the operator-level solve applies; `None` for a self-grounding cover.
     pub(crate) fn grounding(&self) -> Option<Grounding> {
         match self {

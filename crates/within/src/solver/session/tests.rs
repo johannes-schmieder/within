@@ -190,3 +190,92 @@ fn correction_keeps_budget_and_owned_replacement_survives_solver_move() {
         .unwrap();
     assert!(session.finish().converged);
 }
+
+#[test]
+fn failed_partial_iteration_consumes_budget_and_keeps_last_accepted_iterate() {
+    use crate::{
+        BuildError, FixedReducedInverse, FixedReducedInverseFactory, LocalSolveError, PairComponent,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Failing {
+        inner: crate::fixed::tests::ProjectedDiagonal,
+        calls: AtomicUsize,
+        fail_at: usize,
+    }
+    impl FixedReducedInverse for Failing {
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+        fn scratch_len(&self) -> usize {
+            0
+        }
+        fn apply_in_place(
+            &self,
+            rhs: &mut [f64],
+            scratch: &mut [f64],
+        ) -> Result<(), LocalSolveError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) + 1 == self.fail_at {
+                Err(LocalSolveError::BackendFailed {
+                    context: "iteration budget witness",
+                    message: "injected failure".into(),
+                })
+            } else {
+                self.inner.apply_in_place(rhs, scratch)
+            }
+        }
+    }
+    struct Factory(usize);
+    impl FixedReducedInverseFactory for Factory {
+        fn build(
+            &self,
+            component: PairComponent<'_>,
+        ) -> Result<Arc<dyn FixedReducedInverse>, BuildError> {
+            Ok(Arc::new(Failing {
+                inner: crate::fixed::tests::ProjectedDiagonal(component.n_retained),
+                calls: AtomicUsize::new(0),
+                fail_at: self.0,
+            }))
+        }
+    }
+    let solver = Solver::new(
+        categorical(),
+        Some((0..60).map(|i| 0.2 + (i % 7) as f64).collect()),
+        config(),
+    )
+    .unwrap()
+    .with_reproducible()
+    .unwrap();
+    let y: Vec<_> = (0..60).map(|i| ((i * 13) % 17) as f64 / 19.0).collect();
+    for fail_at in [1, 2, 3] {
+        let replacement = solver
+            .build_pair_replacement(&Factory(fail_at))
+            .unwrap()
+            .unwrap();
+        assert!(replacement.apply_work_bound().is_none());
+        let mut session = solver
+            .start_session(
+                &y,
+                &LsmrOptions {
+                    tol: 0.0,
+                    ..options(5)
+                },
+            )
+            .unwrap();
+        if fail_at == 3 {
+            session.run_action(Some(&replacement), 1, None).unwrap();
+        }
+        let accepted = session.snapshot();
+        assert!(session.run_action(Some(&replacement), 5, None).is_err());
+        let consumed = fail_at - 1;
+        assert_eq!(session.remaining_iterations(), 5 - consumed);
+        assert!(session.run_action(None, 5, None).is_err());
+        let failed = session.finish();
+        assert_eq!(failed.iterations, consumed);
+        assert_eq!(failed.x, accepted.x);
+        assert_eq!(failed.demeaned, accepted.demeaned);
+        assert!(!failed.converged);
+    }
+}

@@ -93,6 +93,52 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
         Self::build(entries, Some(n_dofs), strategy)
     }
 
+    /// Construct with bounded work checkpoints throughout scheduler preparation.
+    /// Charges 32 units before each entry and four units per index in chunks of
+    /// at most 128 indices. A rejected checkpoint drops all candidate entries;
+    /// no partial preconditioner is published. `n_dofs` must span every index.
+    pub fn try_with_n_dofs<E>(
+        entries: Vec<SubdomainEntry<S>>,
+        n_dofs: usize,
+        strategy: ReductionStrategy,
+        mut checkpoint: impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        let mut max_scratch_size = 0;
+        let mut total_inner_parallel_work = 0usize;
+        let mut max_inner_parallel_work = 0;
+        let mut total_scatter_dofs = 0usize;
+        let mut covered_span = 0;
+        for entry in &entries {
+            checkpoint(32)?;
+            let work = entry.solver().inner_parallelism_work_estimate();
+            total_inner_parallel_work = total_inner_parallel_work.saturating_add(work);
+            max_inner_parallel_work = max_inner_parallel_work.max(work);
+            total_scatter_dofs = total_scatter_dofs.saturating_add(entry.global_indices().len());
+            max_scratch_size = max_scratch_size.max(entry.scratch_size());
+            for chunk in entry.global_indices().chunks(128) {
+                checkpoint(4 * chunk.len() as u64)?;
+                if let Some(&last) = chunk.iter().max() {
+                    covered_span = covered_span.max(last as usize + 1);
+                }
+            }
+        }
+        debug_assert!(
+            n_dofs >= covered_span,
+            "n_dofs must span every subdomain index"
+        );
+        let executor = AdditiveExecutor::new(Arc::new(entries), n_dofs, max_scratch_size);
+        let scheduler = AdditiveScheduler {
+            total_inner_parallel_work,
+            max_inner_parallel_work,
+            total_scatter_dofs,
+        };
+        Ok(Self {
+            reduction_strategy: strategy,
+            scheduler,
+            executor,
+        })
+    }
+
     /// One pass over `entries` derives `max_scratch_size`, the metrics, and the covered span.
     fn build(
         entries: Vec<SubdomainEntry<S>>,
