@@ -336,6 +336,24 @@ impl ConvergenceCriteria {
         (recomputed - estimate).abs() <= self.residual_gap()
     }
 
+    /// Whether a plain-metric normal-equation stop survives the exit audit.
+    pub(super) fn corroborates_normal_eq(
+        &self,
+        residual: f64,
+        current: Magnitude,
+        reference: Magnitude,
+        metric_relative: f64,
+    ) -> bool {
+        if residual <= self.residual_gap()
+            || !(current.is_normal() && reference.is_normal() && metric_relative.is_finite())
+        {
+            return true;
+        }
+        let plain_relative = (current / reference).to_f64();
+        plain_relative <= CERTIFICATION_SLACK * self.rel_tol
+            || plain_relative <= CERTIFICATION_SLACK * metric_relative
+    }
+
     /// An annihilated `α₁` certifies via the residual, or via a lower `‖A‖` bound that overstates.
     pub(super) fn corroborates(&self, normr: f64, normar: Magnitude, a_norm_below: f64) -> bool {
         normr <= self.residual_gap()
