@@ -105,7 +105,12 @@ Only components strictly above the configured dense threshold are eligible.
 all eligible components transactionally. Unchanged components share their
 incumbent factors. A failed factory or construction checkpoint leaves the
 incumbent usable. The factory admits its resource envelope and supplies bounded
-work/cancellation checks through `checkpoint(work_units)`.
+work/cancellation checks through `checkpoint(work_units)`. The optional
+`allocation(site, bytes)` callback gates each builder-owned reservation and shared
+owner before allocation, using stable site labels and checked byte counts.
+It defaults to success and does not alter work charges. Vectors use fallible
+reservations; admitted small shared owners still use Rust's infallible allocator.
+Backend allocations and lazy application scratch need their own admission.
 
 A `FixedReducedInverse` must supply one fixed linear, symmetric positive
 semidefinite action in the Euclidean retained-coordinate metric, with exactly

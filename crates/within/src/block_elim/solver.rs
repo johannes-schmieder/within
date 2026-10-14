@@ -390,7 +390,7 @@ impl BlockElimSolver {
             })?;
         Ok(Self::new(
             self.cross_tab.clone(),
-            crate::fixed::copy_admitted(&self.inv_diag_elim, factory)?,
+            crate::fixed::copy_admitted(&self.inv_diag_elim, factory, "pair eliminated diagonal")?,
             ReducedFactor::External(inverse),
             self.coordinates.clone(),
         ))

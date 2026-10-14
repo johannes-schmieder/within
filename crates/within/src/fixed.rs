@@ -77,6 +77,17 @@ pub trait FixedReducedInverseFactory {
     fn checkpoint(&self, _work_units: u64) -> Result<(), BuildError> {
         Ok(())
     }
+    /// Admit one builder-owned allocation before it occurs. `site` is a stable
+    /// logical label; repeated sites are distinguished by callback order. `bytes`
+    /// bounds requested payload storage, including headers/alignment for shared
+    /// owners, but excludes allocator bookkeeping. This is separate from work
+    /// checkpoints and the caller's total retained-memory envelope. Vector
+    /// reservations are fallible; small `Arc` allocations use Rust's infallible
+    /// allocator after this gate, so exogenous allocator exhaustion can still abort.
+    /// Backend-owned allocations remain the responsibility of `build`.
+    fn allocation(&self, _site: &'static str, _bytes: usize) -> Result<(), BuildError> {
+        Ok(())
+    }
     /// Build from the original aggregated component, once per nominated component.
     fn build(
         &self,
@@ -174,11 +185,12 @@ impl OwnedPairBuild {
     ) -> Result<PairReplacement, BuildError> {
         factory.checkpoint(32)?;
         let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.shared.subdomains().len())
-            .map_err(|_| BuildError::Allocation {
-                context: "pair replacement entries",
-            })?;
+        reserve_admitted(
+            &mut entries,
+            self.shared.subdomains().len(),
+            Some(factory),
+            "pair replacement entries",
+        )?;
         let mut work = work::ApplyWork::new(self.n_dofs, self.shared.subdomains().len());
         let mut selected = self.selected.into_iter().peekable();
         for (index, entry) in self.shared.subdomains().iter().enumerate() {
@@ -204,22 +216,26 @@ impl OwnedPairBuild {
                 }
             };
             work.add(solver.inner(), &mut |units| factory.checkpoint(units))?;
-            let globals = copy_admitted(entry.global_indices(), factory)?;
+            let globals = copy_admitted(entry.global_indices(), factory, "pair global indices")?;
             let partition = match entry.partition_weights() {
                 PartitionWeights::Uniform(n) => PartitionWeights::Uniform(*n),
-                PartitionWeights::NonUniform(weights) => {
-                    PartitionWeights::NonUniform(copy_admitted(weights, factory)?)
-                }
+                PartitionWeights::NonUniform(weights) => PartitionWeights::NonUniform(
+                    copy_admitted(weights, factory, "pair partition weights")?,
+                ),
             };
             let core = SubdomainCore::with_partition_weights(globals, partition)
                 .map_err(BuildError::Preconditioner)?;
             entries
                 .push(SubdomainEntry::try_new(core, solver).map_err(BuildError::Preconditioner)?);
         }
-        let preconditioner =
-            SchwarzPreconditioner::try_with_n_dofs(entries, self.n_dofs, self.reduction, |work| {
-                factory.checkpoint(work)
-            })?;
+        let preconditioner = SchwarzPreconditioner::try_with_n_dofs_and_allocation(
+            entries,
+            self.n_dofs,
+            self.reduction,
+            |work| factory.checkpoint(work),
+            |site, bytes| factory.allocation(site, bytes),
+        )?;
+        admit_arc::<()>(factory, "pair replacement identity")?;
         Ok(PairReplacement {
             source: self.source,
             identity: Arc::new(()),
@@ -270,18 +286,45 @@ impl LocalSolver for PairLocalSolver {
 pub(crate) fn copy_admitted<T: Copy>(
     values: &[T],
     factory: &dyn FixedReducedInverseFactory,
+    site: &'static str,
 ) -> Result<Vec<T>, BuildError> {
     factory.checkpoint(32)?;
     let mut copy = Vec::new();
-    copy.try_reserve_exact(values.len())
-        .map_err(|_| BuildError::Allocation {
-            context: "pair replacement metadata",
-        })?;
+    reserve_admitted(&mut copy, values.len(), Some(factory), site)?;
     for chunk in values.chunks(128) {
         factory.checkpoint(std::mem::size_of_val(chunk) as u64)?;
         copy.extend_from_slice(chunk);
     }
     Ok(copy)
+}
+
+fn reserve_admitted<T>(
+    values: &mut Vec<T>,
+    count: usize,
+    factory: Option<&dyn FixedReducedInverseFactory>,
+    site: &'static str,
+) -> Result<(), BuildError> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(BuildError::Allocation { context: site })?;
+    if let Some(factory) = factory {
+        factory.allocation(site, bytes)?;
+    }
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| BuildError::Allocation { context: site })
+}
+
+fn admit_arc<T>(
+    factory: &dyn FixedReducedInverseFactory,
+    site: &'static str,
+) -> Result<(), BuildError> {
+    // Two reference counters plus conservative padding before the payload.
+    let bytes = std::mem::size_of::<T>()
+        .checked_add(2 * std::mem::size_of::<usize>())
+        .and_then(|n| n.checked_add(std::mem::align_of::<T>() - 1))
+        .ok_or(BuildError::Allocation { context: site })?;
+    factory.allocation(site, bytes)
 }
 
 type NominatedEntries<'a> = (&'a FeSchwarz, PairNomination, Vec<usize>);
@@ -320,7 +363,12 @@ impl Solver<'_> {
         let Some((base, nomination, selected)) = self.pair_entries(Some(factory))? else {
             return Ok(None);
         };
+        admit_arc::<SchwarzPreconditioner<BlockElimSolver>>(factory, "pair plan owner")?;
         let shared = Arc::new(base.inner.clone());
+        if self.replacement_source.get().is_none() {
+            admit_arc::<()>(factory, "pair source identity")?;
+        }
+        let source = self.replacement_source.get_or_init(|| Arc::new(())).clone();
         let PreconditionerConfig::Additive { reduction, .. } = &base.config else {
             unreachable!("additive variant has additive configuration")
         };
@@ -330,7 +378,7 @@ impl Solver<'_> {
             nomination,
             n_dofs: self.n_dofs(),
             reduction: *reduction,
-            source: self.replacement_source.get_or_init(|| Arc::new(())).clone(),
+            source,
             started,
         }))
     }
@@ -351,11 +399,7 @@ impl Solver<'_> {
         checkpoint(factory, 32)?;
         let count = base.inner.subdomains().len();
         let mut pairs: Vec<PairNomination> = Vec::new();
-        pairs
-            .try_reserve_exact(count)
-            .map_err(|_| BuildError::Allocation {
-                context: "pair nomination metadata",
-            })?;
+        reserve_admitted(&mut pairs, count, factory, "pair nomination metadata")?;
         for entry in base.inner.subdomains() {
             checkpoint(factory, 128)?;
             let Some(factors) = self.entry_pair(entry, factory)? else {
@@ -414,11 +458,12 @@ impl Solver<'_> {
         };
         checkpoint(factory, 32)?;
         let mut selected = Vec::new();
-        selected
-            .try_reserve_exact(nomination.replacement_components)
-            .map_err(|_| BuildError::Allocation {
-                context: "pair nomination components",
-            })?;
+        reserve_admitted(
+            &mut selected,
+            nomination.replacement_components,
+            factory,
+            "pair nomination components",
+        )?;
         for (index, entry) in base.inner.subdomains().iter().enumerate() {
             checkpoint(factory, 64)?;
             if self.entry_pair(entry, factory)? == Some(nomination.factors)

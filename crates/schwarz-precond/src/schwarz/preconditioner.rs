@@ -13,6 +13,7 @@ use crate::error::SolveError;
 use crate::local_solve::{LocalSolver, SubdomainEntry};
 use crate::Operator;
 
+use super::buffers::BufferPool;
 use super::executor::AdditiveExecutor;
 use super::planning::{AdditiveScheduler, ReductionPlan, ReductionStrategy};
 
@@ -101,7 +102,23 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
         entries: Vec<SubdomainEntry<S>>,
         n_dofs: usize,
         strategy: ReductionStrategy,
+        checkpoint: impl FnMut(u64) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        Self::try_with_n_dofs_and_allocation(entries, n_dofs, strategy, checkpoint, |_, _| Ok(()))
+    }
+
+    /// As [`Self::try_with_n_dofs`], with gates before scheduler control allocations.
+    /// Stable site labels identify the shared entry owner and empty buffer-pool
+    /// owner. Byte bounds include reference counters/alignment, excluding allocator
+    /// bookkeeping and the already-owned entry payload. Application scratch is lazy
+    /// and outside these construction gates. Small shared owners use infallible
+    /// `Arc` allocation after admission; exogenous allocator exhaustion can abort.
+    pub fn try_with_n_dofs_and_allocation<E>(
+        entries: Vec<SubdomainEntry<S>>,
+        n_dofs: usize,
+        strategy: ReductionStrategy,
         mut checkpoint: impl FnMut(u64) -> Result<(), E>,
+        mut allocation: impl FnMut(&'static str, usize) -> Result<(), E>,
     ) -> Result<Self, E> {
         let mut max_scratch_size = 0;
         let mut total_inner_parallel_work = 0usize;
@@ -126,7 +143,16 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
             n_dofs >= covered_span,
             "n_dofs must span every subdomain index"
         );
-        let executor = AdditiveExecutor::new(Arc::new(entries), n_dofs, max_scratch_size);
+        allocation(
+            "schwarz entries owner",
+            std::mem::size_of::<Vec<SubdomainEntry<S>>>()
+                + 2 * std::mem::size_of::<usize>()
+                + std::mem::align_of::<Vec<SubdomainEntry<S>>>()
+                - 1,
+        )?;
+        let entries = Arc::new(entries);
+        allocation("schwarz buffer pool", BufferPool::allocation_bytes())?;
+        let executor = AdditiveExecutor::new(entries, n_dofs, max_scratch_size);
         let scheduler = AdditiveScheduler {
             total_inner_parallel_work,
             max_inner_parallel_work,

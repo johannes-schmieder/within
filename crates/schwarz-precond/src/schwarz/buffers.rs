@@ -23,6 +23,13 @@ pub(super) struct BufferPool {
 impl BufferPool {
     const MAX_POOL_SIZE: usize = 4;
 
+    pub(super) fn allocation_bytes() -> usize {
+        std::mem::size_of::<Mutex<Vec<SchwarzBuffers>>>()
+            + 2 * std::mem::size_of::<usize>()
+            + std::mem::align_of::<Mutex<Vec<SchwarzBuffers>>>()
+            - 1
+    }
+
     pub(super) fn new(n_dofs: usize, max_scratch_size: usize) -> Self {
         Self {
             n_dofs,

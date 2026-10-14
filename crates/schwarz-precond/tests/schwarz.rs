@@ -712,3 +712,66 @@ fn controlled_constructor_checks_inside_large_index_scan_and_preserves_action() 
     assert!(rejected.is_err());
     assert_eq!(steps, 3);
 }
+
+#[test]
+fn scheduler_allocation_gates_preserve_work_and_action_and_abort_at_each_owner() {
+    let entries = || {
+        vec![make_entry(
+            SubdomainCore::uniform(vec![0, 1, 2]),
+            UniformDiagLocalSolver::new(3, 2.0),
+        )]
+    };
+    let mut charges = Vec::new();
+    let mut allocations = Vec::new();
+    let gated = SchwarzPreconditioner::try_with_n_dofs_and_allocation(
+        entries(),
+        3,
+        ReductionStrategy::Ordered,
+        |work| {
+            charges.push(work);
+            Ok::<_, ()>(())
+        },
+        |site, bytes| {
+            allocations.push((site, bytes));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(charges, vec![32, 12]);
+    assert_eq!(
+        allocations
+            .iter()
+            .map(|(site, _)| *site)
+            .collect::<Vec<_>>(),
+        vec!["schwarz entries owner", "schwarz buffer pool"]
+    );
+    assert!(allocations
+        .iter()
+        .all(|(_, bytes)| *bytes >= 2 * std::mem::size_of::<usize>()));
+    let ordinary = SchwarzPreconditioner::with_n_dofs(entries(), 3, ReductionStrategy::Ordered);
+    let mut expected = [0.0; 3];
+    let mut actual = [0.0; 3];
+    ordinary.apply(&[0.3, -0.4, 1.2], &mut expected).unwrap();
+    gated.apply(&[0.3, -0.4, 1.2], &mut actual).unwrap();
+    assert_eq!(actual.map(f64::to_bits), expected.map(f64::to_bits));
+    for reject in 0..allocations.len() {
+        let mut seen = Vec::new();
+        let result = SchwarzPreconditioner::try_with_n_dofs_and_allocation(
+            entries(),
+            3,
+            ReductionStrategy::Ordered,
+            |_| Ok(()),
+            |site, bytes| {
+                let index = seen.len();
+                seen.push((site, bytes));
+                if index == reject {
+                    Err(site)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(site) if site == allocations[reject].0));
+        assert_eq!(seen, allocations[..=reject]);
+    }
+}

@@ -364,10 +364,19 @@ fn metadata_budget_rejection_precedes_factory_and_leaves_solver_exact() {
 #[test]
 fn owned_plan_survives_borrowed_inputs_and_preserves_checkpoints_and_application() {
     use std::cell::RefCell;
-    struct Recording(RefCell<Vec<u64>>);
+    #[derive(Debug, PartialEq)]
+    enum Boundary {
+        Work(u64),
+        Allocation(&'static str, usize),
+    }
+    struct Recording(RefCell<Vec<Boundary>>);
     impl FixedReducedInverseFactory for Recording {
         fn checkpoint(&self, work: u64) -> Result<(), BuildError> {
-            self.0.borrow_mut().push(work);
+            self.0.borrow_mut().push(Boundary::Work(work));
+            Ok(())
+        }
+        fn allocation(&self, site: &'static str, bytes: usize) -> Result<(), BuildError> {
+            self.0.borrow_mut().push(Boundary::Allocation(site, bytes));
             Ok(())
         }
         fn build(&self, c: PairComponent<'_>) -> Result<Arc<dyn FixedReducedInverse>, BuildError> {
@@ -426,4 +435,150 @@ fn owned_plan_survives_borrowed_inputs_and_preserves_checkpoints_and_application
     assert_eq!(a, b);
     assert_eq!(sync.apply_work_bound(), owned.apply_work_bound());
     assert_eq!(sync.apply_storage_bound(), owned.apply_storage_bound());
+}
+
+#[test]
+fn every_owned_allocation_gate_rejects_transactionally_with_checked_sizes() {
+    use std::cell::RefCell;
+    #[derive(Default)]
+    struct Allocations {
+        reject: Option<usize>,
+        seen: RefCell<Vec<(&'static str, usize)>>,
+    }
+    impl FixedReducedInverseFactory for Allocations {
+        fn allocation(&self, site: &'static str, bytes: usize) -> Result<(), BuildError> {
+            let mut seen = self.seen.borrow_mut();
+            let index = seen.len();
+            seen.push((site, bytes));
+            if self.reject == Some(index) {
+                Err(BuildError::Allocation { context: site })
+            } else {
+                Ok(())
+            }
+        }
+        fn build(&self, c: PairComponent<'_>) -> Result<Arc<dyn FixedReducedInverse>, BuildError> {
+            ProjectedFactory.build(c)
+        }
+    }
+    let solver = || {
+        let design = || {
+            Design::from_levels_for_test(vec![
+                (0..4).flat_map(|i| [i; 4]).collect(),
+                (0..4).flat_map(|_| 0..4).collect(),
+            ])
+        };
+        let original = Solver::new(
+            design(),
+            None,
+            PreconditionerConfig::Additive {
+                local_solver: LocalSolverConfig {
+                    dense_threshold: 2,
+                    ..Default::default()
+                },
+                reduction: crate::ReductionStrategy::Ordered,
+            },
+        )
+        .unwrap();
+        // A supported prebuilt action exercises the nonuniform partition copy.
+        let mut preconditioner = original.preconditioner().unwrap().clone();
+        let Variant::Additive(base) = &mut preconditioner.inner else {
+            panic!()
+        };
+        let entries = base
+            .inner
+            .subdomains()
+            .iter()
+            .map(|entry| {
+                let weights = (0..entry.global_indices().len())
+                    .map(|i| 0.5 + i as f64 / 8.0)
+                    .collect();
+                let core = SubdomainCore::with_partition_weights(
+                    entry.global_indices().to_vec(),
+                    PartitionWeights::NonUniform(weights),
+                )
+                .unwrap();
+                SubdomainEntry::try_new(core, entry.solver().clone()).unwrap()
+            })
+            .collect();
+        base.inner =
+            SchwarzPreconditioner::with_n_dofs(entries, 8, crate::ReductionStrategy::Ordered);
+        Solver::new(design(), None, preconditioner).unwrap()
+    };
+    let accepted = Allocations::default();
+    let reference_solver = solver();
+    let replacement = reference_solver
+        .build_pair_replacement(&accepted)
+        .unwrap()
+        .unwrap();
+    let boundaries = accepted.seen.into_inner();
+    assert_eq!(
+        boundaries.iter().map(|(site, _)| *site).collect::<Vec<_>>(),
+        vec![
+            "pair nomination metadata",
+            "pair nomination components",
+            "pair plan owner",
+            "pair source identity",
+            "pair replacement entries",
+            "pair eliminated diagonal",
+            "pair global indices",
+            "pair partition weights",
+            "schwarz entries owner",
+            "schwarz buffer pool",
+            "pair replacement identity",
+        ]
+    );
+    assert!(boundaries.iter().all(|(_, bytes)| *bytes > 0));
+    assert_eq!(boundaries[5].1, 4 * std::mem::size_of::<f64>());
+    assert_eq!(boundaries[6].1, 8 * std::mem::size_of::<u32>());
+    assert_eq!(boundaries[7].1, 8 * std::mem::size_of::<f64>());
+    let rhs = [0.3, -1.0, 1.2, 0.5, -0.7, 0.1, 0.2, 0.8];
+    let mut expected = [0.0; 8];
+    replacement.apply(&rhs, &mut expected).unwrap();
+    for (reject, &(site, _)) in boundaries.iter().enumerate() {
+        let solver = solver();
+        let incumbent = postcard::to_stdvec(solver.preconditioner().unwrap()).unwrap();
+        let factory = Allocations {
+            reject: Some(reject),
+            ..Default::default()
+        };
+        let error = solver.build_pair_replacement(&factory).err().unwrap();
+        assert!(matches!(error, BuildError::Allocation { context } if context == site));
+        assert_eq!(*factory.seen.borrow(), boundaries[..=reject]);
+        assert_eq!(
+            incumbent,
+            postcard::to_stdvec(solver.preconditioner().unwrap()).unwrap()
+        );
+        if let Some(source) = solver.replacement_source.get() {
+            assert_eq!(
+                Arc::strong_count(source),
+                1,
+                "failed candidate must release its source"
+            );
+        }
+        let retry = solver
+            .build_pair_replacement(&ProjectedFactory)
+            .unwrap()
+            .unwrap();
+        let mut actual = [0.0; 8];
+        retry.apply(&rhs, &mut actual).unwrap();
+        assert_eq!(actual.map(f64::to_bits), expected.map(f64::to_bits));
+    }
+    let factory = Allocations::default();
+    let error = reserve_admitted(
+        &mut Vec::<f64>::new(),
+        usize::MAX,
+        Some(&factory),
+        "overflow",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        BuildError::Allocation {
+            context: "overflow"
+        }
+    ));
+    assert!(
+        factory.seen.borrow().is_empty(),
+        "overflow must fail before callback or allocation"
+    );
 }
