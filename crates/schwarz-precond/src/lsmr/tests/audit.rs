@@ -5,10 +5,10 @@ use super::super::bidiag::{BidiagStep, Bidiagonalization};
 use super::super::magnitude::Magnitude;
 use super::super::recurrence::ConvergenceCriteria;
 use super::super::{
-    lsmr_from_bidiag, mlsmr, EscalationHandler, EscalationPolicy, LsmrResult, LsmrStopReason,
+    lsmr, lsmr_from_bidiag, mlsmr, EscalationHandler, EscalationPolicy, LsmrResult, LsmrStopReason,
     MlsmrOptions, NormalEqReference, SolveStart,
 };
-use crate::lsmr::fixtures::{DenseOp, DiagOp, FixedIterations};
+use crate::lsmr::fixtures::{DenseOp, DiagOp, FixedIterations, IdentityOp};
 use crate::SolveError;
 
 /// Stops on ResidualTolerance at every pass's first step; `true_residuals` scripts each check.
@@ -236,6 +236,53 @@ fn each_plain_gradient_audit_leg_is_explicit(
         ),
         expected
     );
+}
+
+/// `M⁻¹ = diag(1, 1e-20)` cannot certify the solution direction it hides.
+#[test]
+fn a_deflating_preconditioner_cannot_certify_the_direction_it_hides() {
+    let op = DenseOp {
+        rows: 3,
+        cols: 2,
+        data: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    };
+    let result = mlsmr(
+        &op,
+        &[1.0, 1.0, 1.0],
+        &DiagOp(vec![1.0, 1e-20]),
+        1e-8,
+        20,
+        MlsmrOptions::default(),
+    )
+    .expect("deflated solve");
+
+    assert!(
+        !result.converged || (result.x[1] - 1.0).abs() <= 1e-8,
+        "a converged solve left the deflated coordinate at {} after {} iterations",
+        result.x[1],
+        result.iterations,
+    );
+}
+
+/// The warm-start certificate keeps the original right-hand side as its reference.
+#[test]
+fn a_warm_start_near_the_solution_keeps_its_certificate() {
+    let op = DenseOp {
+        rows: 4,
+        cols: 2,
+        data: vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, -1.0],
+    };
+    let rhs = [1.0, 2.0, 3.0, 5.0];
+    let solution = lsmr(&op, &rhs, 1e-14, 100, None).expect("cold solve").x;
+    let warm_start = [solution[0] + 1e-11, solution[1] - 2e-11];
+    let options = MlsmrOptions {
+        warm_start: Some(&warm_start),
+        ..Default::default()
+    };
+
+    let result = mlsmr(&op, &rhs, &IdentityOp { n: 2 }, 1e-8, 20, options).expect("warm solve");
+
+    assert!(result.converged, "{:?}", result.stop_reason);
 }
 
 /// `‖Aᵀr‖ / (‖A‖‖r‖)` at the ends of the float range, where the obvious spellings certify an
