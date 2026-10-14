@@ -191,6 +191,10 @@ impl SolutionState {
         }
     }
 
+    pub(super) fn x(&self) -> &[f64] {
+        &self.x
+    }
+
     pub(super) fn into_x(self) -> Vec<f64> {
         self.x
     }

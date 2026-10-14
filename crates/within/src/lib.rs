@@ -27,6 +27,7 @@
 
 pub mod config;
 pub mod error;
+mod fixed;
 pub mod observation;
 
 pub(crate) mod block_elim;
@@ -46,6 +47,12 @@ pub use domain::{Design, Effect};
 pub use error::{BuildError, BuildWarning, SolveError, WithinError};
 pub use operator::schwarz::Preconditioner;
 pub use solver::{
-    solve, solve_batch, BatchSolveResult, CoefficientAddress, CoefficientLayout, IntoDesign,
-    PreconditionerInput, SolveResult, Solver,
+    solve, solve_batch, ActionProgress, BatchSolveResult, CoefficientAddress, CoefficientLayout,
+    IntoDesign, PreconditionerInput, SolveResult, SolveSession, Solver,
 };
+
+pub use fixed::{
+    FixedReducedInverse, FixedReducedInverseFactory, PairComponent, PairNomination, PairReplacement,
+};
+
+pub use schwarz_precond::LocalSolveError;

@@ -95,3 +95,44 @@ MIT
 - Gao, Y., Kyng, R. & Spielman, D. A. (2025). AC(k): Robust Solution of Laplacian Equations by Randomized Approximate Cholesky Factorization. *SIAM Journal on Scientific Computing*.
 - Toselli & Widlund (2005). *Domain Decomposition Methods — Algorithms and Theory*. Springer.
 - Xu, J. (1992). Iterative Methods by Space Decomposition and Subspace Correction. *SIAM Review*, 34(4), 581--613.
+
+### Optional fixed pair backends and solve sessions
+
+`Solver::pair_nomination` selects a categorical pair by its largest retained
+component dimension, then total local dimension, then original factor indices.
+Only components strictly above the configured dense threshold are eligible.
+`build_pair_replacement` accepts a `FixedReducedInverseFactory` and constructs
+all eligible components transactionally. Unchanged components share their
+incumbent factors. A failed factory or construction checkpoint leaves the
+incumbent usable. The factory admits its resource envelope and supplies bounded
+work/cancellation checks through `checkpoint(work_units)`.
+
+A `FixedReducedInverse` must supply one fixed linear, symmetric positive
+semidefinite action in the Euclidean retained-coordinate metric, with exactly
+the constant kernel. A fixed symmetric multigrid cycle is appropriate; CG with
+either a tolerance or a fixed number of iterations is not linear. `within`
+keeps the incumbent sign transform, full-component mean projections, triangular
+elimination/recovery and two-sided partition weights. The full wrapped action
+retains the incumbent component kernel even though the unprojected triangular
+congruence generally does not. This local construction requires no global
+full-rank coefficient basis.
+
+`Solver::start_session` retains an original weighted RHS and an internal
+coefficient iterate. `run_action` with the same backend resumes all existing
+Golub–Kahan vectors, rotations and reorthogonalization state. After rejected
+setup, continuing with the incumbent therefore gives the same recurrence as
+an uninterrupted solve. Accepting a different replacement, or calling
+`restart_correction` at an equal or tighter tolerance, discards the entire
+recurrence and recomputes `b - A x`. Both stopping references use the original
+RHS under the current fixed preconditioner; progress ratios from different
+preconditioners are not comparable. All actions share the original iteration
+budget. `snapshot` returns a recoverable output copy without changing state;
+`finish` returns the final result. Final application-specific scientific
+certification remains the caller's responsibility.
+
+Replacement handles are owned, cheaply cloneable, and tied to their exact
+originating solver through a private identity token, including after that solver
+moves. They are runtime-only. Existing preconditioner wire formats and ordinary
+`solve`/`solve_batch` execution remain unchanged; external reduced factors cannot
+be serialized. Only callers opting into the new action can change their
+numerical solve path.

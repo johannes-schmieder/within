@@ -19,8 +19,8 @@ mod tests;
 /// Concrete additive Schwarz type used in the parent crate.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct FeSchwarz {
-    inner: SchwarzPreconditioner<BlockElimSolver>,
-    config: PreconditionerConfig,
+    pub(crate) inner: SchwarzPreconditioner<BlockElimSolver>,
+    pub(crate) config: PreconditionerConfig,
 }
 
 impl FeSchwarz {
@@ -58,7 +58,7 @@ impl Operator for FeSchwarz {
 
 /// Diagonal/Jacobi preconditioner for the fixed-effects Gramian.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct DiagonalPreconditioner {
+pub(crate) struct DiagonalPreconditioner {
     inv_diag: Arc<[f64]>,
 }
 
@@ -129,12 +129,12 @@ pub(crate) fn build_entry(
 /// Opaque handle to a pre-built preconditioner; cloning is O(1) via `Arc`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Preconditioner {
-    inner: Variant,
+    pub(crate) inner: Variant,
     build_duration: Duration,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-enum Variant {
+pub(crate) enum Variant {
     // Keep Additive first: postcard encodes by declaration order and the fixture depends on it.
     Additive(FeSchwarz),
     Diagonal(DiagonalPreconditioner),

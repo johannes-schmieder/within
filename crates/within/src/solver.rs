@@ -20,6 +20,8 @@ use crate::operator::DesignOperator;
 use crate::{BuildError, BuildWarning, SolveError, WithinError};
 
 mod reparam;
+mod session;
+pub use session::{ActionProgress, SolveSession};
 #[cfg(test)]
 mod tests;
 use reparam::SlopeReparam;
@@ -305,7 +307,8 @@ impl BatchSolveResult {
 /// Python boundary — uses owned columns. Weights are always owned; for a
 /// one-shot weighted solve from a borrowed slice, use the free [`solve`] function.
 pub struct Solver<'a> {
-    design: Design<'a>,
+    pub(crate) design: Design<'a>,
+    pub(crate) replacement_source: std::sync::OnceLock<std::sync::Arc<()>>,
     /// `sqrt(W)` in the design's internal observation order, computed once and
     /// borrowed by the per-RHS [`DesignOperator`]s (raw weights are needed only
     /// during construction).
@@ -405,6 +408,7 @@ impl<'a> Solver<'a> {
 
         Ok(Self {
             design,
+            replacement_source: std::sync::OnceLock::new(),
             sqrt_weights,
             preconditioner,
             stable_adjoint: None,

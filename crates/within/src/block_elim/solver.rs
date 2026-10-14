@@ -280,12 +280,12 @@ fn double_for_cover(values: &[f64], n_rows: usize) -> Vec<f64> {
 
 impl BlockElimSolver {
     /// Size of the block the elimination removes, the leading one.
-    fn n_eliminated(&self) -> usize {
+    pub(crate) fn n_eliminated(&self) -> usize {
         self.cross_tab.n_rows()
     }
 
     /// Size of the block the reduced factor solves.
-    fn n_kept(&self) -> usize {
+    pub(crate) fn n_kept(&self) -> usize {
         self.cross_tab.n_cols()
     }
 
@@ -345,6 +345,36 @@ impl BlockElimSolver {
             eliminated.inv_diagonal,
             factor,
             coordinates,
+        ))
+    }
+
+    pub(crate) fn categorical_cross_tab(&self) -> Option<&CrossTab> {
+        (matches!(self.coordinates, CoordinateMap::Canonical)
+            && self.reduced_factor.grounding() == Some(Grounding::Floating))
+        .then_some(&self.cross_tab)
+    }
+
+    pub(crate) fn with_fixed_inverse(
+        &self,
+        inverse: Arc<dyn crate::FixedReducedInverse>,
+        factory: &dyn crate::FixedReducedInverseFactory,
+    ) -> Result<Self, BuildError> {
+        if inverse.dimension() != self.n_kept() {
+            return Err(BuildError::LocalSolverBuild(
+                "fixed reduced inverse dimension does not match retained block".into(),
+            ));
+        }
+        self.n_internal
+            .checked_add(self.n_kept())
+            .and_then(|n| n.checked_add(inverse.scratch_len()))
+            .ok_or_else(|| {
+                BuildError::LocalSolverBuild("fixed inverse scratch size overflow".into())
+            })?;
+        Ok(Self::new(
+            self.cross_tab.clone(),
+            crate::fixed::copy_admitted(&self.inv_diag_elim, factory)?,
+            ReducedFactor::External(inverse),
+            self.coordinates.clone(),
         ))
     }
 

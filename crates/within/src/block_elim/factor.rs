@@ -29,6 +29,8 @@ pub(crate) enum ReducedFactor {
         /// Single signed reduced dimension exposed to the caller.
         m: usize,
     },
+    #[serde(skip)]
+    External(std::sync::Arc<dyn crate::FixedReducedInverse>),
 }
 
 impl ReducedFactor {
@@ -37,6 +39,7 @@ impl ReducedFactor {
         match self {
             Self::Direct { grounding, .. } => Some(*grounding),
             Self::Cover { .. } => None,
+            Self::External(_) => Some(Grounding::Floating),
         }
     }
 
@@ -57,6 +60,7 @@ impl ReducedFactor {
             Self::Direct { factor, .. } => factor.original_n(),
             // The cover is hidden behind the single signed interface.
             Self::Cover { m, .. } => *m,
+            Self::External(inverse) => inverse.dimension(),
         }
     }
 
@@ -64,6 +68,7 @@ impl ReducedFactor {
         match self {
             Self::Direct { factor, .. } => factor.n(),
             Self::Cover { m, .. } => *m,
+            Self::External(inverse) => inverse.dimension(),
         }
     }
 
@@ -72,6 +77,7 @@ impl ReducedFactor {
         match self {
             Self::Direct { .. } => 0,
             Self::Cover { inner, .. } => inner.n(),
+            Self::External(inverse) => inverse.scratch_len(),
         }
     }
 
@@ -82,6 +88,7 @@ impl ReducedFactor {
         scratch: &mut [f64],
     ) -> Result<(), LocalSolveError> {
         match self {
+            Self::External(inverse) => inverse.apply_in_place(x, scratch),
             Self::Direct { factor, .. } => {
                 debug_assert_eq!(factor.n(), x.len());
                 solve_approx(factor, x)

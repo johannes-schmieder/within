@@ -226,3 +226,141 @@ fn test_staleness_rejects_invalid_configuration() {
         ));
     }
 }
+
+#[test]
+fn original_scale_restart_uses_original_normal_equation_reference() {
+    let op = DiagOp(vec![1.0, 2.0, 4.0]);
+    let m = IdentityOp { n: 3 };
+    let b = [2.0, 3.0, 5.0];
+    let x0 = [1.99, 1.49, 1.24];
+    let opts = MlsmrOptions {
+        warm_start: Some(&x0),
+        ..Default::default()
+    };
+    let old = mlsmr(&op, &b, &m, 0.0, 1, opts).unwrap();
+    let restored = MlsmrContinuation::new(&op, &b, &m, 0.0, opts.warm_start, opts.local_size)
+        .unwrap()
+        .advance(&op, &m, 1, None)
+        .unwrap();
+    // Only the normalization reference changes; the fresh correction recurrence
+    // and the recovered original-coordinate iterate are bit-identical.
+    assert_eq!(old.x, restored.x);
+    let residual0 = [b[0] - x0[0], b[1] - 2.0 * x0[1], b[2] - 4.0 * x0[2]];
+    let original_ref = vec_norm(&[b[0], 2.0 * b[1], 4.0 * b[2]]);
+    let correction_ref = vec_norm(&[residual0[0], 2.0 * residual0[1], 4.0 * residual0[2]]);
+    assert!(
+        (restored.normal_eq_residual - old.normal_eq_residual * correction_ref / original_ref)
+            .abs()
+            < 1e-16
+    );
+    let expected = vec_norm(&[
+        b[0] - restored.x[0],
+        2.0 * (b[1] - 2.0 * restored.x[1]),
+        4.0 * (b[2] - 4.0 * restored.x[2]),
+    ]) / original_ref;
+    assert!((expected - restored.normal_eq_residual).abs() < 1e-15);
+}
+
+#[test]
+fn original_scale_cold_path_is_exactly_legacy_path() {
+    let op = DiagOp((0..30).map(|i| 1.0 + i as f64 / 20.0).collect());
+    let b: Vec<f64> = (0..30).map(|i| ((i * 7) % 11) as f64).collect();
+    let m = IdentityOp { n: 30 };
+    for budget in [1, 20, 200] {
+        let opts = MlsmrOptions {
+            local_size: Some(12),
+            ..Default::default()
+        };
+        let old = mlsmr(&op, &b, &m, 1e-11, budget, opts).unwrap();
+        let new = MlsmrContinuation::new(&op, &b, &m, 1e-11, None, opts.local_size)
+            .unwrap()
+            .advance(&op, &m, budget, None)
+            .unwrap();
+        assert_eq!(old.x, new.x);
+        assert_eq!(old.iterations, new.iterations);
+        assert_eq!(old.residual_norm.to_bits(), new.residual_norm.to_bits());
+        assert_eq!(
+            old.normal_eq_residual.to_bits(),
+            new.normal_eq_residual.to_bits()
+        );
+        assert_eq!(old.stop_reason, new.stop_reason);
+    }
+}
+
+#[test]
+fn paused_continuation_matches_uninterrupted_recurrence_exactly() {
+    let op = DiagOp((0..40).map(|i| 0.5 + i as f64 / 7.0).collect());
+    let b: Vec<f64> = (0..40).map(|i| ((i * 7) % 13) as f64 + 0.3).collect();
+    let m = IdentityOp { n: 40 };
+    let opts = MlsmrOptions {
+        local_size: Some(9),
+        ..Default::default()
+    };
+    let expected = mlsmr(&op, &b, &m, 0.0, 12, opts).unwrap();
+    let mut continuation = MlsmrContinuation::new(&op, &b, &m, 0.0, None, opts.local_size).unwrap();
+    let checkpoint = continuation
+        .advance(&op, &m, 12, Some(&FixedIterations(5)))
+        .unwrap();
+    assert_eq!(checkpoint.stop_reason, LsmrStopReason::Escalated);
+    assert_eq!(checkpoint.iterations, 5);
+    let resumed = continuation.advance(&op, &m, 7, None).unwrap();
+    assert_eq!(resumed.iterations, 7);
+    assert_eq!(expected.x, resumed.x);
+    assert_eq!(
+        expected.normal_eq_residual.to_bits(),
+        resumed.normal_eq_residual.to_bits()
+    );
+    assert_eq!(
+        expected.residual_norm.to_bits(),
+        resumed.residual_norm.to_bits()
+    );
+}
+
+#[test]
+fn residual_restart_preserves_nonunique_coefficient_gauge() {
+    let op = ZeroSecondRow;
+    let m = IdentityOp { n: 2 };
+    let x0 = [0.5, 7.0];
+    let mut continuation =
+        MlsmrContinuation::new(&op, &[2.0, 0.0], &m, 1e-12, Some(&x0), None).unwrap();
+    let result = continuation.advance(&op, &m, 5, None).unwrap();
+    assert!(result.converged);
+    assert_eq!(result.x[1].to_bits(), 7.0f64.to_bits());
+}
+
+#[test]
+fn continuation_applies_one_inverse_per_step_without_reinitializing_on_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted {
+        n: usize,
+        calls: AtomicUsize,
+    }
+    impl Operator for Counted {
+        fn nrows(&self) -> usize {
+            self.n
+        }
+        fn ncols(&self) -> usize {
+            self.n
+        }
+        fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            y.copy_from_slice(x);
+            Ok(())
+        }
+        fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+            self.apply(x, y)
+        }
+    }
+    let op = DiagOp((0..40).map(|i| 0.5 + i as f64 / 7.0).collect());
+    let b: Vec<f64> = (0..40).map(|i| ((i * 7) % 13) as f64 + 0.3).collect();
+    let m = Counted {
+        n: 40,
+        calls: AtomicUsize::new(0),
+    };
+    let mut continuation = MlsmrContinuation::new(&op, &b, &m, 0.0, None, Some(9)).unwrap();
+    assert_eq!(m.calls.load(Ordering::Relaxed), 1);
+    assert!(!continuation.advance(&op, &m, 5, None).unwrap().converged);
+    assert_eq!(m.calls.load(Ordering::Relaxed), 6);
+    assert!(!continuation.advance(&op, &m, 7, None).unwrap().converged);
+    assert_eq!(m.calls.load(Ordering::Relaxed), 13);
+}

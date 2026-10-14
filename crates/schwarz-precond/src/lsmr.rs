@@ -5,6 +5,8 @@
 //! - [`mlsmr`] — preconditioned variant with composable warm starts and escalation.
 
 mod bidiag;
+mod continuation;
+pub use continuation::MlsmrContinuation;
 #[cfg(test)]
 mod fixtures;
 mod recurrence;
@@ -37,6 +39,7 @@ pub(crate) fn vec_norm(v: &[f64]) -> f64 {
 
 /// Result of an LSMR solve.
 #[must_use]
+#[derive(Clone)]
 pub struct LsmrResult {
     /// Solution vector.
     pub x: Vec<f64>,

@@ -472,7 +472,36 @@ pub(super) struct ModifiedGolubKahan<'a, A: Operator + ?Sized, M: Operator + ?Si
     beta_prev_inv: f64,
 }
 
+/// Owned recurrence data, detached from borrowed operator handles between actions.
+pub(super) struct ModifiedGolubKahanState {
+    bufs: ModifiedGolubKahanBuffers,
+    alpha: f64,
+    beta_prev_inv: f64,
+}
+
 impl<'a, A: Operator + ?Sized, M: Operator + ?Sized> ModifiedGolubKahan<'a, A, M> {
+    pub(super) fn suspend(self) -> ModifiedGolubKahanState {
+        ModifiedGolubKahanState {
+            bufs: self.bufs,
+            alpha: self.alpha,
+            beta_prev_inv: self.beta_prev_inv,
+        }
+    }
+
+    pub(super) fn resume(
+        operator: &'a A,
+        preconditioner: &'a M,
+        state: ModifiedGolubKahanState,
+    ) -> Self {
+        Self {
+            operator,
+            preconditioner,
+            bufs: state.bufs,
+            alpha: state.alpha,
+            beta_prev_inv: state.beta_prev_inv,
+        }
+    }
+
     /// Initialize the bidiagonalization, returning `Self` and the first step `(α₁, β₁)`.
     pub(super) fn init(
         operator: &'a A,
