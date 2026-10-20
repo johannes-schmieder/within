@@ -282,6 +282,11 @@ impl BlockElimSolver {
         self.cross_tab.n_rows()
     }
 
+    /// Checked retained heap capacity of the reduced factor alone.
+    pub(crate) fn factor_retained_heap_bytes(&self) -> Option<usize> {
+        self.reduced_factor.retained_heap_bytes()
+    }
+
     /// Size of the block the reduced factor solves.
     fn n_kept(&self) -> usize {
         self.cross_tab.n_cols()
@@ -398,9 +403,13 @@ impl BlockElimSolver {
             "grounded gauge slot must spill past the kept block into a solved slot",
         );
         sol[reduced.clone()].copy_from_slice(&rhs[n..n + self.n_reduced]);
-        let embed = &mut rhs[n + self.n_reduced..];
+        // After that copy the reduced RHS is dead, and so is every solution slot past
+        // the reduced region: only `rhs[..n_elim]` and `sol[..n]` are read afterward.
+        let (head, embed) = rhs.split_at_mut(n + self.n_reduced);
+        let dead_rhs = &mut head[n..];
+        let (sol_head, dead_tail) = sol.split_at_mut(reduced.end);
         self.reduced_factor
-            .solve_in_place(&mut sol[reduced], embed)?;
+            .solve_in_place(&mut sol_head[reduced], embed, dead_rhs, dead_tail)?;
         if let Some(ground) = explicit_ground {
             let ground = sol[n_elim + ground];
             for v in &mut sol[n_elim..n_elim + n_keep] {

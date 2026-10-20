@@ -482,3 +482,79 @@ fn kept_block_wider_than_the_reduced_factor_is_rejected() {
     let bytes = postcard::to_stdvec(&bad).expect("serialize");
     assert!(postcard::from_bytes::<BlockElimSolver>(&bytes).is_err());
 }
+
+/// The reduced factor of two interleaved components needs permutation scratch,
+/// which the solve takes from dead regions of its own two buffers: stale contents
+/// there must not matter, and the kept block must match the allocating factor solve.
+#[test]
+fn permuted_reduced_factor_solves_from_dead_buffer_regions() {
+    let n_kept = 8;
+    let mut rows = vec![Vec::new(); n_kept];
+    for v in 0..n_kept - 2 {
+        let w = 1.0 + (v % 3) as f64;
+        rows[v].push((v + 2, -w));
+        rows[v + 2].push((v, -w));
+    }
+    let (mut indptr, mut indices, mut data) = (vec![0], Vec::new(), Vec::new());
+    for (v, row) in rows.iter_mut().enumerate() {
+        let degree: f64 = row.iter().map(|&(_, w)| -w).sum();
+        row.push((v, degree + if v == 1 { 0.5 } else { 0.0 }));
+        row.sort_by_key(|&(c, _)| c);
+        for &(c, w) in row.iter() {
+            indices.push(c as u32);
+            data.push(w);
+        }
+        indptr.push(indices.len() as u32);
+    }
+    let laplacian = CsrMatrix::new(indptr, indices, data, n_kept);
+    let config = ApproxCholConfig::default()
+        .to_approx_chol(DEFAULT_DENSE_SCHUR_THRESHOLD, ExactFailure::Error);
+    let factor = factor_sparse(&laplacian, config).expect("factor");
+    assert!(
+        factor.permutation_scratch_len() > 0,
+        "interleaving forces a permutation"
+    );
+    let rhs_kept: Vec<f64> = (0..n_kept).map(|i| (i as f64 * 0.61).cos()).collect();
+    // The canonical coordinate map negates the kept block on the way in and out.
+    let mut expected: Vec<f64> = rhs_kept.iter().map(|v| -v).collect();
+    expected.resize(factor.n(), 0.0);
+    factor
+        .solve_in_place(&mut expected)
+        .expect("allocating reference");
+    for value in &mut expected {
+        *value = -*value;
+    }
+
+    let reduced = ReducedFactor::Direct {
+        factor,
+        grounding: Grounding::Grounded,
+    };
+    // Zero coupling: the eliminated block solves trivially and the kept block is
+    // exactly the reduced solve.
+    let cross_tab = CrossTab::from_dense_for_test(&[0.0; 64], n_kept, n_kept);
+    let solver = BlockElimSolver::new(
+        cross_tab,
+        vec![1.0; n_kept],
+        reduced,
+        CoordinateMap::default(),
+    );
+    let solve_with_stale = |stale: f64| {
+        let mut rhs = vec![stale; solver.scratch_size()];
+        rhs[..n_kept].fill(0.0);
+        rhs[n_kept..2 * n_kept].copy_from_slice(&rhs_kept);
+        let mut solution = vec![stale; solver.scratch_size()];
+        solver.solve_local(&mut rhs, &mut solution, false).unwrap();
+        solution
+    };
+    let first = solve_with_stale(f64::NAN);
+    let second = solve_with_stale(-7.0);
+    for (a, b) in first[..solver.n_local()]
+        .iter()
+        .zip(&second[..solver.n_local()])
+    {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+    for (a, b) in first[n_kept..2 * n_kept].iter().zip(&expected) {
+        assert_eq!(a.to_bits(), b.to_bits());
+    }
+}

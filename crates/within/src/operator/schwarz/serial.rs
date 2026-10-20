@@ -11,11 +11,12 @@ use schwarz_precond::{Operator, OperatorMut, SerialSchwarzWorkspace, SolveError}
 /// Outputs are unchanged on any returned error; scratch is reusable afterward.
 ///
 /// This bounds the outer action workspace only. Construction remains unchanged
-/// and may use Rayon. Local factors remain opaque; the pinned approximate-
-/// Cholesky dependency can allocate permutation scratch for some factors, and
-/// local errors may allocate text. This API alone is not complete terminal
-/// memory admission, an allocation-free guarantee for every factor, or a
-/// range/positivity certificate. Existing pooled APIs retain their behavior.
+/// and may use Rayon. Local factors take their permutation scratch from dead
+/// regions of the two existing local buffers, so a successful action allocates
+/// nothing for any factor layout; local errors may still allocate text. Factor
+/// capacity is reported by [`Preconditioner::local_factor_retained_heap_bytes`].
+/// This API alone is not complete terminal memory admission or a range/positivity
+/// certificate. Existing pooled APIs retain their behavior.
 pub struct SerialPreconditionerWorkspace<'owner> {
     inner: SerialVariant<'owner>,
 }

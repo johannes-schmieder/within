@@ -75,6 +75,7 @@ fn diagonal_action_uses_no_workspace_array_and_validates_before_output() {
     )
     .unwrap();
     let owner = solver.preconditioner().unwrap();
+    assert_eq!(owner.local_factor_retained_heap_bytes(), Some(0));
     assert_eq!(owner.serial_workspace_required_payload_bytes().unwrap(), 0);
     let mut w = owner.try_serial_workspace(0).unwrap();
     assert_eq!(w.retained_payload_bytes(), 0);
@@ -83,4 +84,25 @@ fn diagonal_action_uses_no_workspace_array_and_validates_before_output() {
     assert_eq!(out, [7.; 2]);
     w.apply(&[8., 18.], &mut out).unwrap();
     assert_eq!(out, [2., 3.]);
+}
+
+#[test]
+fn factor_capacity_is_deterministic_and_survives_serialization() {
+    for case in ["latin", "nested", "disconnected-interleaved", "unbalanced"] {
+        for approximate in [false, true] {
+            let owner = serial_support::build(case, approximate, true);
+            let bytes = owner.local_factor_retained_heap_bytes().unwrap();
+            assert!(bytes > 0, "{case} {approximate}");
+            let again = serial_support::build(case, approximate, true);
+            assert_eq!(again.local_factor_retained_heap_bytes(), Some(bytes));
+            // A deserialized copy reports its own, possibly tighter, capacities.
+            let wire = postcard::to_stdvec(&owner).unwrap();
+            let restored: within::Preconditioner = postcard::from_bytes(&wire).unwrap();
+            let restored_bytes = restored.local_factor_retained_heap_bytes().unwrap();
+            assert!(
+                restored_bytes > 0 && restored_bytes <= bytes,
+                "{case} {approximate}"
+            );
+        }
+    }
 }

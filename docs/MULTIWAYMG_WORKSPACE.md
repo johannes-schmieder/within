@@ -223,3 +223,41 @@ allocations and exact drop. The generic n=12,000 action retains 288,016 bytes,
 with zero first/repeated/static/local-error/recovery allocations for its tested
 allocation-free local solver. Source/PR CI qualification precedes fork merge;
 both downstream pins remain unchanged until that merge qualifies.
+
+## Factor scratch and capacity (M6q)
+
+`within` now depends on the owner approx-chol fork at an exact revision
+(`68ad1b99dbcf4e3d0145cb4d1aef3f3fc036492c`, with `version = "=0.5.0"`). The fork
+adds caller-owned permutation scratch, a checked factor capacity inventory and
+checked construction. The pin is the merge commit of fork PRs #1 and #2; its tree
+is identical to the qualified head `f1315f8`. `deny.toml` allows that git source,
+required to be pinned by `rev`.
+
+Reduced solves take the factor's permutation scratch from storage that is already
+dead, following the M6o liveness audit, so the outer scratch is not enlarged:
+
+- `Direct` uses the reduced right-hand side `rhs[N..N+R]` after it has been copied
+  into the solution. That region is exactly the factor dimension `R`.
+- `Cover` uses the solution tail `sol[L+R..]`, at least `K + H >= H` long, past the
+  region post-processing reads.
+
+The gather overwrites every consumed entry. Unit and solver tests with an
+interleaved two-component factor that requires a permutation match the allocating
+0.5.0 solve bit-for-bit, for Direct and for Cover. Stale NaN or finite buffer
+contents do not change the result. Real within pair domains have not been observed
+to need a permutation, since exact and sampled Schur complements of a connected
+pair stay connected. The explicit scratch removes the need to prove that they never do.
+
+`Preconditioner::local_factor_retained_heap_bytes()` sums every reduced factor's
+checked capacity, or returns `None` on overflow (diagonal variants: `Some(0)`). It
+allocates nothing. It counts factor arrays only: cross-tabulations, inverse
+diagonals, coordinate maps, restriction data and construction peaks are excluded.
+It is a post-build inventory, not construction admission.
+
+All Rust 1.85.0 groups pass locally: fmt, strict Clippy, all/minimal workspace
+tests including the wire-format fixture, warning-free rustdoc, debug/release
+generic and concrete serial contracts, and `cargo deny`. Its yanked-crate warnings
+are unchanged from baseline. Setup remains parallel. Within-level checked
+Schur/cover/setup admission, using the fork's `build_with_limit` and an explicit
+serial construction path, is the next increment. Numerical-range eligibility is
+handled downstream by MultiwayMG's certified kernel projector.

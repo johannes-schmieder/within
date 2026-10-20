@@ -29,6 +29,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for thread in setup_threads {
                     thread.join().expect("setup worker completed");
                 }
+                let before = GLOBAL.stats();
+                let factor_bytes = owner
+                    .local_factor_retained_heap_bytes()
+                    .expect("factor capacity fits usize");
+                let d = GLOBAL.stats() - before;
+                assert_eq!((d.allocations, d.reallocations, d.deallocations), (0, 0, 0));
+                assert!(factor_bytes > 0, "every additive domain retains a factor");
                 let n = owner.nrows();
                 let rhs: Vec<_> = (0..n).map(|i| (i % 7) as f64 / 8. - 0.5).collect();
                 let mut out = vec![0.; n];
@@ -70,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let d = GLOBAL.stats() - before;
                 assert_eq!((d.allocations, d.reallocations, d.deallocations), (0, 0, 1));
                 assert_eq!(d.bytes_deallocated, bytes);
-                println!("{case} approximate={approximate} weighted={weighted}: n={n} outer_bytes={bytes}; first+64 repeat/static rejection/reuse=0 allocations; exact drop");
+                println!("{case} approximate={approximate} weighted={weighted}: n={n} outer_bytes={bytes} factor_bytes={factor_bytes}; first+64 repeat/static rejection/reuse=0 allocations; exact drop");
             }
         }
     }

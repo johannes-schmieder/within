@@ -75,16 +75,47 @@ impl ReducedFactor {
         }
     }
 
+    /// Permutation scratch the factor needs; each form has a dead caller region this long.
+    pub(crate) fn permutation_scratch_len(&self) -> usize {
+        match self {
+            Self::Direct { factor, .. } => factor.permutation_scratch_len(),
+            Self::Cover { inner, .. } => inner.permutation_scratch_len(),
+        }
+    }
+
+    /// Checked retained heap capacity of the factor arrays, `None` on overflow.
+    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Direct { factor, .. } => factor.retained_heap_bytes(),
+            Self::Cover { inner, .. } => inner.retained_heap_bytes(),
+        }
+    }
+
     /// `x` spans [`Self::solve_dimension`]; `scratch` is at least [`Self::scratch_len`] long.
+    ///
+    /// The factor's permutation scratch comes from caller storage that is dead
+    /// during the solve: `dead_rhs` (the reduced right-hand side already copied
+    /// into `x`) for [`Self::Direct`], `dead_tail` (solution slots past the reduced
+    /// region) for [`Self::Cover`], whose embedding occupies `scratch`. Every
+    /// consumed entry is overwritten before it is read, so nothing allocates.
     pub(crate) fn solve_in_place(
         &self,
         x: &mut [f64],
         scratch: &mut [f64],
+        dead_rhs: &mut [f64],
+        dead_tail: &mut [f64],
     ) -> Result<(), LocalSolveError> {
+        debug_assert!(
+            match self {
+                Self::Direct { .. } => dead_rhs.len(),
+                Self::Cover { .. } => dead_tail.len(),
+            } >= self.permutation_scratch_len(),
+            "the dead caller region must hold the factor's permutation scratch"
+        );
         match self {
             Self::Direct { factor, .. } => {
                 debug_assert_eq!(factor.n(), x.len());
-                solve_approx(factor, x)
+                solve_approx(factor, x, dead_rhs)
             }
             Self::Cover { inner, m } => {
                 debug_assert_eq!(*m, x.len());
@@ -98,7 +129,7 @@ impl ReducedFactor {
                 for slot in buf[2 * *m..].iter_mut() {
                     *slot = 0.0;
                 }
-                solve_approx(inner, buf)?;
+                solve_approx(inner, buf, dead_tail)?;
                 // Read back the antisymmetric solution: x = (x⁺ - x⁻) / 2.
                 for (i, out) in x.iter_mut().enumerate() {
                     *out = 0.5 * (buf[i] - buf[*m + i]);
@@ -146,8 +177,8 @@ impl<'de> serde::Deserialize<'de> for ReducedFactor {
     }
 }
 
-fn solve_approx(f: &Factor, x: &mut [f64]) -> Result<(), LocalSolveError> {
-    f.solve_in_place(x)
+fn solve_approx(f: &Factor, x: &mut [f64], permutation: &mut [f64]) -> Result<(), LocalSolveError> {
+    f.solve_in_place_with_scratch(x, permutation)
         .map_err(|e| LocalSolveError::BackendFailed {
             context: "within.local.block_elim.reduced_approx",
             message: e.to_string(),
@@ -200,8 +231,9 @@ mod tests {
         let b = [1.0, 0.5];
         let mut x = b;
         let mut scratch = vec![0.0; reduced.scratch_len()];
+        let mut dead_tail = vec![f64::NAN; reduced.permutation_scratch_len()];
         reduced
-            .solve_in_place(&mut x, &mut scratch)
+            .solve_in_place(&mut x, &mut scratch, &mut [], &mut dead_tail)
             .expect("cover solve");
 
         // Residual of the signed system M x = b (M = [[2,1],[1,2]]).
@@ -222,6 +254,92 @@ mod tests {
         let config = ApproxCholConfig::default()
             .to_approx_chol(DEFAULT_DENSE_SCHUR_THRESHOLD, ExactFailure::Error);
         factor_sparse(&m, config).expect("factor 2x2")
+    }
+
+    /// Two interleaved components {0, 2, 4, 6} and {1, 3, 5, 7}: the factor must
+    /// permute to make its blocks contiguous.
+    fn interleaved_laplacian(n: usize) -> CsrMatrix {
+        let mut rows = vec![Vec::new(); n];
+        for v in 0..n - 2 {
+            let w = 1.0 + (v % 3) as f64;
+            rows[v].push((v + 2, -w));
+            rows[v + 2].push((v, -w));
+        }
+        let (mut indptr, mut indices, mut data) = (vec![0], Vec::new(), Vec::new());
+        for (v, row) in rows.iter_mut().enumerate() {
+            let degree: f64 = row.iter().map(|&(_, w)| -w).sum();
+            row.push((v, degree + if v == 1 { 0.5 } else { 0.0 }));
+            row.sort_by_key(|&(c, _)| c);
+            for &(c, w) in row.iter() {
+                indices.push(c as u32);
+                data.push(w);
+            }
+            indptr.push(indices.len() as u32);
+        }
+        CsrMatrix::new(indptr, indices, data, n)
+    }
+
+    #[test]
+    fn permuted_factors_solve_from_dead_regions_bit_for_bit() {
+        let config = ApproxCholConfig::default()
+            .to_approx_chol(DEFAULT_DENSE_SCHUR_THRESHOLD, ExactFailure::Error);
+        let rhs: Vec<f64> = (0..8).map(|i| (i as f64 * 0.37).sin()).collect();
+
+        let factor = factor_sparse(&interleaved_laplacian(8), config).expect("factor");
+        let n = factor.n();
+        assert_eq!(
+            factor.permutation_scratch_len(),
+            n,
+            "interleaving forces a permutation"
+        );
+        let mut expected = rhs.clone();
+        expected.resize(n, 0.0);
+        factor
+            .solve_in_place(&mut expected)
+            .expect("allocating reference");
+        let direct = ReducedFactor::Direct {
+            factor: factor.clone(),
+            grounding: Grounding::Grounded,
+        };
+        assert!(direct.retained_heap_bytes().expect("no overflow") > 0);
+        let mut x = rhs.clone();
+        x.resize(n, 0.0);
+        let mut dead_rhs = vec![f64::NAN; n + 3];
+        direct
+            .solve_in_place(&mut x, &mut [], &mut dead_rhs, &mut [])
+            .expect("direct solve");
+        for (a, b) in x.iter().zip(&expected) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        assert!(
+            dead_rhs[n..].iter().all(|v| v.is_nan()),
+            "the tail is untouched"
+        );
+
+        // The same interleaved factor behind the cover interface, m = 4.
+        // A clone keeps no spare capacity, so it reports its own, smaller inventory.
+        let inner = factor.clone();
+        let inner_bytes = inner.retained_heap_bytes();
+        let cover = ReducedFactor::Cover { inner, m: 4 };
+        let b = [0.25, -1.0, 0.5, 2.0];
+        let mut buf = vec![0.0; n];
+        buf[..4].copy_from_slice(&b);
+        for i in 0..4 {
+            buf[4 + i] = -b[i];
+        }
+        factor
+            .solve_in_place(&mut buf)
+            .expect("allocating cover reference");
+        let mut x = b;
+        let mut scratch = vec![f64::NAN; cover.scratch_len()];
+        let mut dead_tail = vec![f64::NAN; cover.permutation_scratch_len()];
+        cover
+            .solve_in_place(&mut x, &mut scratch, &mut [], &mut dead_tail)
+            .expect("cover solve");
+        for (i, out) in x.iter().enumerate() {
+            assert_eq!(out.to_bits(), (0.5 * (buf[i] - buf[4 + i])).to_bits());
+        }
+        assert_eq!(cover.retained_heap_bytes(), inner_bytes);
     }
 
     #[test]

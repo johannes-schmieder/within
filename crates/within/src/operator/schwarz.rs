@@ -181,6 +181,23 @@ impl Preconditioner {
     pub fn build_duration(&self) -> Duration {
         self.build_duration
     }
+
+    /// Checked sum of every local reduced factor's retained heap capacity in bytes.
+    ///
+    /// Counts each approximate-Cholesky factor's block, fallback, permutation and
+    /// nested exact or approximate arrays, including spare capacity. Excludes the
+    /// local cross-tabulations, inverse diagonals and coordinate maps, the
+    /// restriction indices and weights, inline objects, allocator overhead and every
+    /// construction peak. `None` on arithmetic overflow; diagonal variants hold no
+    /// factors. A post-build inventory, not construction admission.
+    pub fn local_factor_retained_heap_bytes(&self) -> Option<usize> {
+        match &self.inner {
+            Variant::Additive(p) => p.inner.subdomains().iter().try_fold(0usize, |sum, entry| {
+                sum.checked_add(entry.solver().factor_retained_heap_bytes()?)
+            }),
+            Variant::Diagonal(_) => Some(0),
+        }
+    }
 }
 
 impl Operator for Preconditioner {
