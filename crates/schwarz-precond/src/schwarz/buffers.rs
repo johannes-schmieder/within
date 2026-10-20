@@ -31,6 +31,11 @@ impl BufferPool {
         }
     }
 
+    /// Heap bytes [`Self::new`] allocates: the shared pool's reference-counted block.
+    pub(super) fn heap_bytes() -> usize {
+        rc_block_bytes::<Mutex<Vec<SchwarzBuffers>>>()
+    }
+
     pub(super) fn n_dofs(&self) -> usize {
         self.n_dofs
     }
@@ -256,6 +261,19 @@ impl WorkerReductionBuffers {
                 }
             });
     }
+}
+
+/// Heap bytes of an `Arc<T>` allocation: strong and weak counters, then the value,
+/// padded to the block's alignment.
+pub(super) const fn rc_block_bytes<T>() -> usize {
+    let align = if core::mem::align_of::<T>() > core::mem::align_of::<usize>() {
+        core::mem::align_of::<T>()
+    } else {
+        core::mem::align_of::<usize>()
+    };
+    let header = 2 * core::mem::size_of::<usize>();
+    let start = header.div_ceil(align) * align;
+    (start + core::mem::size_of::<T>()).div_ceil(align) * align
 }
 
 #[cfg(test)]

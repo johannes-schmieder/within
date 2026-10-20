@@ -2,7 +2,9 @@
 //! `schwarz-precond` API, plus the opaque public [`Preconditioner`] handle.
 
 use rayon::prelude::*;
-use schwarz_precond::{Operator, SchwarzPreconditioner, SubdomainEntry};
+use schwarz_precond::{
+    Operator, PartitionWeights, SchwarzPreconditioner, SubdomainCore, SubdomainEntry,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,12 +12,15 @@ use std::time::{Duration, Instant};
 use crate::block_elim::BlockElimSolver;
 use crate::config::{LocalSolverConfig, PreconditionerConfig};
 use crate::domain::Loading;
-use crate::domain::{Design, LocalDomain};
+use crate::domain::{for_each_local_domain_checked, Design, LocalDomain};
+use crate::setup::{Ledger, SetupLimit, SetupReport};
 use crate::{BuildError, BuildWarning};
 
 mod serial;
 pub use serial::SerialPreconditionerWorkspace;
 
+#[cfg(test)]
+mod checked_tests;
 #[cfg(test)]
 mod tests;
 
@@ -180,6 +185,159 @@ impl Preconditioner {
     /// Time spent building this preconditioner.
     pub fn build_duration(&self) -> Duration {
         self.build_duration
+    }
+
+    /// Build the additive Schwarz preconditioner serially within a declared live
+    /// payload, returning it with its accounting.
+    ///
+    /// Takes the design and caller-order weights [`Solver::new`](crate::Solver::new)
+    /// takes, and the local-solver and reduction settings of
+    /// [`PreconditionerConfig::Additive`]. Every array of the build is charged to
+    /// one ledger before it is allocated: weight permutation, active-level maps,
+    /// pair cross-tabulations, component splits, exact and sampled Schur
+    /// complements and their sampler scratch, every `approx-chol` factor through
+    /// its own checked builder (including a failed exact attempt's peak),
+    /// partition weights and the shared blocks of the returned value. Exceeding
+    /// `limit` returns [`BuildError::SetupBudgetExceeded`] without the refused
+    /// allocation; a refused reservation returns
+    /// [`BuildError::SetupAllocationFailed`]. A successful build returns a
+    /// preconditioner whose action and serialized form equal the one
+    /// [`Solver::new`](crate::Solver::new) builds from the same input, whatever the
+    /// limit. Its retained payload is the report's `retained_payload_bytes`.
+    ///
+    /// Covers intercept-only designs, whose pairs are known Laplacians; slope
+    /// effects return [`BuildError::CheckedSetupUnsupported`] before any
+    /// allocation. Fixed-size reference-counted blocks are allocated infallibly
+    /// after being charged. `Ok((None, _))` means the design has no pair
+    /// subdomain, as an unchecked build returns no preconditioner.
+    pub fn build_checked(
+        design: &Design<'_>,
+        weights: Option<&[f64]>,
+        local_solver: &LocalSolverConfig,
+        reduction: schwarz_precond::ReductionStrategy,
+        limit: SetupLimit,
+    ) -> Result<(Option<Self>, SetupReport), BuildError> {
+        let mut ledger = Ledger::new(limit);
+        let preconditioner =
+            Self::build_checked_in(design, weights, local_solver, reduction, &mut ledger)?;
+        Ok((preconditioner, ledger.report()))
+    }
+
+    /// [`Self::build_checked`] against a caller's ledger.
+    pub(crate) fn build_checked_in(
+        design: &Design<'_>,
+        weights: Option<&[f64]>,
+        local_solver: &LocalSolverConfig,
+        reduction: schwarz_precond::ReductionStrategy,
+        ledger: &mut Ledger,
+    ) -> Result<Option<Self>, BuildError> {
+        const CONTEXT: &str = "subdomain assembly";
+        let build_started = Instant::now();
+        if !local_solver.ridge.is_finite() || local_solver.ridge < 0.0 {
+            return Err(BuildError::InvalidRidge {
+                value: local_solver.ridge,
+            });
+        }
+        design.validate_weights(weights)?;
+        if (0..design.n_factors())
+            .flat_map(|term| design.channels(term))
+            .any(|channel| design.loading(channel).covariate().is_some())
+        {
+            return Err(BuildError::CheckedSetupUnsupported {
+                reason: "slope (covariate) effects",
+            });
+        }
+        if u32::try_from(design.n_obs()).is_err() {
+            return Err(BuildError::CheckedSetupUnsupported {
+                reason: "more than u32::MAX observations",
+            });
+        }
+
+        let permuted = match (&design.obs_perm, weights) {
+            (Some(perm), Some(weights)) => {
+                let mut permuted = ledger.with_capacity("weight permutation", perm.len())?;
+                permuted.extend(perm.iter().map(|&i| weights[i as usize]));
+                Some(permuted)
+            }
+            _ => None,
+        };
+        let internal_weights = match &design.obs_perm {
+            Some(_) => permuted.as_deref(),
+            None => weights,
+        };
+
+        let mut built: Vec<(SubdomainCore, BlockElimSolver)> = Vec::new();
+        for_each_local_domain_checked(
+            design,
+            internal_weights,
+            ledger,
+            |ledger, globals, component| {
+                let solver = BlockElimSolver::build_checked(component, local_solver, ledger)?;
+                ledger.push(
+                    CONTEXT,
+                    &mut built,
+                    (SubdomainCore::uniform(globals), solver),
+                )
+            },
+        )?;
+        if let Some(permuted) = permuted {
+            ledger.free(permuted);
+        }
+        if built.is_empty() {
+            ledger.free(built);
+            return Ok(None);
+        }
+
+        // Intercept-only channels carry no slope, so the `1/√c` weights always apply.
+        let mut counts = ledger.filled("partition weights", design.n_dofs, 0u32)?;
+        for (core, _) in &built {
+            for &idx in core.global_indices() {
+                counts[idx as usize] += 1;
+            }
+        }
+        for (core, _) in &mut built {
+            if core
+                .global_indices()
+                .iter()
+                .all(|&idx| counts[idx as usize] <= 1)
+            {
+                core.set_uniform_partition_weights();
+            } else {
+                let mut weights = ledger.with_capacity("partition weights", core.n_local())?;
+                weights.extend(core.global_indices().iter().map(|&idx| {
+                    let c = counts[idx as usize];
+                    debug_assert!(c > 0);
+                    1.0 / (c as f64).sqrt()
+                }));
+                core.set_partition_weights(PartitionWeights::NonUniform(weights))
+                    .expect("partition weight count must match index count");
+            }
+        }
+        ledger.free(counts);
+
+        let mut entries = ledger.with_capacity(CONTEXT, built.len())?;
+        let built_capacity = built.capacity();
+        for (core, solver) in built {
+            entries
+                .push(SubdomainEntry::try_new(core, solver).map_err(BuildError::Preconditioner)?);
+        }
+        ledger.forget::<(SubdomainCore, BlockElimSolver)>(built_capacity);
+        ledger.charge(
+            CONTEXT,
+            SchwarzPreconditioner::<BlockElimSolver>::assembly_heap_bytes(),
+        )?;
+        let inner = SchwarzPreconditioner::with_n_dofs(entries, design.n_dofs, reduction);
+        let preconditioner = Preconditioner {
+            inner: Variant::Additive(FeSchwarz {
+                inner,
+                config: PreconditionerConfig::Additive {
+                    local_solver: local_solver.clone(),
+                    reduction,
+                },
+            }),
+            build_duration: build_started.elapsed(),
+        };
+        Ok(Some(preconditioner))
     }
 
     /// Checked sum of every local reduced factor's retained heap capacity in bytes.

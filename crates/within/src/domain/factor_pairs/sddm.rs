@@ -14,6 +14,8 @@
 use super::ComponentClass;
 use crate::config::{ScalingConfig, ScalingFailure};
 use crate::domain::CrossTab;
+use crate::setup::Ledger;
+use crate::BuildError;
 
 mod scaling;
 use scaling::dominance_scaling;
@@ -210,6 +212,42 @@ fn convert_known_laplacian(
         form: MatrixForm::Laplacian,
         coordinates: CoordinateMap::default(),
     })
+}
+
+/// The checked build's [`convert_known_laplacian`], reserved through `ledger`;
+/// consumes and releases `diagonal`.
+pub(super) fn convert_known_laplacian_checked(
+    cross_tab: CrossTab,
+    diagonal: Vec<f64>,
+    ledger: &mut Ledger,
+) -> Result<Result<LocalComponent, NotScalable>, BuildError> {
+    const CONTEXT: &str = "local SDDM conversion";
+    let mut row_sums = ledger.with_capacity(CONTEXT, cross_tab.n_local())?;
+    row_sums.extend(
+        (0..cross_tab.n_local()).map(|i| cross_tab.neighbors(i).map(|(_, v)| v).sum::<f64>()),
+    );
+    let mut total_diagonal = 0.0;
+    let mut total_mismatch = 0.0;
+    for (&entry, &row_sum) in diagonal.iter().zip(row_sums.iter()) {
+        total_diagonal += entry;
+        total_mismatch += (entry - row_sum).abs();
+    }
+    let tolerance = LAPLACIAN_VALIDATION_BUDGET.tolerance(cross_tab.n_local(), total_diagonal);
+    ledger.free(diagonal);
+    if total_mismatch > tolerance {
+        return Ok(Err(NotScalable));
+    }
+    let ground_edges = ledger.filled(CONTEXT, cross_tab.n_local(), 0.0)?;
+    Ok(Ok(LocalComponent {
+        matrix: SddmMatrix {
+            ground_edges,
+            cross_tab,
+            diagonal: row_sums,
+            grounding: Grounding::Floating,
+        },
+        form: MatrixForm::Laplacian,
+        coordinates: CoordinateMap::default(),
+    }))
 }
 
 fn convert_general(

@@ -14,6 +14,8 @@ use crate::domain::Design;
 
 use super::{to_u32, ActiveLevels};
 use crate::domain::Loading as ColumnLoading;
+use crate::setup::Ledger;
+use crate::BuildError;
 
 /// Hard cap on the dense accumulator (~40 MB); larger tables always go sparse.
 const DENSE_TABLE_MAX_ENTRIES: usize = 5_000_000;
@@ -82,6 +84,16 @@ impl<Lq: Loading, Lr: Loading> PairColumns<'_, Lq, Lr> {
     }
 }
 
+/// Whether a pair accumulates through the sparse path: dense when the table is small
+/// or the sparse buckets would use more memory.
+fn sparse_accumulation(design: &Design<'_>, active: &ActiveLevels) -> bool {
+    // Dispatching on cell count alone would pick sparse where it uses MORE memory.
+    let table_size = active.n_rows.saturating_mul(active.n_cols);
+    let dense_cost = table_size.saturating_mul(8);
+    let sparse_cost = design.n_obs.saturating_mul(12);
+    table_size > DENSE_TABLE_MAX_ENTRIES && sparse_cost < dense_cost
+}
+
 /// Accumulate into `C` plus diagonals, dispatching dense or sparse by peak transient memory.
 pub(super) fn accumulate_cross_block(
     design: &Design<'_>,
@@ -89,11 +101,7 @@ pub(super) fn accumulate_cross_block(
     pair: ChannelPair,
     active: &ActiveLevels,
 ) -> (CsrBlock, Vec<f64>, Vec<f64>) {
-    // Dispatching on cell count alone would pick sparse where it uses MORE memory.
-    let table_size = active.n_rows.saturating_mul(active.n_cols);
-    let dense_cost = table_size.saturating_mul(8);
-    let sparse_cost = design.n_obs.saturating_mul(12);
-    let go_sparse = table_size > DENSE_TABLE_MAX_ENTRIES && sparse_cost < dense_cost;
+    let go_sparse = sparse_accumulation(design, active);
 
     let row_levels = design.frame.level_column(pair.rows.term);
     let col_levels = design.frame.level_column(pair.cols.term);
@@ -270,4 +278,155 @@ pub(super) fn accumulate_sparse_cross_block<Lq: Loading, Lr: Loading>(
         ncols: n_cols,
     };
     (c, row_diag, col_diag)
+}
+
+/// The checked build's intercept-only pairs: [`accumulate_cross_block`] with every
+/// array reserved through `ledger`, in the same accumulation order.
+pub(super) fn accumulate_unit_cross_block_checked(
+    design: &Design<'_>,
+    weights: Option<&[f64]>,
+    pair: ChannelPair,
+    active: &ActiveLevels,
+    ledger: &mut Ledger,
+) -> Result<(CsrBlock, Vec<f64>, Vec<f64>), BuildError> {
+    debug_assert!(design.loading(pair.rows).covariate().is_none());
+    debug_assert!(design.loading(pair.cols).covariate().is_none());
+    let cols = PairColumns {
+        row_levels: design.frame.level_column(pair.rows.term),
+        col_levels: design.frame.level_column(pair.cols.term),
+        row_load: Unit,
+        col_load: Unit,
+        weights,
+    };
+    if sparse_accumulation(design, active) {
+        accumulate_sparse_cross_block_checked(cols, active, ledger)
+    } else {
+        accumulate_dense_cross_block_checked(cols, active, ledger)
+    }
+}
+
+fn accumulate_dense_cross_block_checked<Lq: Loading, Lr: Loading>(
+    cols: PairColumns<'_, Lq, Lr>,
+    active: &ActiveLevels,
+    ledger: &mut Ledger,
+) -> Result<(CsrBlock, Vec<f64>, Vec<f64>), BuildError> {
+    const CONTEXT: &str = "dense cross-tabulation";
+    let n_obs = cols.row_levels.len();
+    let n_rows = active.n_rows;
+    let n_cols = active.n_cols;
+    let mut row_diag = ledger.filled(CONTEXT, n_rows, 0.0f64)?;
+    let mut col_diag = ledger.filled(CONTEXT, n_cols, 0.0f64)?;
+    let cells = n_rows
+        .checked_mul(n_cols)
+        .ok_or(BuildError::SetupAllocationFailed {
+            context: CONTEXT,
+            bytes: usize::MAX,
+        })?;
+    let mut table = ledger.filled(CONTEXT, cells, 0.0f64)?;
+
+    for uid in 0..n_obs {
+        let Some(o) = cols.decode(active, uid) else {
+            continue;
+        };
+        row_diag[o.cj] += o.row_diag;
+        col_diag[o.ck] += o.col_diag;
+        table[o.cj * n_cols + o.ck] += o.cell;
+    }
+
+    let c = CsrBlock::from_dense_table_checked(&table, n_rows, n_cols, ledger)?;
+    ledger.free(table);
+    Ok((c, row_diag, col_diag))
+}
+
+fn accumulate_sparse_cross_block_checked<Lq: Loading, Lr: Loading>(
+    cols: PairColumns<'_, Lq, Lr>,
+    active: &ActiveLevels,
+    ledger: &mut Ledger,
+) -> Result<(CsrBlock, Vec<f64>, Vec<f64>), BuildError> {
+    const CONTEXT: &str = "sparse cross-tabulation";
+    let n_obs = cols.row_levels.len();
+    let n_rows = active.n_rows;
+    let n_cols = active.n_cols;
+    let mut row_diag = ledger.filled(CONTEXT, n_rows, 0.0f64)?;
+    let mut col_diag = ledger.filled(CONTEXT, n_cols, 0.0f64)?;
+
+    let mut row_counts = ledger.filled(CONTEXT, n_rows, 0u32)?;
+    for uid in 0..n_obs {
+        let Some(o) = cols.decode(active, uid) else {
+            continue;
+        };
+        row_diag[o.cj] += o.row_diag;
+        col_diag[o.ck] += o.col_diag;
+        row_counts[o.cj] += 1;
+    }
+
+    let mut bucket_indptr = ledger.filled(CONTEXT, n_rows + 1, 0u32)?;
+    for i in 0..n_rows {
+        bucket_indptr[i + 1] = bucket_indptr[i] + row_counts[i];
+    }
+    ledger.free(row_counts);
+    let total_entries = bucket_indptr[n_rows] as usize;
+
+    let mut bucket_cols = ledger.filled(CONTEXT, total_entries, 0u32)?;
+    let mut bucket_vals = ledger.filled(CONTEXT, total_entries, 0.0f64)?;
+    let mut cursor = ledger.copied(CONTEXT, &bucket_indptr[..n_rows])?;
+    for uid in 0..n_obs {
+        let Some(o) = cols.decode(active, uid) else {
+            continue;
+        };
+        let pos = cursor[o.cj] as usize;
+        bucket_cols[pos] = to_u32(o.ck);
+        bucket_vals[pos] = o.cell;
+        cursor[o.cj] += 1;
+    }
+    ledger.free(cursor);
+
+    // A row touches at most `n_cols` distinct columns, and a column re-pushed after
+    // cancelling mid-row at most once per bucket entry, so this bounds `touched`.
+    let max_row = (0..n_rows)
+        .map(|row| (bucket_indptr[row + 1] - bucket_indptr[row]) as usize)
+        .max()
+        .unwrap_or(0);
+    let mut work = ledger.filled(CONTEXT, n_cols, 0.0f64)?;
+    let mut touched: Vec<u32> = ledger.with_capacity(CONTEXT, max_row)?;
+    let mut c_indptr = ledger.filled(CONTEXT, n_rows + 1, 0u32)?;
+    let mut c_indices = Vec::new();
+    let mut c_data = Vec::new();
+
+    for row in 0..n_rows {
+        let start = bucket_indptr[row] as usize;
+        let end = bucket_indptr[row + 1] as usize;
+        for idx in start..end {
+            let col = bucket_cols[idx] as usize;
+            if work[col] == 0.0 {
+                touched.push(to_u32(col));
+            }
+            work[col] += bucket_vals[idx];
+        }
+        touched.sort_unstable();
+        for &col in &touched {
+            let v = work[col as usize];
+            if v != 0.0 {
+                ledger.push(CONTEXT, &mut c_indices, col)?;
+                ledger.push(CONTEXT, &mut c_data, v)?;
+            }
+            work[col as usize] = 0.0;
+        }
+        c_indptr[row + 1] = to_u32(c_indices.len());
+        touched.clear();
+    }
+    ledger.free(work);
+    ledger.free(touched);
+    ledger.free(bucket_indptr);
+    ledger.free(bucket_cols);
+    ledger.free(bucket_vals);
+
+    let c = CsrBlock {
+        indptr: c_indptr,
+        indices: c_indices,
+        data: c_data,
+        nrows: n_rows,
+        ncols: n_cols,
+    };
+    Ok((c, row_diag, col_diag))
 }

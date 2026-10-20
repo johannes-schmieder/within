@@ -56,6 +56,13 @@ impl CsrMatrix {
         }
     }
 
+    /// Release every array of a matrix built through `ledger`.
+    pub(crate) fn free_checked(self, ledger: &mut crate::setup::Ledger) {
+        ledger.free(self.indptr);
+        ledger.free(self.indices);
+        ledger.free(self.data);
+    }
+
     /// Row pointer array (length `n + 1`).
     #[inline]
     pub(crate) fn indptr(&self) -> &[u32] {

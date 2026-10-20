@@ -1,5 +1,8 @@
 use rayon::prelude::*;
 
+use crate::setup::Ledger;
+use crate::BuildError;
+
 /// Minimum number of rows to trigger parallel SpMV.
 pub(crate) const PAR_SPMV_THRESHOLD: usize = 10_000;
 /// Target number of non-zeros per parallel chunk.
@@ -123,6 +126,92 @@ impl CsrBlock {
             nrows,
             ncols,
         }
+    }
+
+    /// [`Self::transpose`] with every array reserved through `ledger`.
+    pub(crate) fn transpose_checked(&self, ledger: &mut Ledger) -> Result<CsrBlock, BuildError> {
+        const CONTEXT: &str = "cross-tabulation transpose";
+        let nnz = self.nnz();
+        let mut row_counts = ledger.filled(CONTEXT, self.ncols, 0u32)?;
+        for &col in &self.indices {
+            row_counts[col as usize] += 1;
+        }
+        let mut indptr = ledger.filled(CONTEXT, self.ncols + 1, 0u32)?;
+        for i in 0..self.ncols {
+            indptr[i + 1] = indptr[i] + row_counts[i];
+        }
+        ledger.free(row_counts);
+        let mut cursor = ledger.copied(CONTEXT, &indptr[..self.ncols])?;
+        let mut indices = ledger.filled(CONTEXT, nnz, 0u32)?;
+        let mut data = ledger.filled(CONTEXT, nnz, 0.0f64)?;
+        for src_row in 0..self.nrows {
+            let start = self.indptr[src_row] as usize;
+            let end = self.indptr[src_row + 1] as usize;
+            for idx in start..end {
+                let dst_row = self.indices[idx] as usize;
+                let pos = cursor[dst_row] as usize;
+                indices[pos] = src_row as u32;
+                data[pos] = self.data[idx];
+                cursor[dst_row] += 1;
+            }
+        }
+        ledger.free(cursor);
+        Ok(CsrBlock {
+            indptr,
+            indices,
+            data,
+            nrows: self.ncols,
+            ncols: self.nrows,
+        })
+    }
+
+    /// [`Self::from_dense_table`] with every array reserved through `ledger`.
+    pub(crate) fn from_dense_table_checked(
+        table: &[f64],
+        nrows: usize,
+        ncols: usize,
+        ledger: &mut Ledger,
+    ) -> Result<Self, BuildError> {
+        const CONTEXT: &str = "dense cross-tabulation";
+        debug_assert_eq!(table.len(), nrows * ncols);
+        let mut indptr = ledger.filled(CONTEXT, nrows + 1, 0u32)?;
+        for i in 0..nrows {
+            let row_start = i * ncols;
+            let mut count = 0u32;
+            for j in 0..ncols {
+                if table[row_start + j] != 0.0 {
+                    count += 1;
+                }
+            }
+            indptr[i + 1] = indptr[i] + count;
+        }
+        let nnz = indptr[nrows] as usize;
+        let mut indices = ledger.with_capacity(CONTEXT, nnz)?;
+        let mut data = ledger.with_capacity(CONTEXT, nnz)?;
+        for i in 0..nrows {
+            let row_start = i * ncols;
+            for j in 0..ncols {
+                let v = table[row_start + j];
+                if v != 0.0 {
+                    indices.push(j as u32);
+                    data.push(v);
+                }
+            }
+        }
+        Ok(CsrBlock {
+            indptr,
+            indices,
+            data,
+            nrows,
+            ncols,
+        })
+    }
+
+    /// Release every array of a block built through `ledger`.
+    pub(crate) fn free_checked(self, ledger: &mut Ledger) {
+        ledger.free(self.indptr);
+        ledger.free(self.indices);
+        ledger.free(self.data);
     }
 
     /// `y = base + A x`, fusing the base copy with accumulation to avoid an extra pass.

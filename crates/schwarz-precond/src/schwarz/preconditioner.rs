@@ -13,6 +13,7 @@ use crate::error::SolveError;
 use crate::local_solve::{LocalSolver, SubdomainEntry};
 use crate::Operator;
 
+use super::buffers::{rc_block_bytes, BufferPool};
 use super::executor::AdditiveExecutor;
 use super::planning::{AdditiveScheduler, ReductionPlan, ReductionStrategy};
 
@@ -91,6 +92,13 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
         strategy: ReductionStrategy,
     ) -> Self {
         Self::build(entries, Some(n_dofs), strategy)
+    }
+
+    /// Heap bytes [`Self::with_n_dofs`] and [`Self::new`] allocate beyond the entries
+    /// they take over: the shared entry list's and buffer pool's reference-counted
+    /// blocks. Pooled apply buffers are allocated later, on first use.
+    pub fn assembly_heap_bytes() -> usize {
+        rc_block_bytes::<Vec<SubdomainEntry<S>>>() + BufferPool::heap_bytes()
     }
 
     /// One pass over `entries` derives `max_scratch_size`, the metrics, and the covered span.

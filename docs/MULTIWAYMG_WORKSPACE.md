@@ -261,3 +261,106 @@ are unchanged from baseline. Setup remains parallel. Within-level checked
 Schur/cover/setup admission, using the fork's `build_with_limit` and an explicit
 serial construction path, is the next increment. Numerical-range eligibility is
 handled downstream by MultiwayMG's certified kernel projector.
+
+## Checked serial setup (M6r)
+
+The approx-chol pin moves to `43f470abed1ca1a0858c6101779bf6dcf62c362a`, the merge
+of fork PRs #3 (sampler reservation) and #4 (failure reporting) on top of #1 and #2.
+Its tree is identical to the qualified PR #4 head.
+
+`Preconditioner::build_checked(design, weights, local_solver, reduction, limit)`
+builds the additive pair Schwarz preconditioner serially within a declared live
+payload (`SetupLimit`) and returns it with a `SetupReport` (peak and retained
+payload). It takes the inputs `Solver::new` takes: caller-order weights and the
+settings of `PreconditionerConfig::Additive`. It never touches Rayon.
+
+Every array is charged to one ledger before it is allocated, with the old buffer
+still charged while a growing array is reallocated. That covers:
+
+- the weight permutation and the active-level and pair lists;
+- dense or sparse pair cross-tabulations and their transposes;
+- component splits;
+- exact Schur rows and their assembly, and sampled Schur edges;
+- the clique-tree sampler scratch, reserved exactly through the fork's
+  `CliqueTreeSampler::reservation_bytes`/`try_reserve`;
+- the explicit reduced Laplacians;
+- inverse diagonals, partition weights and the subdomain list;
+- the reference-counted blocks of the result. Their sizes come from the standard
+  `Arc` layout, and `SchwarzPreconditioner::assembly_heap_bytes` is new in
+  `schwarz-precond`.
+
+Each local factor is built by approx-chol's `build_with_limit_reported` against the
+remaining budget, and its peak is folded in. That includes the peak of a failed
+exact attempt, which within then rebuilds from the sampled complement. The
+reporting method is new in fork PR #4 for exactly this composition.
+
+A build exceeding the inclusive limit returns `SetupBudgetExceeded` before the
+refused allocation. A refused reservation returns `SetupAllocationFailed`. The
+limit never changes a successful result.
+
+The checked path covers intercept-only designs, whose pairs are all known
+Laplacians: no scaling, ridge, warning or Gremban cover arises. Slope effects return
+`CheckedSetupUnsupported` before anything is reserved. So would a signed component,
+which an intercept-only design cannot produce.
+
+The checked kernels sit beside the parallel ones and keep their arithmetic order.
+Serial exact rows equal parallel ones because each row is independent. Sampled
+edges are reseeded per star and summed after one total-order sort, so a single
+sampler over the stars in order reproduces the per-task samplers. The default
+parallel path is unchanged apart from extracting its sparse-dispatch predicate
+into a shared function.
+
+### Qualification
+
+The cases are 18 deterministic intercept-only inputs:
+
+- random three-factor designs at three sizes, with unit, dyadic and partly zero
+  weights;
+- interleaved components;
+- nested tuples sorted canonically, the MultiwayMG input shape;
+- unused codes;
+- four factors with `2^±30` weights;
+- tiny weights;
+- a sparse-accumulation pair (2,500 × 2,400 levels, 12,000 observations);
+- two pivot-cancellation designs. Their kept Schur complement is the floating path
+  `1, 1e-20, 1`, whose dense exact factor meets a non-positive pivot.
+
+They run under five configurations: default; exact Schur; no dense block; every
+kept block exact; and AC with a three-way sampled split. Large cases skip the two
+all-exact configurations, giving 88 builds. The tests check that:
+
+- every checked build serializes byte-for-byte like the parallel build. The
+  pivot-cancellation designs reach the exact-failure fallback under every
+  configuration that makes an exact attempt, and still match.
+- the checked build matches the public `Solver::new` route on every non-large case.
+- one-thread actions agree bit-for-bit.
+- a limit of exactly the peak admits the identical result. One byte under, half,
+  half the retained payload and zero are all refused, with
+  `limit < required <= peak`.
+- every one of the reservations in four input families × five configurations is
+  failed in turn by test-only fault injection. Each is reported as
+  `SetupAllocationFailed`.
+- a slope design is refused with nothing reserved.
+- a design without pairs builds nothing and retains nothing.
+- invalid weights and ridges are rejected as the solver rejects them.
+
+`checked_setup_allocations` (isolated counting allocator, `allocation-counter`
+0.8.1) measures all 88 builds. The allocator peak equals the ledger peak
+(`maximum_conservative_slack_bytes=0`, debug and release). Retained live bytes equal
+the reported retained payload, and dropping the result releases exactly that.
+Refusals at one byte under the peak and at a third of it stay within their limit
+and leak nothing. CI runs it on Linux, macOS and Windows.
+
+This proof caught one real undercharge during development. The sampled-star
+`entries` buffer was sized for sampled stars only, but single-entry stars fill it
+too, so it grew by an uncharged 64 bytes on nested designs. The capacity now covers
+every star, and a debug assertion pins it.
+
+On one container, informational only: release single-thread setup costs about as
+much as a one-thread `Solver::new` (which also builds the design), from 0.55× to
+1.08× on four cases.
+
+What this does not cover: designs with slopes, the parallel default path (still
+unaccounted), allocator overhead, inline objects, and the caller's design and
+weight arrays. Fixed-size reference-counted blocks are charged but allocated
+infallibly. The report is requested payload, not process memory.

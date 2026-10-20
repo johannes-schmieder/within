@@ -7,11 +7,12 @@ use schwarz_precond::{LocalSolveError, LocalSolver};
 use crate::config::{LocalSolverConfig, SchurMode};
 use crate::csr_block::{CsrBlock, PAR_SPMV_THRESHOLD};
 use crate::domain::{CoordinateMap, CrossTab, Grounding, LocalComponent, MatrixForm, SddmMatrix};
+use crate::setup::Ledger;
 use crate::BuildError;
 
 use super::compensated_sum;
 use super::csr_matrix::CsrMatrix;
-use super::factor::{factor_sparse, local_solver_build, ReducedFactor};
+use super::factor::{factor_sparse, factor_sparse_checked, local_solver_build, ReducedFactor};
 use super::schur;
 
 /// Minimum number of rows to trigger parallel back-substitution.
@@ -154,6 +155,12 @@ impl<'de> serde::Deserialize<'de> for BlockElimSolver {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Checked exact attempts that failed and fell back on this thread.
+    pub(crate) static CHECKED_EXACT_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// An eliminated-major SDDM plus its eliminated-diagonal reciprocals, which it does not carry.
 struct Eliminated {
     matrix: SddmMatrix,
@@ -181,6 +188,76 @@ impl Eliminated {
             matrix,
             inv_diagonal,
         })
+    }
+
+    /// [`Self::new`] with the reciprocals reserved through `ledger`.
+    fn new_checked(matrix: SddmMatrix, ledger: &mut Ledger) -> Result<Self, BuildError> {
+        debug_assert!(
+            matrix.n_eliminated() >= matrix.n_kept(),
+            "component is not eliminated-major"
+        );
+        let n = matrix.n_eliminated();
+        let mut inv_diagonal = ledger.with_capacity("local elimination", n)?;
+        for (i, &d) in matrix.diagonal[..n].iter().enumerate() {
+            if d > 0.0 {
+                inv_diagonal.push(1.0 / d);
+            } else {
+                return Err(BuildError::SingularDiagonal { index: i });
+            }
+        }
+        Ok(Self {
+            matrix,
+            inv_diagonal,
+        })
+    }
+
+    /// [`Self::factor_reduced`] with every complement and factor charged to `ledger`.
+    /// A failed exact attempt's peak is charged too, and its complement is
+    /// released before the fallback complement is built.
+    fn factor_reduced_checked(
+        &self,
+        config: &LocalSolverConfig,
+        ledger: &mut Ledger,
+    ) -> Result<Factor, BuildError> {
+        let exact_below = config.dense_threshold;
+        let approx_chol = |on_failure| config.approx_chol.to_approx_chol(exact_below, on_failure);
+
+        let mut exact = None;
+        if exact_below > 0 && self.matrix.n_kept() <= exact_below {
+            let complement =
+                schur::exact_for_factor_checked(&self.matrix, &self.inv_diagonal, ledger)?;
+            match factor_sparse_checked(&complement, approx_chol(ExactFailure::Error), ledger)? {
+                Err(approx_chol::Error::DenseFactorizationFailed { .. }) => {
+                    #[cfg(test)]
+                    CHECKED_EXACT_FALLBACKS.with(|count| count.set(count.get() + 1));
+                    exact = Some(complement);
+                }
+                result => {
+                    complement.free_checked(ledger);
+                    return result.map_err(local_solver_build);
+                }
+            }
+        }
+
+        let complement = match &config.schur {
+            SchurMode::Approximate(cfg) => {
+                if let Some(exact) = exact.take() {
+                    exact.free_checked(ledger);
+                }
+                schur::sampled_checked(&self.matrix, cfg, ledger)?
+            }
+            SchurMode::Exact => match exact.take() {
+                Some(exact) => exact,
+                None => schur::exact_for_factor_checked(&self.matrix, &self.inv_diagonal, ledger)?,
+            },
+        };
+        let factor = factor_sparse_checked(
+            &complement,
+            approx_chol(ExactFailure::FallBackToApproximate),
+            ledger,
+        )?;
+        complement.free_checked(ledger);
+        factor.map_err(local_solver_build)
     }
 
     /// Fold of the signed matrix's Gremban cover; transient, dropped once its factor is built.
@@ -346,6 +423,51 @@ impl BlockElimSolver {
         Ok(BlockElimSolver::new(
             eliminated.matrix.cross_tab,
             eliminated.inv_diagonal,
+            factor,
+            coordinates,
+        ))
+    }
+
+    /// The checked build's [`Self::build`]: serial, with every array and the shared
+    /// cross-tabulation block charged to `ledger`. Signed components, which need a
+    /// transient Gremban cover, are not covered.
+    pub(crate) fn build_checked(
+        component: LocalComponent,
+        config: &LocalSolverConfig,
+        ledger: &mut Ledger,
+    ) -> Result<Self, BuildError> {
+        let LocalComponent {
+            matrix,
+            form,
+            coordinates,
+        } = component;
+        if form != MatrixForm::Laplacian {
+            return Err(BuildError::CheckedSetupUnsupported {
+                reason: "signed components",
+            });
+        }
+        let eliminated = Eliminated::new_checked(matrix, ledger)?;
+        let factor = ReducedFactor::Direct {
+            factor: eliminated.factor_reduced_checked(config, ledger)?,
+            grounding: eliminated.matrix.grounding,
+        };
+        debug_assert!(factor.solve_dimension() >= factor.input_dimension());
+        let Eliminated {
+            matrix,
+            inv_diagonal,
+        } = eliminated;
+        let SddmMatrix {
+            cross_tab,
+            diagonal,
+            ground_edges,
+            ..
+        } = matrix;
+        ledger.free(diagonal);
+        ledger.free(ground_edges);
+        ledger.charge_rc::<CrossTab>("local solver")?;
+        Ok(BlockElimSolver::new(
+            cross_tab,
+            inv_diagonal,
             factor,
             coordinates,
         ))
