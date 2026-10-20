@@ -26,8 +26,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 [[package]]
 name = "approx-chol"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "affa21d606ec089747ab3ef1baff8feac12b5c115e42d4451b01668c9acded56"
+source = "git+https://github.com/johannes-schmieder/approx-chol?rev=f1315f81e8f2da0b91d0c858efc761cac198d68c#f1315f81e8f2da0b91d0c858efc761cac198d68c"
 dependencies = [
  "num-traits",
  "rand 0.10.2",
@@ -1738,7 +1737,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
