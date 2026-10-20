@@ -10,7 +10,9 @@ use crate::csr_block::{to_u32, CsrBlock};
 use crate::domain::Design;
 
 mod accumulate;
-use accumulate::accumulate_cross_block;
+use crate::setup::Ledger;
+use crate::BuildError;
+use accumulate::{accumulate_cross_block, accumulate_unit_cross_block_checked};
 
 /// Compact mapping of active levels for a factor pair, plus its local-to-global vector.
 struct ActiveLevels {
@@ -85,6 +87,60 @@ fn build_compact_mapping(
     })
 }
 
+/// [`compact_map`] reserved through `ledger`.
+fn compact_map_checked(
+    active: &[bool],
+    ledger: &mut Ledger,
+) -> Result<(Vec<u32>, usize), BuildError> {
+    let mut map = ledger.filled("active level map", active.len(), u32::MAX)?;
+    let mut n = 0u32;
+    for (j, &a) in active.iter().enumerate() {
+        if a {
+            map[j] = n;
+            n += 1;
+        }
+    }
+    Ok((map, n as usize))
+}
+
+/// [`build_compact_mapping`] reserved through `ledger`; `Ok(None)` releases what it took.
+fn build_compact_mapping_checked(
+    active_rows: &[bool],
+    active_cols: &[bool],
+    base_rows: usize,
+    base_cols: usize,
+    ledger: &mut Ledger,
+) -> Result<Option<ActiveLevels>, BuildError> {
+    let (row_map, n_rows) = compact_map_checked(active_rows, ledger)?;
+    let (col_map, n_cols) = compact_map_checked(active_cols, ledger)?;
+
+    if n_rows == 0 || n_cols == 0 {
+        ledger.free(row_map);
+        ledger.free(col_map);
+        return Ok(None);
+    }
+
+    let mut local_to_global = ledger.with_capacity("active level map", n_rows + n_cols)?;
+    for (j, &a) in active_rows.iter().enumerate() {
+        if a {
+            local_to_global.push(to_u32(base_rows + j));
+        }
+    }
+    for (k, &a) in active_cols.iter().enumerate() {
+        if a {
+            local_to_global.push(to_u32(base_cols + k));
+        }
+    }
+
+    Ok(Some(ActiveLevels {
+        row_map,
+        n_rows,
+        col_map,
+        n_cols,
+        local_to_global,
+    }))
+}
+
 /// A connected component in a bipartite factor-pair graph, in compact 0-based parent indices.
 pub(crate) struct BipartiteComponent {
     pub(crate) rows: Vec<usize>,
@@ -117,6 +173,35 @@ impl BlockDiagonals {
             .map(|&i| self.rows[i])
             .chain(comp.cols.iter().map(|&i| self.cols[i]))
             .collect()
+    }
+}
+
+impl BlockDiagonals {
+    /// [`Self::extract_component`] reserved through `ledger`.
+    pub(crate) fn extract_component_checked(
+        &self,
+        comp: &BipartiteComponent,
+        ledger: &mut Ledger,
+    ) -> Result<Vec<f64>, BuildError> {
+        let mut diagonal =
+            ledger.with_capacity("component split", comp.rows.len() + comp.cols.len())?;
+        diagonal.extend(comp.rows.iter().map(|&i| self.rows[i]));
+        diagonal.extend(comp.cols.iter().map(|&i| self.cols[i]));
+        Ok(diagonal)
+    }
+
+    /// Release both diagonals of a pair built through `ledger`.
+    pub(crate) fn free_checked(self, ledger: &mut Ledger) {
+        ledger.free(self.rows);
+        ledger.free(self.cols);
+    }
+}
+
+impl BipartiteComponent {
+    /// Release a component found through `ledger`.
+    pub(crate) fn free_checked(self, ledger: &mut Ledger) {
+        ledger.free(self.rows);
+        ledger.free(self.cols);
     }
 }
 
@@ -158,6 +243,154 @@ impl CrossTab {
             cols: col_diag,
         };
         Some((cross_tab, diagonals, active.local_to_global))
+    }
+
+    /// The checked build's [`Self::build_for_pair_with_active`] for an
+    /// intercept-only pair, with every array reserved through `ledger`.
+    pub(crate) fn build_for_pair_checked(
+        design: &Design<'_>,
+        weights: Option<&[f64]>,
+        pair: ChannelPair,
+        all_active: &[Vec<bool>],
+        ledger: &mut Ledger,
+    ) -> Result<Option<(Self, BlockDiagonals, Vec<u32>)>, BuildError> {
+        let Some(active) = build_compact_mapping_checked(
+            &all_active[pair.rows.term],
+            &all_active[pair.cols.term],
+            design.terms[pair.rows.term].column_base(pair.rows.column),
+            design.terms[pair.cols.term].column_base(pair.cols.column),
+            ledger,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let (c, row_diag, col_diag) =
+            accumulate_unit_cross_block_checked(design, weights, pair, &active, ledger)?;
+        let ActiveLevels {
+            row_map,
+            col_map,
+            local_to_global,
+            ..
+        } = active;
+        ledger.free(row_map);
+        ledger.free(col_map);
+        let ct = c.transpose_checked(ledger)?;
+        let cross_tab = CrossTab { c, ct };
+        let diagonals = BlockDiagonals {
+            rows: row_diag,
+            cols: col_diag,
+        };
+        Ok(Some((cross_tab, diagonals, local_to_global)))
+    }
+
+    /// [`Self::bipartite_connected_components`] reserved through `ledger`, in the same order.
+    pub(crate) fn bipartite_connected_components_checked(
+        &self,
+        ledger: &mut Ledger,
+    ) -> Result<Vec<BipartiteComponent>, BuildError> {
+        const CONTEXT: &str = "component split";
+        let n_rows = self.n_rows();
+        let mut visited = ledger.filled(CONTEXT, self.n_local(), false)?;
+        let mut components = Vec::new();
+        // Every node is pushed at most once.
+        let mut stack = ledger.with_capacity(CONTEXT, self.n_local())?;
+
+        for start in 0..self.n_local() {
+            if visited[start] {
+                continue;
+            }
+            visited[start] = true;
+            stack.push(start);
+            let mut rows = Vec::new();
+            let mut cols = Vec::new();
+
+            while let Some(node) = stack.pop() {
+                if node < n_rows {
+                    ledger.push(CONTEXT, &mut rows, node)?;
+                } else {
+                    ledger.push(CONTEXT, &mut cols, node - n_rows)?;
+                }
+                for (j, _) in self.neighbors(node) {
+                    if !visited[j] {
+                        visited[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+
+            rows.sort_unstable();
+            cols.sort_unstable();
+            ledger.push(CONTEXT, &mut components, BipartiteComponent { rows, cols })?;
+        }
+        ledger.free(visited);
+        ledger.free(stack);
+        Ok(components)
+    }
+
+    /// [`Self::extract_component`] reserved through `ledger`.
+    pub(crate) fn extract_component_checked(
+        &self,
+        comp: &BipartiteComponent,
+        row_remap: &mut [u32],
+        col_remap: &mut [u32],
+        ledger: &mut Ledger,
+    ) -> Result<Self, BuildError> {
+        const CONTEXT: &str = "component split";
+        let n_rows = comp.rows.len();
+        let n_cols = comp.cols.len();
+
+        for (new_idx, &old_idx) in comp.rows.iter().enumerate() {
+            row_remap[old_idx] = to_u32(new_idx);
+        }
+        for (new_idx, &old_idx) in comp.cols.iter().enumerate() {
+            col_remap[old_idx] = to_u32(new_idx);
+        }
+
+        // A component's rows keep every stored entry, so its row ranges give the count.
+        let nnz: usize = comp
+            .rows
+            .iter()
+            .map(|&row| (self.c.indptr[row + 1] - self.c.indptr[row]) as usize)
+            .sum();
+        let mut c_indptr = ledger.filled(CONTEXT, n_rows + 1, 0u32)?;
+        let mut c_indices = ledger.with_capacity(CONTEXT, nnz)?;
+        let mut c_data = ledger.with_capacity(CONTEXT, nnz)?;
+        for (new_row, &old_row) in comp.rows.iter().enumerate() {
+            let start = self.c.indptr[old_row] as usize;
+            let end = self.c.indptr[old_row + 1] as usize;
+            for idx in start..end {
+                let old_rj = self.c.indices[idx] as usize;
+                let new_rj = col_remap[old_rj];
+                if new_rj != u32::MAX {
+                    c_indices.push(new_rj);
+                    c_data.push(self.c.data[idx]);
+                }
+            }
+            c_indptr[new_row + 1] = to_u32(c_indices.len());
+        }
+
+        let c = CsrBlock {
+            indptr: c_indptr,
+            indices: c_indices,
+            data: c_data,
+            nrows: n_rows,
+            ncols: n_cols,
+        };
+        for &old_idx in &comp.rows {
+            row_remap[old_idx] = u32::MAX;
+        }
+        for &old_idx in &comp.cols {
+            col_remap[old_idx] = u32::MAX;
+        }
+        let ct = c.transpose_checked(ledger)?;
+        Ok(CrossTab { c, ct })
+    }
+
+    /// Release both blocks of a cross-tabulation built through `ledger`.
+    pub(crate) fn free_checked(self, ledger: &mut Ledger) {
+        self.c.free_checked(ledger);
+        self.ct.free_checked(ledger);
     }
 
     /// Symmetric adjacency over local `[q | r]` indexing: q-nodes walk `C`, r-nodes walk `Cᵀ`.

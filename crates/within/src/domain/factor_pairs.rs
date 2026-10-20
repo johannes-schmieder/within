@@ -10,6 +10,7 @@ use schwarz_precond::{PartitionWeights, SubdomainCore};
 
 use crate::channel::{Channel, ChannelPair};
 use crate::config::LocalSolverConfig;
+use crate::setup::Ledger;
 use crate::{BuildError, BuildWarning};
 
 use super::{find_all_active_levels, BlockDiagonals, CrossTab, Design};
@@ -95,6 +96,141 @@ pub(crate) fn build_local_domains(
     }
 
     Ok((domain_pairs, warnings))
+}
+
+/// The checked build's [`build_local_domains`] for intercept-only designs: serial,
+/// in the same pair and component order, with every array reserved through
+/// `ledger`. Hands each live component and its global indices to `sink` as soon
+/// as it is converted, so only one pair's transient state is live at a time.
+///
+/// Intercept-only pairs are known Laplacians: no scaling, ridge or warning applies.
+pub(crate) fn for_each_local_domain_checked(
+    design: &Design<'_>,
+    weights: Option<&[f64]>,
+    ledger: &mut Ledger,
+    mut sink: impl FnMut(&mut Ledger, Vec<u32>, LocalComponent) -> Result<(), BuildError>,
+) -> Result<(), BuildError> {
+    const CONTEXT: &str = "pair enumeration";
+    let n_channels: usize = (0..design.n_factors())
+        .map(|term| design.terms[term].n_columns())
+        .sum();
+    let mut channels: Vec<Channel> = ledger.with_capacity(CONTEXT, n_channels)?;
+    channels.extend((0..design.n_factors()).flat_map(|term| design.channels(term)));
+    debug_assert!(
+        channels
+            .iter()
+            .all(|&c| design.loading(c).covariate().is_none()),
+        "the caller refuses slope effects before reserving"
+    );
+    let n_pairs = channels
+        .iter()
+        .enumerate()
+        .map(|(i, rows)| {
+            channels[i + 1..]
+                .iter()
+                .filter(|cols| cols.term != rows.term)
+                .count()
+        })
+        .sum();
+    let mut pairs = ledger.with_capacity(CONTEXT, n_pairs)?;
+    pairs.extend(channels.iter().enumerate().flat_map(|(i, &rows)| {
+        channels[i + 1..]
+            .iter()
+            .filter(move |cols| cols.term != rows.term)
+            .map(move |&cols| ChannelPair { rows, cols })
+    }));
+    ledger.free(channels);
+
+    let mut all_active: Vec<Vec<bool>> = ledger.with_capacity(CONTEXT, design.n_factors())?;
+    for term in &design.terms {
+        all_active.push(ledger.filled(CONTEXT, term.n_levels, false)?);
+    }
+    for (f, col) in all_active.iter_mut().enumerate() {
+        for &v in design.frame.level_column(f) {
+            col[v as usize] = true;
+        }
+    }
+
+    for &pair in &pairs {
+        let Some((full_ct, full_diag, l2g)) =
+            CrossTab::build_for_pair_checked(design, weights, pair, &all_active, ledger)?
+        else {
+            continue;
+        };
+        split_into_subdomains_checked(pair, full_ct, full_diag, l2g, ledger, &mut sink)?;
+    }
+    ledger.free(pairs);
+    for active in all_active.drain(..) {
+        ledger.free(active);
+    }
+    ledger.free(all_active);
+    Ok(())
+}
+
+/// The checked [`split_into_subdomains`] for a known-Laplacian pair.
+fn split_into_subdomains_checked(
+    pair: ChannelPair,
+    full_ct: CrossTab,
+    full_diag: BlockDiagonals,
+    l2g: Vec<u32>,
+    ledger: &mut Ledger,
+    sink: &mut impl FnMut(&mut Ledger, Vec<u32>, LocalComponent) -> Result<(), BuildError>,
+) -> Result<(), BuildError> {
+    const CONTEXT: &str = "component split";
+    let n_rows_full = full_ct.n_rows();
+    let components = full_ct.bipartite_connected_components_checked(ledger)?;
+
+    let mut emit = |ledger: &mut Ledger,
+                    comp: &super::cross_tab::BipartiteComponent,
+                    comp_ct: CrossTab,
+                    comp_diag: Vec<f64>|
+     -> Result<(), BuildError> {
+        if comp_diag.iter().all(|&v| v == 0.0) {
+            comp_ct.free_checked(ledger);
+            ledger.free(comp_diag);
+            return Ok(());
+        }
+        let mut comp_globals = ledger.with_capacity(CONTEXT, comp.rows.len() + comp.cols.len())?;
+        comp_globals.extend(
+            comp.rows
+                .iter()
+                .map(|&i| l2g[i])
+                .chain(comp.cols.iter().map(|&i| l2g[n_rows_full + i])),
+        );
+        let (comp_ct, comp_diag, comp_globals) =
+            sddm::orient_for_elimination(comp_ct, comp_diag, comp_globals);
+        let component = sddm::convert_known_laplacian_checked(comp_ct, comp_diag, ledger)?
+            .map_err(|NotScalable| BuildError::UnscalableComponent { pair })?;
+        sink(ledger, comp_globals, component)
+    };
+
+    if components.len() == 1 {
+        let mut flat = ledger.with_capacity(CONTEXT, full_ct.n_local())?;
+        flat.extend_from_slice(&full_diag.rows);
+        flat.extend_from_slice(&full_diag.cols);
+        full_diag.free_checked(ledger);
+        emit(ledger, &components[0], full_ct, flat)?;
+    } else {
+        let mut row_remap = ledger.filled(CONTEXT, full_ct.n_rows(), u32::MAX)?;
+        let mut col_remap = ledger.filled(CONTEXT, full_ct.n_cols(), u32::MAX)?;
+        for comp in &components {
+            let comp_ct =
+                full_ct.extract_component_checked(comp, &mut row_remap, &mut col_remap, ledger)?;
+            let comp_diag = full_diag.extract_component_checked(comp, ledger)?;
+            emit(ledger, comp, comp_ct, comp_diag)?;
+        }
+        ledger.free(row_remap);
+        ledger.free(col_remap);
+        full_ct.free_checked(ledger);
+        full_diag.free_checked(ledger);
+    }
+    let mut components = components;
+    for comp in components.drain(..) {
+        comp.free_checked(ledger);
+    }
+    ledger.free(components);
+    ledger.free(l2g);
+    Ok(())
 }
 
 /// Dead singletons (zero diagonal, an exact-zero design column) produce no subdomain.

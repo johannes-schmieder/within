@@ -9,8 +9,8 @@ pub(crate) use cross_tab::{find_all_active_levels, BlockDiagonals, CrossTab};
 pub use effect::Effect;
 
 pub(crate) use factor_pairs::{
-    build_local_domains, CoordinateMap, Grounding, LocalComponent, LocalDomain, MatrixForm,
-    SddmMatrix,
+    build_local_domains, for_each_local_domain_checked, CoordinateMap, Grounding, LocalComponent,
+    LocalDomain, MatrixForm, SddmMatrix,
 };
 
 use std::borrow::Cow;

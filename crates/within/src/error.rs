@@ -105,6 +105,30 @@ pub enum BuildError {
         /// Total degrees of freedom implied by the design.
         n_dofs: usize,
     },
+    /// A checked build would exceed its declared live-payload limit.
+    #[error("{context}: checked setup requires {required} payload bytes, limit is {limit}")]
+    SetupBudgetExceeded {
+        /// Construction step whose reservation was refused.
+        context: &'static str,
+        /// Live requested payload including the refused reservation.
+        required: usize,
+        /// Caller-declared inclusive limit, not process memory.
+        limit: usize,
+    },
+    /// A checked build's fallible reservation failed or its size overflowed.
+    #[error("{context}: checked setup allocation of {bytes} bytes failed")]
+    SetupAllocationFailed {
+        /// Construction step whose reservation failed.
+        context: &'static str,
+        /// Requested bytes, `usize::MAX` when the size itself overflowed.
+        bytes: usize,
+    },
+    /// The checked build does not cover this input; nothing was allocated for it.
+    #[error("checked setup does not support {reason}")]
+    CheckedSetupUnsupported {
+        /// Fixed description of the unsupported input or configuration.
+        reason: &'static str,
+    },
 }
 
 /// A non-fatal preconditioner-build event.

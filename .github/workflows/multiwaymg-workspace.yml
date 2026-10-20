@@ -62,6 +62,8 @@ jobs:
           cargo test --locked --release --manifest-path crates/schwarz-precond/Cargo.toml --no-default-features --test serial_schwarz --test serial_schwarz_allocations 2>&1 | tee serial-evidence/schwarz-release-minimal.txt
           cargo test --locked --manifest-path crates/within/Cargo.toml --all-features --test serial_preconditioner --test serial_preconditioner_allocations 2>&1 | tee serial-evidence/within-debug.txt
           cargo test --locked --release --manifest-path crates/within/Cargo.toml --all-features --test serial_preconditioner --test serial_preconditioner_allocations 2>&1 | tee serial-evidence/within-release.txt
+          cargo test --locked --manifest-path crates/within/Cargo.toml --all-features --test checked_setup_allocations 2>&1 | tee serial-evidence/within-checked-setup-debug.txt
+          cargo test --locked --release --manifest-path crates/within/Cargo.toml --all-features --test checked_setup_allocations 2>&1 | tee serial-evidence/within-checked-setup-release.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

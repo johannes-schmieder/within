@@ -25,6 +25,10 @@
 //! [`ReductionStrategy`] rather than [`ReductionStrategy::Auto`], which selects
 //! its backend from the width.
 
+// Lets the shared integration-test case generator name this crate from unit tests.
+#[cfg(test)]
+extern crate self as within;
+
 pub mod config;
 pub mod error;
 pub mod observation;
@@ -35,6 +39,7 @@ pub(crate) mod csr_block;
 pub(crate) mod domain;
 pub(crate) mod linalg;
 pub(crate) mod operator;
+pub(crate) mod setup;
 pub(crate) mod solver;
 
 pub use channel::{Channel, ChannelPair};
@@ -45,6 +50,7 @@ pub use config::{
 pub use domain::{Design, Effect};
 pub use error::{BuildError, BuildWarning, SolveError, WithinError};
 pub use operator::schwarz::{Preconditioner, SerialPreconditionerWorkspace};
+pub use setup::{SetupLimit, SetupReport};
 pub use solver::{
     solve, solve_batch, BatchSolveResult, CoefficientAddress, CoefficientLayout, IntoDesign,
     PreconditionerInput, SolveResult, Solver,

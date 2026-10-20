@@ -458,5 +458,8 @@ fn counting_sort_by_lo(edges: &mut Vec<Edge>, n_kept: usize) {
     *edges = out;
 }
 
+mod checked;
+pub(crate) use checked::{exact_for_factor_checked, sampled_checked};
+
 #[cfg(test)]
 mod tests;

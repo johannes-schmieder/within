@@ -4,11 +4,12 @@
 //! Gremban cover. [`factor_sparse`] bridges to the `approx-chol` builder.
 
 use approx_chol::low_level::Builder;
-use approx_chol::{CsrRef, Factor};
+use approx_chol::{ConstructionLimit, CsrRef, Factor};
 use schwarz_precond::LocalSolveError;
 
 use super::csr_matrix::CsrMatrix;
 use crate::domain::Grounding;
+use crate::setup::Ledger;
 use crate::BuildError;
 
 /// Reduced-system factor for Schur-complement local solves.
@@ -197,6 +198,53 @@ pub(crate) fn factor_sparse(
         u32::try_from(matrix.n()).expect("Schur complement dimension exceeds u32::MAX"),
     )?;
     Builder::new(config).build(csr)
+}
+
+/// [`factor_sparse`] under the setup ledger's remaining budget, folding the build's
+/// peak into the ledger whether or not it succeeds.
+///
+/// Budget and allocation refusals become the ledger's errors. Any other
+/// `approx-chol` error is returned in the inner result, so the caller can still
+/// spot an unusable exact pivot.
+pub(crate) fn factor_sparse_checked(
+    matrix: &CsrMatrix,
+    config: approx_chol::Config,
+    ledger: &mut Ledger,
+) -> Result<Result<Factor, approx_chol::Error>, BuildError> {
+    const CONTEXT: &str = "local factor";
+    let csr = CsrRef::new(
+        matrix.indptr(),
+        matrix.indices(),
+        matrix.data(),
+        u32::try_from(matrix.n()).expect("Schur complement dimension exceeds u32::MAX"),
+    );
+    let csr = match csr {
+        Ok(csr) => csr,
+        Err(error) => return Ok(Err(error)),
+    };
+    let limit = ConstructionLimit {
+        maximum_payload_bytes: ledger.remaining(),
+    };
+    let (built, report) = Builder::new(config).build_with_limit_reported(csr, limit);
+    match built {
+        Ok(factor) => {
+            ledger.absorb(report.peak_payload_bytes, report.retained_payload_bytes);
+            Ok(Ok(factor))
+        }
+        Err(approx_chol::Error::ConstructionBudgetExceeded { required, .. }) => {
+            Err(ledger.refusal(CONTEXT, required))
+        }
+        Err(approx_chol::Error::AllocationFailed { bytes }) => {
+            Err(BuildError::SetupAllocationFailed {
+                context: CONTEXT,
+                bytes,
+            })
+        }
+        Err(error) => {
+            ledger.absorb(report.peak_payload_bytes, 0);
+            Ok(Err(error))
+        }
+    }
 }
 
 pub(crate) fn local_solver_build(e: approx_chol::Error) -> BuildError {

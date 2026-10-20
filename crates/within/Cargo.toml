@@ -12,9 +12,10 @@ categories.workspace = true
 
 [dependencies]
 schwarz-precond = { workspace = true, features = ["serde"] }
-# Owner fork with caller-owned permutation scratch, capacity inventory and checked
-# construction, pinned to the merge commit of fork PRs #1 and #2.
-approx-chol = { git = "https://github.com/johannes-schmieder/approx-chol", rev = "68ad1b99dbcf4e3d0145cb4d1aef3f3fc036492c", version = "=0.5.0", features = ["serde"] }
+# Owner fork with caller-owned permutation scratch, capacity inventory, checked
+# construction, sampler reservation and failure reporting, pinned to the merge
+# commit of fork PRs #1 to #4.
+approx-chol = { git = "https://github.com/johannes-schmieder/approx-chol", rev = "43f470abed1ca1a0858c6101779bf6dcf62c362a", version = "=0.5.0", features = ["serde"] }
 serde = { workspace = true, features = ["rc"] }
 postcard.workspace = true
 ndarray = "0.17"
@@ -24,6 +25,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 stats_alloc = "=0.1.10"
+allocation-counter = "=0.8.1"
 criterion = { version = "0.7", features = ["html_reports"] }
 rand = "0.10"
 proptest = "1"
@@ -45,4 +47,8 @@ workspace = true
 
 [[test]]
 name = "serial_preconditioner_allocations"
+harness = false
+
+[[test]]
+name = "checked_setup_allocations"
 harness = false
