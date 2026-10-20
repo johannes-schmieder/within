@@ -227,11 +227,11 @@ both downstream pins remain unchanged until that merge qualifies.
 ## Factor scratch and capacity (M6q)
 
 `within` now depends on the owner approx-chol fork at an exact revision
-(`f1315f81e8f2da0b91d0c858efc761cac198d68c`, with `version = "=0.5.0"`). The fork
+(`68ad1b99dbcf4e3d0145cb4d1aef3f3fc036492c`, with `version = "=0.5.0"`). The fork
 adds caller-owned permutation scratch, a checked factor capacity inventory and
-checked construction. The pin is provisional: it names the head of fork PRs #1/#2
-and must move to their merge commit before this branch merges. `deny.toml` allows
-that git source, required to be pinned by `rev`.
+checked construction. The pin is the merge commit of fork PRs #1 and #2; its tree
+is identical to the qualified head `f1315f8`. `deny.toml` allows that git source,
+required to be pinned by `rev`.
 
 Reduced solves take the factor's permutation scratch from storage that is already
 dead, following the M6o liveness audit, so the outer scratch is not enlarged:
