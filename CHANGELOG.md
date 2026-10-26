@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Long weighted Gram diagonals and cross-table cells use compensated accumulation, avoiding roundoff-driven Laplacian validation failures and loss of signed cell contributions.
+
 ### Changed
 
 - Levels with no cross-factor entries in a channel pair are batched into diagonal Schwarz subdomains per side instead of one subdomain each, cutting per-subdomain build and apply overhead without changing the preconditioner.
