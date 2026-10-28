@@ -67,15 +67,18 @@ impl LocalSolver for UniformDiagLocalSolver {
     fn n_local(&self) -> usize {
         self.n_local
     }
+    fn workspace_len(&self) -> usize {
+        0
+    }
     fn solve_local(
         &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
+        x: &mut [f64],
         _workspace: &mut [f64],
         _allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
-        for i in 0..self.n_local {
-            sol[i] = rhs[i] * self.inv_diag;
+        assert_eq!(x.len(), self.n_local);
+        for v in x.iter_mut() {
+            *v *= self.inv_diag;
         }
         Ok(())
     }
@@ -120,10 +123,12 @@ impl LocalSolver for FailingLocalSolver {
     fn n_local(&self) -> usize {
         self.n_local
     }
+    fn workspace_len(&self) -> usize {
+        0
+    }
     fn solve_local(
         &self,
-        _rhs: &mut [f64],
-        _sol: &mut [f64],
+        _x: &mut [f64],
         _workspace: &mut [f64],
         _allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {

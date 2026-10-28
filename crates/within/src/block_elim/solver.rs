@@ -424,7 +424,7 @@ impl LocalSolver for BlockElimSolver {
     }
 
     fn workspace_len(&self) -> usize {
-        self.n_reduced + self.reduced_factor.embed_len()
+        self.n_internal + self.n_reduced + self.reduced_factor.embed_len()
     }
 
     fn inner_parallelism_work_estimate(&self) -> usize {
@@ -439,12 +439,15 @@ impl LocalSolver for BlockElimSolver {
 
     fn solve_local(
         &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
+        x: &mut [f64],
         workspace: &mut [f64],
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
         let n_eliminated = self.n_eliminated();
+        // The elimination keeps its right-hand side apart from the solution it writes.
+        let (rhs, workspace) = workspace.split_at_mut(self.n_internal);
+        rhs.copy_from_slice(x);
+        let sol = x;
 
         self.coordinates.fold(rhs, n_eliminated);
         if self.reduced_factor.grounding() == Some(Grounding::Floating) {

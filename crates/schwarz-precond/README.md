@@ -46,19 +46,19 @@ impl Operator for TridiagOp {
     }
 }
 
-// --- Diagonal local solver: sol = rhs / diag ---
+// --- Diagonal local solver: x ← x / diag ---
 struct DiagSolver(usize, f64);
 
 impl LocalSolver for DiagSolver {
-    fn n_local(&self) -> usize    { self.0 }
+    fn n_local(&self) -> usize { self.0 }
+    fn workspace_len(&self) -> usize { 0 }
     fn solve_local(
         &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
+        x: &mut [f64],
         _workspace: &mut [f64],
         _allow_inner_parallelism: bool,
     ) -> Result<(), schwarz_precond::LocalSolveError> {
-        for i in 0..self.0 { sol[i] = rhs[i] / self.1; }
+        for v in x.iter_mut() { *v /= self.1; }
         Ok(())
     }
 }

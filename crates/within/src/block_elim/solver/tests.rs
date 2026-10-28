@@ -6,14 +6,13 @@ use crate::block_elim::csr_matrix::CsrMatrix;
 use crate::config::{ApproxCholConfig, SchurMode, DEFAULT_DENSE_SCHUR_THRESHOLD};
 
 impl BlockElimSolver {
-    /// Solves `r` with `sol` and the workspace preset to `stale`.
+    /// Solves `r` with the workspace preset to `stale`.
     pub(crate) fn solve_for_test(&self, r: &[f64], stale: f64) -> Vec<f64> {
-        let mut rhs = r.to_vec();
-        let mut sol = vec![stale; self.n_local()];
+        let mut x = r.to_vec();
         let mut workspace = vec![stale; self.workspace_len()];
-        self.solve_local(&mut rhs, &mut sol, &mut workspace, false)
+        self.solve_local(&mut x, &mut workspace, false)
             .expect("solve_local failed");
-        sol
+        x
     }
 }
 

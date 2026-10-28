@@ -135,7 +135,7 @@ impl SubdomainCore {
     #[inline]
     pub(crate) fn weight(&self, local: &[f64], out: &mut [f64]) {
         match &self.partition_weights {
-            PartitionWeights::Uniform(_) => out.copy_from_slice(&local[..out.len()]),
+            PartitionWeights::Uniform(_) => out.copy_from_slice(local),
             PartitionWeights::NonUniform(w) => {
                 for ((o, &li), &wi) in out.iter_mut().zip(local).zip(w) {
                     *o = li * wi;

@@ -42,24 +42,21 @@ impl LocalSolver for NestedRayonIdentitySolver {
         self.n
     }
 
+    fn workspace_len(&self) -> usize {
+        0
+    }
+
     fn solve_local(
         &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
+        x: &mut [f64],
         _workspace: &mut [f64],
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
+        // Identity, forking per chunk so the apply runs nested Rayon work.
         if allow_inner_parallelism {
-            sol[..self.n]
-                .par_chunks_mut(Self::CHUNK_SIZE)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let start = chunk_idx * Self::CHUNK_SIZE;
-                    let end = start + chunk.len();
-                    chunk.copy_from_slice(&rhs[start..end]);
-                });
-        } else {
-            sol[..self.n].copy_from_slice(&rhs[..self.n]);
+            x.par_chunks_mut(Self::CHUNK_SIZE).for_each(|chunk| {
+                std::hint::black_box(chunk);
+            });
         }
         Ok(())
     }
@@ -390,42 +387,16 @@ fn test_additive_schwarz_apply_subdomain_empty_indices() {
         .expect("apply with empty subdomain succeeds");
 }
 
-// ============================================================================
-// Error Display and source() tests
-// ============================================================================
-
-struct ExactLengthIdentitySolver {
-    n: usize,
-}
-
-impl LocalSolver for ExactLengthIdentitySolver {
-    fn n_local(&self) -> usize {
-        self.n
-    }
-
-    fn solve_local(
-        &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
-        _workspace: &mut [f64],
-        _allow_inner_parallelism: bool,
-    ) -> Result<(), LocalSolveError> {
-        assert_eq!((rhs.len(), sol.len()), (self.n, self.n));
-        sol.copy_from_slice(rhs);
-        Ok(())
-    }
-}
-
 #[test]
-fn test_solve_local_gets_buffers_of_its_own_length_beside_larger_subdomains() {
+fn test_solve_local_gets_x_of_its_own_length_beside_larger_subdomains() {
     let entries = vec![
         make_entry(
             SubdomainCore::uniform(vec![0, 1, 2]),
-            ExactLengthIdentitySolver { n: 3 },
+            UniformDiagLocalSolver::new(3, 1.0),
         ),
         make_entry(
             SubdomainCore::uniform(vec![3]),
-            ExactLengthIdentitySolver { n: 1 },
+            UniformDiagLocalSolver::new(1, 1.0),
         ),
     ];
     let schwarz = SchwarzPreconditioner::new(entries);
@@ -436,6 +407,8 @@ fn test_solve_local_gets_buffers_of_its_own_length_beside_larger_subdomains() {
     assert_eq!(z, [1.0, 2.0, 3.0, 4.0]);
 }
 
+// ============================================================================
+// Error Display and source() tests
 // ============================================================================
 
 #[test]

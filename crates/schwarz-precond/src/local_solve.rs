@@ -21,15 +21,12 @@ pub trait LocalSolver: Send + Sync {
     fn n_local(&self) -> usize;
 
     /// Length of the private `workspace` that `solve_local` gets with stale contents.
-    fn workspace_len(&self) -> usize {
-        0
-    }
+    fn workspace_len(&self) -> usize;
 
-    /// `rhs`, `sol` span `n_local()`, `rhs` may be clobbered; hint and thread count can't change bits.
+    /// Solves in place: `x` spans `n_local()`, rhs in, solution out; bits ignore hint and threads.
     fn solve_local(
         &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
+        x: &mut [f64],
         workspace: &mut [f64],
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError>;
@@ -83,9 +80,9 @@ impl<S: LocalSolver> SubdomainEntry<S> {
         self.core.is_empty()
     }
 
-    /// Room for the local `rhs`, `sol` and solver workspace of [`Self::apply_weighted_local`].
+    /// Room for the local `x` and solver workspace of [`Self::apply_weighted_local`].
     pub(crate) fn scratch_len(&self) -> usize {
-        2 * self.core.n_local() + self.solver.workspace_len()
+        self.core.n_local() + self.solver.workspace_len()
     }
 
     /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; `scratch` must hold `scratch_len()`.
@@ -99,14 +96,12 @@ impl<S: LocalSolver> SubdomainEntry<S> {
         if self.core.is_empty() {
             return Ok(());
         }
-        let n = self.core.n_local();
-        let (rhs, rest) = scratch.split_at_mut(n);
-        let (sol, rest) = rest.split_at_mut(n);
+        let (x, rest) = scratch.split_at_mut(self.core.n_local());
         let workspace = &mut rest[..self.solver.workspace_len()];
-        self.core.restrict_weighted(r, rhs);
+        self.core.restrict_weighted(r, x);
         self.solver
-            .solve_local(rhs, sol, workspace, allow_inner_parallelism)?;
-        self.core.weight(sol, out);
+            .solve_local(x, workspace, allow_inner_parallelism)?;
+        self.core.weight(x, out);
         Ok(())
     }
 }
@@ -156,7 +151,7 @@ mod tests {
     use crate::domain::PartitionWeights;
     use rstest::rstest;
 
-    /// Identity local solver: sol = rhs.
+    /// Identity local solver.
     struct IdentityLocalSolver {
         n: usize,
     }
@@ -165,14 +160,15 @@ mod tests {
         fn n_local(&self) -> usize {
             self.n
         }
+        fn workspace_len(&self) -> usize {
+            0
+        }
         fn solve_local(
             &self,
-            rhs: &mut [f64],
-            sol: &mut [f64],
+            _x: &mut [f64],
             _workspace: &mut [f64],
             _allow_inner_parallelism: bool,
         ) -> Result<(), LocalSolveError> {
-            sol.copy_from_slice(rhs);
             Ok(())
         }
     }
