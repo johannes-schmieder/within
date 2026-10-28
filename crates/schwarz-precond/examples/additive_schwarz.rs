@@ -52,13 +52,11 @@ impl LocalSolver for DiagLocalSolver {
     fn n_local(&self) -> usize {
         self.n_local
     }
-    fn scratch_size(&self) -> usize {
-        self.n_local
-    }
     fn solve_local(
         &self,
         rhs: &mut [f64],
         sol: &mut [f64],
+        _workspace: &mut [f64],
         _allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
         for i in 0..self.n_local {

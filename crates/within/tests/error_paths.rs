@@ -198,9 +198,9 @@ fn test_within_error_from_solve_error() {
 #[test]
 fn test_within_error_source_chains_through_transparent_wrapper() {
     // Transparent: WithinError -> BuildError::Preconditioner -> schwarz_precond::BuildError
-    let inner = schwarz_precond::BuildError::ScratchSizeTooSmall {
-        scratch_size: 1,
-        required_min: 2,
+    let inner = schwarz_precond::BuildError::LocalDofCountMismatch {
+        index_count: 1,
+        solver_n_local: 2,
     };
     let e = WithinError::Build(BuildError::Preconditioner(inner));
     assert!(e.source().is_some());

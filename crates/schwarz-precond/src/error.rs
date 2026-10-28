@@ -3,7 +3,7 @@
 //! Errors are partitioned by lifecycle phase:
 //!
 //! - **Build** ([`BuildError`]) — caught during construction, before any
-//!   solve begins. Covers partition-weight validation, subdomain DOF/scratch
+//!   solve begins. Covers partition-weight validation, subdomain DOF
 //!   contracts, and preconditioner-wide index checks.
 //! - **Solve** ([`SolveError`]) — runtime failures during a solve, including
 //!   operator/preconditioner application (e.g. a local solver diverges) and
@@ -35,14 +35,6 @@ pub enum BuildError {
         index_count: usize,
         /// Local DOF count reported by the solver implementation.
         solver_n_local: usize,
-    },
-    /// Local solver scratch size is too small for the subdomain gather/scatter buffers.
-    #[error("scratch size ({scratch_size}) is smaller than required minimum ({required_min})")]
-    ScratchSizeTooSmall {
-        /// Scratch size reported by the local solver.
-        scratch_size: usize,
-        /// Minimum scratch size required by the subdomain core.
-        required_min: usize,
     },
 }
 

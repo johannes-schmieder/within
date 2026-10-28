@@ -67,13 +67,11 @@ impl LocalSolver for UniformDiagLocalSolver {
     fn n_local(&self) -> usize {
         self.n_local
     }
-    fn scratch_size(&self) -> usize {
-        self.n_local
-    }
     fn solve_local(
         &self,
         rhs: &mut [f64],
         sol: &mut [f64],
+        _workspace: &mut [f64],
         _allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
         for i in 0..self.n_local {
@@ -116,20 +114,17 @@ pub fn make_schwarz_entries(n: usize) -> Vec<SubdomainEntry<UniformDiagLocalSolv
 /// Local solver that always fails with `BackendFailed`.
 pub struct FailingLocalSolver {
     pub n_local: usize,
-    pub scratch_size: usize,
 }
 
 impl LocalSolver for FailingLocalSolver {
     fn n_local(&self) -> usize {
         self.n_local
     }
-    fn scratch_size(&self) -> usize {
-        self.scratch_size
-    }
     fn solve_local(
         &self,
         _rhs: &mut [f64],
         _sol: &mut [f64],
+        _workspace: &mut [f64],
         _allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
         Err(LocalSolveError::BackendFailed {

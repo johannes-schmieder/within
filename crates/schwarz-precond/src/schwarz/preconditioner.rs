@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::error::SolveError;
-use crate::local_solve::{LocalSolveScratch, LocalSolver, SubdomainEntry};
+use crate::local_solve::{LocalSolver, SubdomainEntry};
 use crate::Operator;
 
 use super::buffers::Pool;
@@ -60,9 +60,9 @@ pub struct SchwarzPreconditioner<S: LocalSolver> {
     subdomains: Arc<Vec<SubdomainEntry<S>>>,
     prolongation: Arc<Prolongation>,
     /// One per concurrent apply; every apply rewrites all slots, so a failure leaves nothing stale.
-    local_outputs: Arc<Pool<Vec<f64>>>,
+    local_outputs: Arc<Pool>,
     /// One per running span of subdomains.
-    scratch: Arc<Pool<LocalSolveScratch>>,
+    scratch: Arc<Pool>,
     outer_capacity: f64,
 }
 
@@ -87,10 +87,10 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
             "n_dofs ({n_dofs}) is below the covered index span"
         );
         let prolongation = Prolongation::new(entries.iter().map(|e| e.global_indices()), n_dofs);
-        let scratch_size = entries.iter().map(|e| e.scratch_size()).max().unwrap_or(0);
+        let scratch_len = entries.iter().map(|e| e.scratch_len()).max().unwrap_or(0);
         Self {
             local_outputs: Arc::new(Pool::new(prolongation.n_slots())),
-            scratch: Arc::new(Pool::new(scratch_size)),
+            scratch: Arc::new(Pool::new(scratch_len)),
             outer_capacity: Self::outer_capacity(&entries),
             subdomains: Arc::new(entries),
             prolongation: Arc::new(prolongation),
@@ -219,7 +219,7 @@ impl<S: LocalSolver> Sweep<'_, S> {
         })
     }
 
-    fn solve(&self, mut span: Span<'_>, scratch: &mut LocalSolveScratch) -> Result<(), SolveError> {
+    fn solve(&self, mut span: Span<'_>, scratch: &mut [f64]) -> Result<(), SolveError> {
         let p = &*self.preconditioner.prolongation;
         for i in span.ids.clone() {
             self.preconditioner.subdomains[i]
