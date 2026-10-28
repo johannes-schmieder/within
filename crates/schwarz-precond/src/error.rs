@@ -73,12 +73,6 @@ pub enum SolveError {
         #[source]
         source: LocalSolveError,
     },
-    /// Internal synchronization failed (e.g. poisoned mutex) during an apply.
-    #[error("synchronization failure at {context}")]
-    Synchronization {
-        /// Context string identifying the lock/synchronization site.
-        context: &'static str,
-    },
     /// Solver input was invalid before any iteration was attempted.
     #[error("invalid solver input at {context}: {message}")]
     InvalidInput {

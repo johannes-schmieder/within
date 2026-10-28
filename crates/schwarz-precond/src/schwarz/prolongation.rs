@@ -12,29 +12,18 @@ pub(super) struct Prolongation {
 }
 
 impl Prolongation {
-    /// `subdomains` yields each subdomain's DOFs; it is walked twice, so it must be cheap to clone.
+    /// `subdomains` yields each subdomain's DOFs; it is re-walked, so it must be cheap to clone.
     pub(super) fn new<'a>(
         subdomains: impl Iterator<Item = &'a [u32]> + Clone,
         n_dofs: usize,
     ) -> Self {
-        let mut starts = vec![0];
-        let mut offsets = vec![0usize; n_dofs + 1];
-        for dofs in subdomains.clone() {
-            starts.push(starts[starts.len() - 1] + dofs.len());
-            for &g in dofs {
-                offsets[g as usize + 1] += 1;
-            }
-        }
-        for g in 0..n_dofs {
-            offsets[g + 1] += offsets[g];
-        }
-        let mut next = offsets[..n_dofs].to_vec();
-        let mut slots = vec![0u32; offsets[n_dofs]];
-        for (s, &g) in subdomains.flatten().enumerate() {
-            let at = &mut next[g as usize];
-            slots[*at] = u32::try_from(s).expect("at most u32::MAX slots");
-            *at += 1;
-        }
+        let starts = std::iter::once(0)
+            .chain(subdomains.clone().scan(0, |end, dofs| {
+                *end += dofs.len();
+                Some(*end)
+            }))
+            .collect();
+        let (offsets, slots) = slots_by_dof(subdomains.flatten().copied(), n_dofs);
         Self {
             starts,
             offsets,
@@ -74,6 +63,25 @@ impl Prolongation {
                 }
             });
     }
+}
+
+/// Counting sort of slots by DOF: DOF `g` gets `slots[offsets[g]..offsets[g + 1]]`, ascending.
+fn slots_by_dof(dofs: impl Iterator<Item = u32> + Clone, n_dofs: usize) -> (Vec<usize>, Vec<u32>) {
+    let mut offsets = vec![0usize; n_dofs + 1];
+    for g in dofs.clone() {
+        offsets[g as usize + 1] += 1;
+    }
+    for g in 0..n_dofs {
+        offsets[g + 1] += offsets[g];
+    }
+    let mut next = offsets[..n_dofs].to_vec();
+    let mut slots = vec![0u32; offsets[n_dofs]];
+    for (s, g) in dofs.enumerate() {
+        let at = &mut next[g as usize];
+        slots[*at] = u32::try_from(s).expect("at most u32::MAX slots");
+        *at += 1;
+    }
+    (offsets, slots)
 }
 
 #[cfg(test)]

@@ -460,19 +460,6 @@ fn test_solve_error_display_local_solve_failed() {
 }
 
 #[test]
-fn test_solve_error_display_synchronization() {
-    let err = SolveError::Synchronization {
-        context: "mutex.lock",
-    };
-    let msg = err.to_string();
-    assert!(
-        msg.contains("synchronization"),
-        "missing sync keyword: {msg}"
-    );
-    assert!(msg.contains("mutex.lock"), "missing context: {msg}");
-}
-
-#[test]
 fn test_solve_error_source() {
     let local_err = LocalSolveError::BackendFailed {
         context: "test",
@@ -485,12 +472,6 @@ fn test_solve_error_source() {
     assert!(
         err.source().is_some(),
         "LocalSolveFailed should have a source"
-    );
-
-    let err2 = SolveError::Synchronization { context: "test" };
-    assert!(
-        err2.source().is_none(),
-        "Synchronization should have no source"
     );
 }
 

@@ -184,7 +184,10 @@ fn test_within_error_from_build_error() {
 
 #[test]
 fn test_within_error_from_solve_error() {
-    let inner = SolveError::Synchronization { context: "test" };
+    let inner = SolveError::InvalidInput {
+        context: "test",
+        message: "test".to_string(),
+    };
     let e: WithinError = inner.into();
     match e {
         WithinError::Solve(_) => {}
