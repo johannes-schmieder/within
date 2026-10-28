@@ -17,17 +17,17 @@ use crate::error::{BuildError, LocalSolveError};
 
 /// The `Aᵢ⁻¹` operator: solves the restricted system `Aᵢ = Rᵢ A Rᵢᵀ`, exactly or approximately.
 pub trait LocalSolver: Send + Sync {
-    /// Number of DOFs in the subdomain (before augmentation).
+    /// Number of DOFs in the subdomain.
     fn n_local(&self) -> usize;
 
-    /// Required scratch buffer size (may be > n_local for augmented systems).
-    fn scratch_size(&self) -> usize;
+    /// Length of the private `workspace` that `solve_local` gets with stale contents.
+    fn workspace_len(&self) -> usize;
 
-    /// Solve into `sol` with `scratch_size()` buffers; hint and thread count can't change bits.
+    /// Solves in place: `x` spans `n_local()`, rhs in, solution out; bits ignore hint and threads.
     fn solve_local(
         &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
+        x: &mut [f64],
+        workspace: &mut [f64],
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError>;
 
@@ -57,15 +57,6 @@ impl<S: LocalSolver> SubdomainEntry<S> {
                 solver_n_local,
             });
         }
-
-        let scratch_size = solver.scratch_size();
-        if scratch_size < index_count {
-            return Err(BuildError::ScratchSizeTooSmall {
-                scratch_size,
-                required_min: index_count,
-            });
-        }
-
         Ok(Self { core, solver })
     }
 
@@ -89,43 +80,29 @@ impl<S: LocalSolver> SubdomainEntry<S> {
         self.core.is_empty()
     }
 
-    /// Required scratch buffer size (delegates to solver).
-    #[inline]
-    pub fn scratch_size(&self) -> usize {
-        self.solver.scratch_size()
+    /// Room for the local `x` and solver workspace of [`Self::apply_weighted_local`].
+    pub(crate) fn scratch_len(&self) -> usize {
+        self.core.n_local() + self.solver.workspace_len()
     }
 
-    /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; `scratch` must hold `scratch_size()`.
+    /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; `scratch` must hold `scratch_len()`.
     pub(crate) fn apply_weighted_local(
         &self,
         r: &[f64],
         out: &mut [f64],
-        scratch: &mut LocalSolveScratch,
+        scratch: &mut [f64],
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
         if self.core.is_empty() {
             return Ok(());
         }
-        let LocalSolveScratch { rhs, sol } = scratch;
-        self.core.restrict_weighted(r, rhs);
-        self.solver.solve_local(rhs, sol, allow_inner_parallelism)?;
-        self.core.weight(sol, out);
+        let (x, rest) = scratch.split_at_mut(self.core.n_local());
+        let workspace = &mut rest[..self.solver.workspace_len()];
+        self.core.restrict_weighted(r, x);
+        self.solver
+            .solve_local(x, workspace, allow_inner_parallelism)?;
+        self.core.weight(x, out);
         Ok(())
-    }
-}
-
-/// The local right-hand side and solution buffers of one [`LocalSolver::solve_local`] call.
-pub(crate) struct LocalSolveScratch {
-    rhs: Vec<f64>,
-    sol: Vec<f64>,
-}
-
-impl LocalSolveScratch {
-    pub(crate) fn new(scratch_size: usize) -> Self {
-        Self {
-            rhs: vec![0.0; scratch_size],
-            sol: vec![0.0; scratch_size],
-        }
     }
 }
 
@@ -174,7 +151,7 @@ mod tests {
     use crate::domain::PartitionWeights;
     use rstest::rstest;
 
-    /// Identity local solver: sol = rhs.
+    /// Identity local solver.
     struct IdentityLocalSolver {
         n: usize,
     }
@@ -183,16 +160,15 @@ mod tests {
         fn n_local(&self) -> usize {
             self.n
         }
-        fn scratch_size(&self) -> usize {
-            self.n
+        fn workspace_len(&self) -> usize {
+            0
         }
         fn solve_local(
             &self,
-            rhs: &mut [f64],
-            sol: &mut [f64],
+            _x: &mut [f64],
+            _workspace: &mut [f64],
             _allow_inner_parallelism: bool,
         ) -> Result<(), LocalSolveError> {
-            sol[..self.n].copy_from_slice(&rhs[..self.n]);
             Ok(())
         }
     }
@@ -238,7 +214,7 @@ mod tests {
 
         let r = vec![10.0, 20.0, 30.0, 40.0];
         let mut out = vec![0.0; 2];
-        let mut scratch = LocalSolveScratch::new(entry.scratch_size());
+        let mut scratch = vec![0.0; entry.scratch_len()];
 
         entry
             .apply_weighted_local(&r, &mut out, &mut scratch, true)

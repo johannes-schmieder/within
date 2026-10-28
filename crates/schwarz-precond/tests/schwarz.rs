@@ -42,27 +42,21 @@ impl LocalSolver for NestedRayonIdentitySolver {
         self.n
     }
 
-    fn scratch_size(&self) -> usize {
-        self.n
+    fn workspace_len(&self) -> usize {
+        0
     }
 
     fn solve_local(
         &self,
-        rhs: &mut [f64],
-        sol: &mut [f64],
+        x: &mut [f64],
+        _workspace: &mut [f64],
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
+        // Identity, forking per chunk so the apply runs nested Rayon work.
         if allow_inner_parallelism {
-            sol[..self.n]
-                .par_chunks_mut(Self::CHUNK_SIZE)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let start = chunk_idx * Self::CHUNK_SIZE;
-                    let end = start + chunk.len();
-                    chunk.copy_from_slice(&rhs[start..end]);
-                });
-        } else {
-            sol[..self.n].copy_from_slice(&rhs[..self.n]);
+            x.par_chunks_mut(Self::CHUNK_SIZE).for_each(|chunk| {
+                std::hint::black_box(chunk);
+            });
         }
         Ok(())
     }
@@ -393,6 +387,26 @@ fn test_additive_schwarz_apply_subdomain_empty_indices() {
         .expect("apply with empty subdomain succeeds");
 }
 
+#[test]
+fn test_solve_local_gets_x_of_its_own_length_beside_larger_subdomains() {
+    let entries = vec![
+        make_entry(
+            SubdomainCore::uniform(vec![0, 1, 2]),
+            UniformDiagLocalSolver::new(3, 1.0),
+        ),
+        make_entry(
+            SubdomainCore::uniform(vec![3]),
+            UniformDiagLocalSolver::new(1, 1.0),
+        ),
+    ];
+    let schwarz = SchwarzPreconditioner::new(entries);
+    let mut z = vec![0.0; 4];
+    schwarz
+        .apply(&[1.0, 2.0, 3.0, 4.0], &mut z)
+        .expect("apply succeeds");
+    assert_eq!(z, [1.0, 2.0, 3.0, 4.0]);
+}
+
 // ============================================================================
 // Error Display and source() tests
 // ============================================================================
@@ -406,17 +420,6 @@ fn test_subdomain_entry_build_error_display_local_dof_mismatch() {
     let msg = err.to_string();
     assert!(msg.contains("5"), "missing index_count: {msg}");
     assert!(msg.contains("3"), "missing solver_n_local: {msg}");
-}
-
-#[test]
-fn test_subdomain_entry_build_error_display_scratch_size_too_small() {
-    let err = BuildError::ScratchSizeTooSmall {
-        scratch_size: 2,
-        required_min: 4,
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("2"), "missing scratch_size: {msg}");
-    assert!(msg.contains("4"), "missing required_min: {msg}");
 }
 
 #[test]
@@ -566,10 +569,7 @@ fn test_additive_schwarz_parallel_readout_large_n() {
 fn test_additive_schwarz_apply_returns_err_on_solver_failure() {
     // FailingLocalSolver always returns Err — apply must propagate the error
     // (previously this silently filled z with NaN).
-    let solver = FailingLocalSolver {
-        n_local: 2,
-        scratch_size: 2,
-    };
+    let solver = FailingLocalSolver { n_local: 2 };
     let core = SubdomainCore::uniform(vec![0u32, 1]);
     let entry = make_entry(core, solver);
 
