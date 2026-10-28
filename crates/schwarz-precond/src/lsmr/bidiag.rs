@@ -26,29 +26,22 @@ pub(super) const LSMR_UPDATE_CHUNK: usize = 4096;
 #[inline]
 fn axpy_with_norm(y: &mut [f64], x: &[f64], scale: f64) -> f64 {
     debug_assert_eq!(x.len(), y.len());
-    let seq = |y_c: &mut [f64], x_c: &[f64]| -> f64 {
+    let sq = chunked_sum((&mut *y, x), |(y_c, x_c): (&mut [f64], &[f64])| {
         let mut s = 0.0;
-        for (yi, &xi) in y_c.iter_mut().zip(x_c.iter()) {
+        for (yi, &xi) in y_c.iter_mut().zip(x_c) {
             let val = xi + scale * *yi;
             *yi = val;
             s += val * val;
         }
         s
-    };
-    let sq = chunked_sum((&mut *y, x), |(y_c, x_c)| seq(y_c, x_c));
+    });
     norm_from_sq(y, sq)
 }
 
-/// `Σ leaf` over `LSMR_UPDATE_CHUNK` pieces in a fixed tree; one piece below the threshold.
+/// `Σ leaf` over `LSMR_UPDATE_CHUNK` pieces in a tree fixed by the length.
 #[inline]
 fn chunked_sum<P: Split>(input: P, leaf: impl Fn(P) -> f64 + Sync) -> f64 {
-    let n = input.n_items();
-    let block_len = if n >= LSMR_PAR_THRESHOLD {
-        LSMR_UPDATE_CHUNK
-    } else {
-        n
-    };
-    fold(input, block_len, &leaf, &|a, b| a + b)
+    fold(input, LSMR_UPDATE_CHUNK, &leaf, &|a, b| a + b)
 }
 
 /// `y = alpha * x + beta * y`. Parallel above the threshold.

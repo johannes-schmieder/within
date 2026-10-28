@@ -1,6 +1,8 @@
 //! Thread-count independence: the same solve returns the same bits in any pool.
 
 use super::super::*;
+use crate::fold::assert_pool_independent;
+use crate::lsmr::fixtures::DiagOp;
 use crate::{Operator, SolveError};
 
 /// `A x` with `y[i] = x[i mod n] + ½ x[(7i + 3) mod n]`: large enough that every reduction splits.
@@ -40,27 +42,6 @@ impl Operator for Wrapped {
     }
 }
 
-/// `M = diag(d)` with entries spread over three decades, so `⟨v, M⁻¹p̃⟩` is not a rescaled norm.
-struct Diagonal(Vec<f64>);
-
-impl Operator for Diagonal {
-    fn nrows(&self) -> usize {
-        self.0.len()
-    }
-    fn ncols(&self) -> usize {
-        self.0.len()
-    }
-    fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
-        for ((yi, &xi), &di) in y.iter_mut().zip(x).zip(&self.0) {
-            *yi = di * xi;
-        }
-        Ok(())
-    }
-    fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
-        self.apply(x, y)
-    }
-}
-
 fn spread(len: usize, scale: f64) -> Vec<f64> {
     (0..len)
         .map(|i| ((i as u64 * 2_654_435_761) % 1_000) as f64 * scale / 1_000.0 - 0.5 * scale)
@@ -78,14 +59,6 @@ fn fingerprint(r: &LsmrResult) -> (Vec<u64>, usize, u64, u64, LsmrStopReason) {
     )
 }
 
-fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .expect("pool")
-        .install(f)
-}
-
 #[test]
 fn lsmr_returns_the_same_bits_at_any_thread_count() {
     let op = Wrapped {
@@ -93,11 +66,7 @@ fn lsmr_returns_the_same_bits_at_any_thread_count() {
         n: 60_000,
     };
     let b = spread(op.m, 1.0);
-    let solve = || fingerprint(&lsmr(&op, &b, 1e-14, 40, None).expect("lsmr"));
-    let reference = in_pool(1, solve);
-    for threads in [2, 3, 8] {
-        assert!(in_pool(threads, solve) == reference, "{threads} threads");
-    }
+    assert_pool_independent(|| fingerprint(&lsmr(&op, &b, 1e-14, 40, None).expect("lsmr")));
 }
 
 #[test]
@@ -107,18 +76,15 @@ fn mlsmr_returns_the_same_bits_at_any_thread_count() {
         n: 60_000,
     };
     let b = spread(op.m, 1.0);
-    let m = Diagonal(
+    // Entries over three decades, so `⟨v, M⁻¹p̃⟩` is not a rescaled norm.
+    let m = DiagOp(
         spread(op.n, 1.0)
             .iter()
             .map(|v| 10f64.powf(3.0 * (v + 0.5)))
             .collect(),
     );
-    let solve = || {
+    assert_pool_independent(|| {
         let r = mlsmr(&op, &b, &m, 1e-14, 40, MlsmrOptions::default()).expect("mlsmr");
         fingerprint(&r)
-    };
-    let reference = in_pool(1, solve);
-    for threads in [2, 3, 8] {
-        assert!(in_pool(threads, solve) == reference, "{threads} threads");
-    }
+    });
 }

@@ -55,13 +55,13 @@ pub(crate) fn fold<P: Split, T: Send>(
     leaf: &(impl Fn(P) -> T + Sync),
     combine: &(impl Fn(T, T) -> T + Sync),
 ) -> T {
-    let pieces = input.n_items().div_ceil(block_len.max(1));
+    let n = input.n_items();
+    let pieces = n.div_ceil(block_len);
     if pieces <= 1 {
         return leaf(input);
     }
-    let parallel = input.n_items() > SEQUENTIAL_ITEMS;
     let (left, right) = input.split_at(pieces / 2 * block_len);
-    let (l, r) = if parallel {
+    let (l, r) = if n > SEQUENTIAL_ITEMS {
         rayon::join(
             || fold(left, block_len, leaf, combine),
             || fold(right, block_len, leaf, combine),
@@ -78,19 +78,28 @@ pub(crate) fn fold<P: Split, T: Send>(
 /// Subtrees this small run on the calling thread: a `join` per piece costs more than it spreads.
 const SEQUENTIAL_ITEMS: usize = 1 << 16;
 
+/// Asserts `f` returns the same value in pools of 1, 2, 3 and 8 threads.
+#[cfg(test)]
+pub(crate) fn assert_pool_independent<R: PartialEq + Send>(f: impl Fn() -> R + Sync) {
+    let in_pool = |threads: usize| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool")
+            .install(&f)
+    };
+    let reference = in_pool(1);
+    for threads in [2, 3, 8] {
+        // Not `assert_eq!`: a printed solution vector would bury the thread count.
+        assert!(in_pool(threads) == reference, "{threads} threads");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
-
-    fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("pool")
-            .install(f)
-    }
 
     #[rstest]
     #[case(0)]
@@ -118,21 +127,14 @@ mod tests {
         let x: Vec<f64> = (0..100_003u64)
             .map(|i| ((i * 2_654_435_761) % 997) as f64 * 10f64.powi((i % 31) as i32 - 15))
             .collect();
-        let sum = || {
+        assert_pool_independent(|| {
             fold(
                 x.as_slice(),
                 64,
                 &|c: &[f64]| c.iter().sum::<f64>(),
                 &|a, b| a + b,
             )
-        };
-        let reference = in_pool(1, sum).to_bits();
-        for threads in [2, 3, 8] {
-            assert_eq!(
-                in_pool(threads, sum).to_bits(),
-                reference,
-                "{threads} threads"
-            );
-        }
+            .to_bits()
+        });
     }
 }
