@@ -321,6 +321,8 @@ pub struct Solver<'a> {
     kernel: StepKernel,
     reparam: Option<SlopeReparam>,
     warnings: Vec<BuildWarning>,
+    /// Leading `warnings` from design screening; the rest came from the preconditioner build.
+    screening_warnings: usize,
 }
 
 impl std::fmt::Debug for Solver<'_> {
@@ -457,6 +459,7 @@ impl<'a> Solver<'a> {
             }
         };
 
+        let screening_warnings = warnings.len();
         warnings.extend(build_warnings);
 
         let sqrt_weights = weights.map(|mut w| {
@@ -476,9 +479,66 @@ impl<'a> Solver<'a> {
             kernel: StepKernel::Fused,
             reparam,
             warnings,
+            screening_warnings,
         };
         solver.index_adjoints()?;
         Ok(solver)
+    }
+
+    /// Replace the preconditioner while keeping this solver's design (including
+    /// any locality sort and slope reparametrization), square-root weights,
+    /// adjoint index, step kernel and reproducibility mode. The result is
+    /// bitwise the solver [`Self::new_with_screening`] builds from the same
+    /// inputs and options. `weights` must be the construction weights in
+    /// caller order; they are checked against the retained square roots. Pair
+    /// replacements built for this solver are not accepted by the result.
+    pub fn with_preconditioner(
+        mut self,
+        weights: Option<&[f64]>,
+        preconditioner: impl Into<PreconditionerInput>,
+    ) -> Result<Self, BuildError> {
+        self.design.validate_weights(weights)?;
+        let weights = weights.map(|w| self.design.permute_obs_in(w));
+        let consistent = match (weights.as_deref(), self.sqrt_weights.as_deref()) {
+            (None, None) => true,
+            (Some(w), Some(sw)) => w
+                .iter()
+                .zip(sw)
+                .all(|(wi, swi)| wi.sqrt().to_bits() == swi.to_bits()),
+            _ => false,
+        };
+        if !consistent {
+            return Err(BuildError::WeightsDiffer);
+        }
+        // Release the incumbent before building its replacement.
+        self.preconditioner = None;
+        let (preconditioner, build_warnings) = match preconditioner.into() {
+            PreconditionerInput::Default => {
+                build_preconditioner(&self.design, weights.as_deref(), None)?
+            }
+            PreconditionerInput::Config(c) => {
+                build_preconditioner(&self.design, weights.as_deref(), Some(&c))?
+            }
+            PreconditionerInput::Prebuilt(p) => {
+                if p.nrows() != self.design.n_dofs || p.ncols() != self.design.n_dofs {
+                    return Err(BuildError::PreconditionerDimensionMismatch {
+                        expected: self.design.n_dofs,
+                        actual_rows: p.nrows(),
+                        actual_cols: p.ncols(),
+                    });
+                }
+                (Some(p), Vec::new())
+            }
+        };
+        self.preconditioner = if self.reproducible {
+            preconditioner.map(Preconditioner::into_reproducible)
+        } else {
+            preconditioner
+        };
+        self.warnings.truncate(self.screening_warnings);
+        self.warnings.extend(build_warnings);
+        self.replacement_source = std::sync::OnceLock::new();
+        Ok(self)
     }
 
     /// Build the ownership index the kernel and reproducibility mode need,

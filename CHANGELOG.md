@@ -24,6 +24,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Solver::with_preconditioner` replaces a solver's preconditioner while keeping its prepared design (locality sort, slope reparametrization), square-root weights, adjoint index, step kernel and reproducibility mode; the result is bitwise a fresh construction. `BuildError::WeightsDiffer` rejects weights that differ from the construction weights.
 - `StepKernel` with `Solver::with_step_kernel` and `Solver::step_kernel`; `StepKernel::Separate` restores the separate passes and the 0.4 arithmetic bit for bit.
 - `schwarz_precond::Operator::apply_fused_update` (provided, `None` by default) lets an operator fuse a modified-LSMR step; `lsmr_norm_chunk` and `lsmr_norm_reduce` reproduce the separate update's norm association.
 - `schwarz_precond::MlsmrContinuation::new_shared` takes the original RHS as an `Arc<[f64]>`; an unseeded recurrence keeps it instead of a private copy.

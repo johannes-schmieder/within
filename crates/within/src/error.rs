@@ -52,6 +52,10 @@ pub enum BuildError {
         /// The offending value.
         value: f64,
     },
+    /// Weights passed to [`crate::Solver::with_preconditioner`] differ from the
+    /// solver's construction weights.
+    #[error("weights differ from the solver's construction weights")]
+    WeightsDiffer,
     /// Weight vector does not match the number of observations.
     #[error("weights has length {got}, expected {expected}")]
     WeightCountMismatch {
