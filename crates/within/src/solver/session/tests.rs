@@ -376,3 +376,30 @@ fn categorical_seed_preserves_original_rhs_scale_gauge_and_budget() {
         .start_session_categorical_seeded(&z, &vec![0.0; slope.n_dofs()], &options(80))
         .is_err());
 }
+
+#[test]
+fn unit_weight_sessions_hold_one_response_copy() {
+    let y: Vec<f64> = (0..60).map(|i| ((i * 13) % 17) as f64 / 19.0).collect();
+    let weights: Vec<f64> = (0..60).map(|i| 0.2 + (i % 7) as f64).collect();
+    for weighted in [false, true] {
+        let solver = Solver::new(
+            categorical(),
+            weighted.then(|| weights.clone()),
+            PreconditionerConfig::Diagonal,
+        )
+        .unwrap();
+        let mut session = solver.start_session(&y, &options(80)).unwrap();
+        assert_eq!(session.b.is_some(), weighted);
+        session.run_action(None, 2, None).unwrap();
+        // An unseeded recurrence shares the solve RHS: `y`, or `W^{1/2} y` when weighted.
+        let rhs = session.b.as_ref().unwrap_or(&session.y);
+        assert_eq!(std::sync::Arc::strong_count(rhs), 2);
+        let seed = vec![0.0; solver.n_dofs()];
+        let mut seeded = solver
+            .start_session_categorical_seeded(&y, &seed, &options(80))
+            .unwrap();
+        seeded.run_action(None, 2, None).unwrap();
+        // A seeded recurrence owns its correction residual instead.
+        assert_eq!(std::sync::Arc::strong_count(&seeded.y), 1);
+    }
+}

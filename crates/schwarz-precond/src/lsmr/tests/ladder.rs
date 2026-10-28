@@ -317,6 +317,43 @@ fn paused_continuation_matches_uninterrupted_recurrence_exactly() {
 }
 
 #[test]
+fn shared_rhs_continuation_is_bitwise_the_owned_recurrence_without_a_copy() {
+    use std::sync::Arc;
+    let op = DenseOp::vandermonde(30, 12);
+    let b: Vec<f64> = (0..op.rows).map(|i| ((i * 7) % 13) as f64 - 6.2).collect();
+    let m = jacobi(&op);
+    let x0: Vec<f64> = (0..op.cols).map(|j| 0.01 * j as f64).collect();
+    for warm in [None, Some(x0.as_slice())] {
+        let shared: Arc<[f64]> = Arc::from(b.as_slice());
+        let mut owned = MlsmrContinuation::new(&op, &b, &m, 1e-12, warm, Some(4)).unwrap();
+        let mut borrowed =
+            MlsmrContinuation::new_shared(&op, Arc::clone(&shared), &m, 1e-12, warm, Some(4))
+                .unwrap();
+        // Unseeded recurrences hold the caller's RHS; a warm start owns `b - A x`.
+        assert_eq!(
+            Arc::strong_count(&shared),
+            if warm.is_none() { 2 } else { 1 }
+        );
+        for cap in [3, 200] {
+            let expected = owned.advance(&op, &m, cap, None).unwrap();
+            let actual = borrowed.advance(&op, &m, cap, None).unwrap();
+            assert_eq!(expected.iterations, actual.iterations);
+            assert_eq!(expected.stop_reason, actual.stop_reason);
+            assert_eq!(expected.converged, actual.converged);
+            let bits = |r: &LsmrResult| -> Vec<u64> {
+                r.x.iter()
+                    .chain([&r.residual_norm, &r.normal_eq_residual])
+                    .map(|v| v.to_bits())
+                    .collect()
+            };
+            assert_eq!(bits(&expected), bits(&actual));
+        }
+        drop(borrowed);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+}
+
+#[test]
 fn residual_restart_preserves_nonunique_coefficient_gauge() {
     let op = ZeroSecondRow;
     let m = IdentityOp { n: 2 };

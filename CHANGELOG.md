@@ -9,6 +9,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- A `SolveSession` shares its response storage: with unit weights the solve RHS is the permuted response itself, and an unseeded recurrence shares that RHS (or `W^{1/2} y`). A unit-weight unseeded session holds one observation-length response vector instead of three; unit-weight seeded and weighted unseeded sessions hold one fewer. Results are bitwise unchanged (pinned digests at 1, 2, 4 and 8 workers).
 - **BREAKING:** Python `PreconditionerConfig` is now a tagged union: construct variants as `PreconditionerConfig.Off()`, `.Diagonal()`, or `.Additive(local_solver=..., reduction=...)` (previously class-attribute singletons plus an `.additive()` factory). Instances compare by value and support `match`/`case` on Python ≥3.10.
 - Rust `Preconditioner` objects expose their normalized construction configuration through `Preconditioner::config()`.
 - Serialized `schwarz_precond::SchwarzPreconditioner` values now preserve the configured reduction strategy.
@@ -20,6 +21,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `schwarz_precond::MlsmrContinuation::new_shared` takes the original RHS as an `Arc<[f64]>`; an unseeded recurrence keeps it instead of a private copy.
 - Python `Preconditioner.build_duration_seconds` and Rust `Preconditioner::build_duration()` expose the original preconditioner build duration, preserved across serialization and reuse.
 - `BuildWarning::CollinearSlopeCovariate` reports a slope covariate that is (nearly) a per-level combination of another term's columns — a cross-term near-null direction that per-term whitening cannot see and that can inflate iteration counts by orders of magnitude (#281).
 - `schwarz_precond::EscalationPolicy` builds a per-run `EscalationHandler` that ends a solve with `LsmrStopReason::Escalated` and an iterate that warm-starts the next preconditioner; `Staleness` implements it from the trailing contraction window.

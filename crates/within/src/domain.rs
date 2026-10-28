@@ -289,6 +289,15 @@ impl<'a> Design<'a> {
         }
     }
 
+    /// [`permute_obs_in`](Self::permute_obs_in) into one shared allocation.
+    pub(crate) fn permute_obs_in_shared(&self, v: &[f64]) -> std::sync::Arc<[f64]> {
+        debug_assert_eq!(v.len(), self.n_obs);
+        match &self.obs_perm {
+            None => std::sync::Arc::from(v),
+            Some(perm) => perm.iter().map(|&i| v[i as usize]).collect(),
+        }
+    }
+
     /// Internal order → caller order: `out[obs_perm[k]] = v[k]`.
     pub(crate) fn permute_obs_out(&self, v: Vec<f64>) -> Vec<f64> {
         debug_assert_eq!(v.len(), self.n_obs);

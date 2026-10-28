@@ -10,6 +10,26 @@ use super::{
 };
 use crate::{Operator, SolveError};
 
+use std::sync::Arc;
+
+/// The recurrence's RHS: the caller's original `b` shared without a copy, or
+/// an owned warm-start residual `b - A x`.
+enum Rhs {
+    Shared(Arc<[f64]>),
+    Owned(Vec<f64>),
+}
+
+impl std::ops::Deref for Rhs {
+    type Target = [f64];
+
+    fn deref(&self) -> &[f64] {
+        match self {
+            Self::Shared(rhs) => rhs,
+            Self::Owned(rhs) => rhs,
+        }
+    }
+}
+
 /// An owned modified-LSMR recurrence that can pause without a residual restart.
 /// Repeated `advance` calls MUST receive the same mathematical operator and
 /// fixed preconditioner. To change either, discard this object and construct a
@@ -21,7 +41,7 @@ pub struct MlsmrContinuation {
     recurrence: LsmrRecurrenceState,
     solution: SolutionState,
     prev_rot: RotationStep,
-    rhs: Vec<f64>,
+    rhs: Rhs,
     offset: Option<Vec<f64>>,
     completed: usize,
     started: usize,
@@ -40,6 +60,48 @@ impl MlsmrContinuation {
         warm_start: Option<&[f64]>,
         local_size: Option<usize>,
     ) -> Result<Self, SolveError> {
+        Self::start(
+            operator,
+            b,
+            None,
+            preconditioner,
+            tol,
+            warm_start,
+            local_size,
+        )
+    }
+
+    /// [`new`](Self::new) with a shared original RHS. Without a warm start the
+    /// recurrence keeps `b` itself instead of a private copy; the arithmetic is
+    /// unchanged.
+    pub fn new_shared<A: Operator + ?Sized, M: Operator + ?Sized>(
+        operator: &A,
+        b: Arc<[f64]>,
+        preconditioner: &M,
+        tol: f64,
+        warm_start: Option<&[f64]>,
+        local_size: Option<usize>,
+    ) -> Result<Self, SolveError> {
+        Self::start(
+            operator,
+            &b,
+            Some(&b),
+            preconditioner,
+            tol,
+            warm_start,
+            local_size,
+        )
+    }
+
+    fn start<A: Operator + ?Sized, M: Operator + ?Sized>(
+        operator: &A,
+        b: &[f64],
+        shared: Option<&Arc<[f64]>>,
+        preconditioner: &M,
+        tol: f64,
+        warm_start: Option<&[f64]>,
+        local_size: Option<usize>,
+    ) -> Result<Self, SolveError> {
         validate_lsmr_inputs(operator, b, tol)?;
         let n = operator.ncols();
         if preconditioner.nrows() != n || preconditioner.ncols() != n {
@@ -53,13 +115,18 @@ impl MlsmrContinuation {
             ));
         }
         let b_norm = vec_norm(b);
-        let mut rhs = b.to_vec();
-        if let Some(x) = warm_start {
-            operator.apply(x, &mut rhs)?;
-            for (r, b) in rhs.iter_mut().zip(b) {
-                *r = b - *r;
+        let rhs = match (warm_start, shared) {
+            (Some(x), _) => {
+                let mut rhs = b.to_vec();
+                operator.apply(x, &mut rhs)?;
+                for (r, b) in rhs.iter_mut().zip(b) {
+                    *r = b - *r;
+                }
+                Rhs::Owned(rhs)
             }
-        }
+            (None, Some(shared)) => Rhs::Shared(Arc::clone(shared)),
+            (None, None) => Rhs::Owned(b.to_vec()),
+        };
         let rhs_norm = vec_norm(&rhs);
         if !rhs_norm.is_finite() {
             return Err(invalid_input(

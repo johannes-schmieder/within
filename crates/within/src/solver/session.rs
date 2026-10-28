@@ -1,5 +1,6 @@
 //! Restartable solves keep original RHS scales and coefficients in the solve basis.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use schwarz_precond::{EscalationPolicy, LsmrStopReason, MlsmrContinuation, Operator};
@@ -32,8 +33,10 @@ pub struct ActionProgress {
 /// slope and observation-order recovery operate only on output copies.
 pub struct SolveSession<'s, 'a> {
     solver: &'s Solver<'a>,
-    y: Vec<f64>,
-    b: Vec<f64>,
+    /// Response in internal observation order, shared with an unseeded recurrence.
+    y: Arc<[f64]>,
+    /// `W^{1/2} y` when weighted; unit weights solve against `y` itself.
+    b: Option<Arc<[f64]>>,
     x: Vec<f64>,
     options: LsmrOptions,
     progress: ActionProgress,
@@ -61,13 +64,14 @@ impl<'a> Solver<'a> {
         if !options.tol.is_finite() || options.tol < 0.0 {
             return Err(invalid("tolerance must be finite and nonnegative"));
         }
-        let y = self.design.permute_obs_in(y).into_owned();
-        let operator = DesignOperator::with_stable(
-            &self.design,
-            self.sqrt_weights.as_deref(),
-            self.stable_adjoint.as_ref(),
-        );
-        let b = operator.weighted_rhs(&y).into_owned();
+        let y = self.design.permute_obs_in_shared(y);
+        // Same products as `DesignOperator::weighted_rhs`, collected once.
+        let b = self.sqrt_weights.as_deref().map(|sw| {
+            y.iter()
+                .zip(sw)
+                .map(|(&yi, &swi)| swi * yi)
+                .collect::<Arc<[f64]>>()
+        });
         Ok(SolveSession {
             solver: self,
             y,
@@ -196,9 +200,10 @@ impl SolveSession<'_, '_> {
             .map_or(0, MlsmrContinuation::iterations_started);
         let attempt = (|| {
             if self.continuation.is_none() {
-                self.continuation = Some(MlsmrContinuation::new(
+                let b = Arc::clone(self.b.as_ref().unwrap_or(&self.y));
+                self.continuation = Some(MlsmrContinuation::new_shared(
                     &operator,
-                    &self.b,
+                    b,
                     preconditioner,
                     self.options.tol,
                     self.ran.then_some(self.x.as_slice()),
@@ -256,7 +261,7 @@ impl SolveSession<'_, '_> {
     /// iterate. A failed session is explicitly marked unconverged.
     pub fn finish(mut self) -> SolveResult {
         self.continuation = None;
-        self.b = Vec::new();
+        self.b = None;
         let x = std::mem::take(&mut self.x);
         self.result(x)
     }
@@ -270,7 +275,7 @@ impl SolveSession<'_, '_> {
     fn result(&self, mut x: Vec<f64>) -> SolveResult {
         let mut demeaned = vec![0.0; self.solver.n_obs()];
         gather_apply(&self.solver.design, &x, &mut demeaned, None);
-        for (value, &response) in demeaned.iter_mut().zip(&self.y) {
+        for (value, &response) in demeaned.iter_mut().zip(self.y.iter()) {
             *value = response - *value;
         }
         if let Some(reparam) = &self.solver.reparam {
