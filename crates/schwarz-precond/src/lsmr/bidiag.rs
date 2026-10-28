@@ -12,6 +12,7 @@ mod tests;
 
 use super::finite;
 use super::magnitude::{exponent, ldexp, Magnitude};
+use crate::fold::{fold, Split};
 use crate::{Operator, SolveError};
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::prelude::{ParallelSlice, ParallelSliceMut};
@@ -34,15 +35,20 @@ fn axpy_with_norm(y: &mut [f64], x: &[f64], scale: f64) -> f64 {
         }
         s
     };
-    let sq = if y.len() >= LSMR_PAR_THRESHOLD {
-        y.par_chunks_mut(LSMR_UPDATE_CHUNK)
-            .zip(x.par_chunks(LSMR_UPDATE_CHUNK))
-            .map(|(y_c, x_c)| seq(y_c, x_c))
-            .sum()
-    } else {
-        seq(y, x)
-    };
+    let sq = chunked_sum((&mut *y, x), |(y_c, x_c)| seq(y_c, x_c));
     norm_from_sq(y, sq)
+}
+
+/// `Σ leaf` over `LSMR_UPDATE_CHUNK` pieces in a fixed tree; one piece below the threshold.
+#[inline]
+fn chunked_sum<P: Split>(input: P, leaf: impl Fn(P) -> f64 + Sync) -> f64 {
+    let n = input.n_items();
+    let block_len = if n >= LSMR_PAR_THRESHOLD {
+        LSMR_UPDATE_CHUNK
+    } else {
+        n
+    };
+    fold(input, block_len, &leaf, &|a, b| a + b)
 }
 
 /// `y = alpha * x + beta * y`. Parallel above the threshold.
@@ -92,15 +98,7 @@ pub(super) fn dot(a: &[f64], b: &[f64]) -> f64 {
 /// Parallel dot product, falling back to the sequential `dot` below the threshold.
 #[inline]
 fn par_dot(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
-    if a.len() >= LSMR_PAR_THRESHOLD {
-        a.par_chunks(LSMR_UPDATE_CHUNK)
-            .zip(b.par_chunks(LSMR_UPDATE_CHUNK))
-            .map(|(ac, bc)| ac.iter().zip(bc).map(|(x, y)| x * y).sum::<f64>())
-            .sum()
-    } else {
-        dot(a, b)
-    }
+    chunked_sum((a, b), |(ac, bc)| dot(ac, bc))
 }
 
 /// Why [`alpha_from_vp`] refused a pair.
