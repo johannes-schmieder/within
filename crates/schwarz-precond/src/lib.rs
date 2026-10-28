@@ -68,7 +68,6 @@ pub mod error;
 mod fold;
 mod local_solve;
 mod lsmr;
-mod prolongation;
 mod schwarz;
 
 pub use domain::{PartitionWeights, SubdomainCore};

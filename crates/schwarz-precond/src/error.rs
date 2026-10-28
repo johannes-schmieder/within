@@ -10,7 +10,7 @@
 //!   iterative-solver input validation.
 //!
 //! [`crate::error::LocalSolveError`] is the narrow trait contract returned by
-//! [`crate::LocalSolver::solve_local`]. The Schwarz executor lifts it into
+//! [`crate::LocalSolver::solve_local`]. The Schwarz apply lifts it into
 //! [`SolveError::LocalSolveFailed`] at the one apply site that knows the
 //! subdomain index, so there is no `From` chain between the two.
 

@@ -95,23 +95,37 @@ impl<S: LocalSolver> SubdomainEntry<S> {
         self.solver.scratch_size()
     }
 
-    /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; scratches are `scratch_size()` long.
+    /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; `scratch` must hold `scratch_size()`.
     pub(crate) fn apply_weighted_local(
         &self,
         r: &[f64],
         out: &mut [f64],
-        r_scratch: &mut [f64],
-        z_scratch: &mut [f64],
+        scratch: &mut LocalSolveScratch,
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
         if self.core.is_empty() {
             return Ok(());
         }
-        self.core.restrict_weighted(r, r_scratch);
-        self.solver
-            .solve_local(r_scratch, z_scratch, allow_inner_parallelism)?;
-        self.core.weight(z_scratch, out);
+        let LocalSolveScratch { rhs, sol } = scratch;
+        self.core.restrict_weighted(r, rhs);
+        self.solver.solve_local(rhs, sol, allow_inner_parallelism)?;
+        self.core.weight(sol, out);
         Ok(())
+    }
+}
+
+/// The local right-hand side and solution buffers of one [`LocalSolver::solve_local`] call.
+pub(crate) struct LocalSolveScratch {
+    rhs: Vec<f64>,
+    sol: Vec<f64>,
+}
+
+impl LocalSolveScratch {
+    pub(crate) fn new(scratch_size: usize) -> Self {
+        Self {
+            rhs: vec![0.0; scratch_size],
+            sol: vec![0.0; scratch_size],
+        }
     }
 }
 
@@ -224,11 +238,10 @@ mod tests {
 
         let r = vec![10.0, 20.0, 30.0, 40.0];
         let mut out = vec![0.0; 2];
-        let mut r_scratch = vec![0.0; 2];
-        let mut z_scratch = vec![0.0; 2];
+        let mut scratch = LocalSolveScratch::new(entry.scratch_size());
 
         entry
-            .apply_weighted_local(&r, &mut out, &mut r_scratch, &mut z_scratch, true)
+            .apply_weighted_local(&r, &mut out, &mut scratch, true)
             .expect("identity local solver should not fail");
 
         // Restricts DOFs [1, 2] → [20, 30] and solves with the identity.

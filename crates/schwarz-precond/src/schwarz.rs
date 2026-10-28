@@ -2,8 +2,7 @@
 //! [`Operator`](crate::Operator).
 
 mod buffers;
-mod executor;
-mod planning;
 mod preconditioner;
+mod prolongation;
 
 pub use preconditioner::SchwarzPreconditioner;

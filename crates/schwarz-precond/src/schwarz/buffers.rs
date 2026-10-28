@@ -1,4 +1,4 @@
-//! Scratch buffers for the additive Schwarz executor. [`WorkspacePool`] hands a [`Workspace`] to
+//! Scratch buffers for the additive Schwarz apply. [`WorkspacePool`] hands a [`Workspace`] to
 //! each apply and takes it back afterwards, so the steady state allocates nothing.
 
 use std::cell::RefCell;
@@ -7,26 +7,31 @@ use std::sync::{Arc, Mutex};
 use thread_local::ThreadLocal;
 
 use crate::error::SolveError;
-
-pub(super) struct LocalSolveScratch {
-    pub(super) r_scratch: Vec<f64>,
-    pub(super) z_scratch: Vec<f64>,
-}
-
-impl LocalSolveScratch {
-    #[inline]
-    pub(super) fn new(max_scratch_size: usize) -> Self {
-        Self {
-            r_scratch: vec![0.0f64; max_scratch_size],
-            z_scratch: vec![0.0f64; max_scratch_size],
-        }
-    }
-}
+use crate::local_solve::LocalSolveScratch;
 
 /// One apply's buffers: every subdomain's local output, plus per-worker local-solve scratch.
 pub(super) struct Workspace {
     pub(super) local_outputs: Vec<f64>,
-    pub(super) scratch: Vec<LocalSolveScratch>,
+    scratch: Vec<LocalSolveScratch>,
+}
+
+impl Workspace {
+    /// Runs `fill` on the local outputs with per-worker scratch, then reclaims the scratch.
+    pub(super) fn fill_local_outputs(
+        &mut self,
+        max_scratch_size: usize,
+        fill: impl FnOnce(&mut [f64], &WorkerBufferStack) -> Result<(), SolveError>,
+    ) -> Result<(), SolveError> {
+        let worker_scratch =
+            WorkerBufferStack::new(std::mem::take(&mut self.scratch), max_scratch_size);
+        let filled = fill(&mut self.local_outputs, &worker_scratch);
+        // A pool-recovery failure must not mask a real `LocalSolveFailed`.
+        match worker_scratch.into_pool() {
+            Ok(recovered) => self.scratch = recovered,
+            Err(into_err) => return filled.and(Err(into_err)),
+        }
+        filled
+    }
 }
 
 /// Every slot of `local_outputs` is rewritten each apply, so a failed apply leaves nothing stale.
