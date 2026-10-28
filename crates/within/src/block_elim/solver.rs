@@ -302,6 +302,11 @@ impl BlockElimSolver {
         // Every solve reads the transpose, so it is built here rather than inside the first.
         cross_tab.ct();
         debug_assert!(reduced_factor.spans_kept_block(cross_tab.n_cols()));
+        debug_assert!(
+            reduced_factor.grounding() != Some(Grounding::Floating)
+                || reduced_factor.solve_dimension() == cross_tab.n_cols(),
+            "a floating factor has no ground slots for its mean to read",
+        );
         let n_internal = cross_tab.n_local();
         let n_reduced = reduced_factor.solve_dimension();
         Self {
@@ -372,7 +377,6 @@ impl BlockElimSolver {
         scale_by_diag_in_place(&mut rhs[..n_elim], &self.inv_diag_elim);
 
         let (reduced, embed) = workspace.split_at_mut(self.n_reduced);
-        reduced[n_keep..].fill(0.0);
         self.cross_tab.ct().spmv_assign_add(
             &rhs[..n_elim],
             &rhs[n_elim..],

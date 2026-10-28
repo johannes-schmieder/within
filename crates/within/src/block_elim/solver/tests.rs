@@ -231,38 +231,48 @@ fn sampled_sparse_preserves_barely_pd_direction() {
     assert!((ax[1] + 1.0).abs() < 1e-6);
 }
 
-#[test]
-fn grounded_backend_auxiliary_is_initialized_on_every_solve() {
-    let large = 1e7;
-    let small = 1e-9;
-    let principal = CsrMatrix::new(
-        vec![0, 2, 4],
-        vec![0, 1, 0, 1],
-        vec![large, -large, -large, large + small],
-        2,
-    );
-    let explicit_ground_laplacian =
-        schur::build_explicit_laplacian(&principal, &[0.0, small], Grounding::Grounded);
+fn two_dof_sddm(diagonal: [f64; 2], off_diagonal: f64) -> CsrMatrix {
+    let data = vec![diagonal[0], off_diagonal, off_diagonal, diagonal[1]];
+    CsrMatrix::new(vec![0, 2, 4], vec![0, 1, 0, 1], data, 2)
+}
+
+fn explicit_ground_laplacian() -> CsrMatrix {
+    let (large, small) = (1e7, 1e-9);
+    let principal = two_dof_sddm([large, large + small], -large);
+    schur::build_explicit_laplacian(&principal, &[0.0, small], Grounding::Grounded)
+}
+
+#[rstest]
+// approx-chol declines to ground a surplus below its resolvable pivot scale.
+#[case::explicit_ground(explicit_ground_laplacian(), 3)]
+// A resolvable surplus makes approx-chol append a ground vertex of its own.
+#[case::backend_ground(two_dof_sddm([2.5, 2.5], -2.0), 2)]
+fn stale_ground_slots_past_the_kept_block_never_reach_the_solution(
+    #[case] reduced: CsrMatrix,
+    #[case] input_dimension: usize,
+    #[values(3.0, -7.0)] stale: f64,
+) {
     let config = ApproxCholConfig::default().to_approx_chol(
         DEFAULT_DENSE_SCHUR_THRESHOLD,
         ExactFailure::FallBackToApproximate,
     );
     let factor = ReducedFactor::Direct {
-        factor: factor_sparse(&explicit_ground_laplacian, config)
-            .expect("factorization must succeed"),
+        factor: factor_sparse(&reduced, config).expect("factorization must succeed"),
         grounding: Grounding::Grounded,
     };
-    assert_eq!(factor.input_dimension(), 3);
-    // approx-chol declines to ground a surplus below its resolvable pivot scale.
-    assert_eq!(factor.solve_dimension(), 3);
+    assert_eq!(
+        (factor.input_dimension(), factor.solve_dimension()),
+        (input_dimension, 3)
+    );
 
     let cross_tab = CrossTab::from_dense_for_test(&[0.0; 6], 3, 2);
     let solver = BlockElimSolver::new(cross_tab, vec![1.0; 3], factor, CoordinateMap::default());
 
     let r = [0.0, 0.0, 0.0, 1.0, -1.0];
-    let first = solver.solve_for_test(&r, 3.0);
-    let second = solver.solve_for_test(&r, -7.0);
-    assert_eq!(first, second);
+    assert_eq!(
+        solver.solve_for_test(&r, stale),
+        solver.solve_for_test(&r, 0.0)
+    );
 }
 
 /// Stars of ≤2 entries sample deterministically-exact, so all three arms share one oracle.
