@@ -1,5 +1,7 @@
 //! Thread-count independence: the same solve returns the same bits in any pool.
 
+use rstest::rstest;
+
 use super::super::*;
 use crate::fold::assert_pool_independent;
 use crate::lsmr::fixtures::DiagOp;
@@ -59,22 +61,28 @@ fn fingerprint(r: &LsmrResult) -> (Vec<u64>, usize, u64, u64, LsmrStopReason) {
     )
 }
 
-#[test]
-fn lsmr_returns_the_same_bits_at_any_thread_count() {
-    let op = Wrapped {
+/// `n` above `fold`'s sequential cutoff, so column-length reductions also run across threads.
+fn wrapped() -> Wrapped {
+    Wrapped {
         m: 300_000,
-        n: 60_000,
-    };
-    let b = spread(op.m, 1.0);
-    assert_pool_independent(|| fingerprint(&lsmr(&op, &b, 1e-14, 40, None).expect("lsmr")));
+        n: 80_000,
+    }
 }
 
-#[test]
-fn mlsmr_returns_the_same_bits_at_any_thread_count() {
-    let op = Wrapped {
-        m: 300_000,
-        n: 60_000,
-    };
+#[rstest]
+fn lsmr_returns_the_same_bits_at_any_thread_count(
+    #[values(None, Some(4))] local_size: Option<usize>,
+) {
+    let op = wrapped();
+    let b = spread(op.m, 1.0);
+    assert_pool_independent(|| fingerprint(&lsmr(&op, &b, 1e-14, 40, local_size).expect("lsmr")));
+}
+
+#[rstest]
+fn mlsmr_returns_the_same_bits_at_any_thread_count(
+    #[values(None, Some(4))] local_size: Option<usize>,
+) {
+    let op = wrapped();
     let b = spread(op.m, 1.0);
     // Entries over three decades, so `⟨v, M⁻¹p̃⟩` is not a rescaled norm.
     let m = DiagOp(
@@ -83,8 +91,11 @@ fn mlsmr_returns_the_same_bits_at_any_thread_count() {
             .map(|v| 10f64.powf(3.0 * (v + 0.5)))
             .collect(),
     );
+    let options = MlsmrOptions {
+        local_size,
+        ..MlsmrOptions::default()
+    };
     assert_pool_independent(|| {
-        let r = mlsmr(&op, &b, &m, 1e-14, 40, MlsmrOptions::default()).expect("mlsmr");
-        fingerprint(&r)
+        fingerprint(&mlsmr(&op, &b, &m, 1e-14, 40, options).expect("mlsmr"))
     });
 }
