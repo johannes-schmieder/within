@@ -48,11 +48,10 @@ impl<A: Split, B: Split> Split for (A, B) {
     }
 }
 
-/// `leaf` over `block_len` pieces in a length-fixed tree; subtrees ≤ `sequential_len` run serially.
+/// `leaf` over `block_len` pieces of `input`, combined in a tree fixed by the length alone.
 pub(crate) fn fold<P: Split, T: Send>(
     input: P,
     block_len: usize,
-    sequential_len: usize,
     leaf: &(impl Fn(P) -> T + Sync),
     combine: &(impl Fn(T, T) -> T + Sync),
 ) -> T {
@@ -62,19 +61,22 @@ pub(crate) fn fold<P: Split, T: Send>(
         return leaf(input);
     }
     let (left, right) = input.split_at(pieces / 2 * block_len);
-    let (l, r) = if n > sequential_len {
+    let (l, r) = if n > SEQUENTIAL_ITEMS {
         rayon::join(
-            || fold(left, block_len, sequential_len, leaf, combine),
-            || fold(right, block_len, sequential_len, leaf, combine),
+            || fold(left, block_len, leaf, combine),
+            || fold(right, block_len, leaf, combine),
         )
     } else {
         (
-            fold(left, block_len, sequential_len, leaf, combine),
-            fold(right, block_len, sequential_len, leaf, combine),
+            fold(left, block_len, leaf, combine),
+            fold(right, block_len, leaf, combine),
         )
     };
     combine(l, r)
 }
+
+/// Subtrees this small run on the calling thread: a `join` per piece costs more than it spreads.
+const SEQUENTIAL_ITEMS: usize = 1 << 16;
 
 /// Asserts `f` returns the same value in pools of 1, 2, 3 and 8 threads.
 #[cfg(test)]
@@ -108,7 +110,7 @@ mod tests {
     #[case(43)]
     #[case(1_000)]
     fn leaves_cover_the_input_once_in_order(#[case] n: usize) {
-        let leaves = fold(0..n, 8, 0, &|r: Range<usize>| vec![r], &|mut a, b| {
+        let leaves = fold(0..n, 8, &|r: Range<usize>| vec![r], &|mut a, b| {
             a.extend(b);
             a
         });
@@ -129,7 +131,6 @@ mod tests {
             fold(
                 x.as_slice(),
                 64,
-                0,
                 &|c: &[f64]| c.iter().sum::<f64>(),
                 &|a, b| a + b,
             )

@@ -21,8 +21,6 @@ use rayon::prelude::{ParallelSlice, ParallelSliceMut};
 pub(super) const LSMR_PAR_THRESHOLD: usize = 10_000;
 /// Per-worker chunk size: large enough to clear rayon dispatch, small enough to stay L1-resident.
 pub(super) const LSMR_UPDATE_CHUNK: usize = 4096;
-/// Reductions this short stay on one thread: a `join` per chunk cost 4–6% per iteration at 10M.
-const LSMR_SEQUENTIAL_SUM: usize = 1 << 16;
 
 /// Fused `y = x + scale · y` returning `‖y_new‖`; per-chunk partials avoid reduction traffic.
 #[inline]
@@ -57,13 +55,7 @@ const LANES: usize = 8;
 /// `Σ leaf` over `LSMR_UPDATE_CHUNK` pieces in a tree fixed by the length.
 #[inline]
 fn chunked_sum<P: Split>(input: P, leaf: impl Fn(P) -> f64 + Sync) -> f64 {
-    fold(
-        input,
-        LSMR_UPDATE_CHUNK,
-        LSMR_SEQUENTIAL_SUM,
-        &leaf,
-        &|a, b| a + b,
-    )
+    fold(input, LSMR_UPDATE_CHUNK, &leaf, &|a, b| a + b)
 }
 
 /// `y = alpha * x + beta * y`. Parallel above the threshold.
