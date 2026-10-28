@@ -1,6 +1,5 @@
 //! Additive Schwarz preconditioner `M⁻¹ = Σ Rᵢᵀ D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ` as an
-//! [`Operator`](crate::Operator). Per-subdomain reduction strategy (atomic
-//! scatter vs parallel reduction) is selected by [`ReductionStrategy`].
+//! [`Operator`](crate::Operator).
 
 mod buffers;
 mod executor;

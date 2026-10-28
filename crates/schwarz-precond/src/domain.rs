@@ -169,6 +169,19 @@ impl SubdomainCore {
         }
     }
 
+    /// Weighting in local coordinates: `out[i] = w[i] * local[i]`
+    #[inline]
+    pub(crate) fn weight(&self, local: &[f64], out: &mut [f64]) {
+        match &self.partition_weights {
+            PartitionWeights::Uniform(_) => out.copy_from_slice(&local[..out.len()]),
+            PartitionWeights::NonUniform(w) => {
+                for ((o, &li), &wi) in out.iter_mut().zip(local).zip(w) {
+                    *o = li * wi;
+                }
+            }
+        }
+    }
+
     /// Weighted scatter into atomic accumulator: `global[idx[i]] += w[i] * local[i]`
     #[inline]
     pub fn prolongate_weighted_add_atomic(&self, local: &[f64], global: &[AtomicU64]) {
