@@ -1,19 +1,6 @@
 //! Whether local solves may use nested Rayon parallelism, from build-time work estimates and the
 //! current Rayon width.
 
-/// Ignored: every apply sums each DOF's subdomain outputs in subdomain order.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum ReductionStrategy {
-    /// Ignored.
-    #[default]
-    Auto,
-    /// Ignored.
-    AtomicScatter,
-    /// Ignored.
-    ParallelReduction,
-}
-
 /// Build-time inner-parallelism work estimates.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AdditiveScheduler {

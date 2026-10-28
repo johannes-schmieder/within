@@ -6,5 +6,4 @@ mod executor;
 mod planning;
 mod preconditioner;
 
-pub use planning::ReductionStrategy;
 pub use preconditioner::SchwarzPreconditioner;

@@ -23,7 +23,7 @@ cargo add schwarz-precond
 
 ```rust
 use schwarz_precond::{
-    mlsmr, LocalSolver, MlsmrOptions, Operator, ReductionStrategy, SchwarzPreconditioner,
+    mlsmr, LocalSolver, MlsmrOptions, Operator, SchwarzPreconditioner,
     SolveError, SubdomainCore, SubdomainEntry,
 };
 
@@ -79,7 +79,7 @@ fn main() {
         })
         .collect();
 
-    let precond = SchwarzPreconditioner::new(entries, ReductionStrategy::default());
+    let precond = SchwarzPreconditioner::new(entries);
     let result = mlsmr(&a, &b, &precond, 1e-10, 500, MlsmrOptions::default())
         .expect("lsmr should converge");
 

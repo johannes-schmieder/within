@@ -6,8 +6,8 @@
 use faer::{MatRef, Side};
 
 use schwarz_precond::{
-    mlsmr, LocalSolveError, LocalSolver, MlsmrOptions, Operator, ReductionStrategy,
-    SchwarzPreconditioner, SolveError, SubdomainCore, SubdomainEntry,
+    mlsmr, LocalSolveError, LocalSolver, MlsmrOptions, Operator, SchwarzPreconditioner, SolveError,
+    SubdomainCore, SubdomainEntry,
 };
 // ---------------------------------------------------------------------------
 // Tridiagonal operator
@@ -173,7 +173,7 @@ fn main() {
     let rhs = vec![1.0; n];
     let a = TridiagOperator { n };
 
-    let precond = SchwarzPreconditioner::new(build_entries(n), ReductionStrategy::default());
+    let precond = SchwarzPreconditioner::new(build_entries(n));
     let options = MlsmrOptions::default();
     let result = mlsmr(&a, &rhs, &precond, 1e-10, 200, options).expect("preconditioned lsmr");
     println!(

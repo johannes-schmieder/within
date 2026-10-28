@@ -13,7 +13,7 @@ use crate::csr_block::CsrBlock;
 use crate::domain::{build_local_domains, LocalDomain, PreparedDesign};
 use crate::domain::{CrossTab, LocalComponent};
 use crate::operator::schwarz::{build_additive, SchwarzConfig};
-use schwarz_precond::{LocalSolver, Operator, ReductionStrategy};
+use schwarz_precond::{LocalSolver, Operator};
 
 const BLOCK_ELIM_NESTED_RAYON_CHILD_ENV: &str = "WITHIN_TEST_BLOCK_ELIM_NESTED_RAYON_CHILD";
 
@@ -117,7 +117,6 @@ fn run_block_elim_nested_rayon_case() {
         domain_pairs,
         &SchwarzConfig {
             local_solver: config,
-            reduction: ReductionStrategy::default(),
         },
         n_dofs,
     )
@@ -192,7 +191,6 @@ fn test_build_additive() {
     let (design, domain_pairs) = make_test_data();
     let config = SchwarzConfig {
         local_solver: LocalSolverConfig::default(),
-        reduction: ReductionStrategy::default(),
     };
     let schwarz = build_additive(domain_pairs, &config, design.design.n_dofs)
         .expect("build schwarz with explicit domains");

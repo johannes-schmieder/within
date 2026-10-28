@@ -4,8 +4,8 @@
 //! subdomains and diagonal local solvers.
 
 use schwarz_precond::{
-    lsmr, mlsmr, LocalSolveError, LocalSolver, MlsmrOptions, Operator, ReductionStrategy,
-    SchwarzPreconditioner, SolveError, SubdomainCore, SubdomainEntry,
+    lsmr, mlsmr, LocalSolveError, LocalSolver, MlsmrOptions, Operator, SchwarzPreconditioner,
+    SolveError, SubdomainCore, SubdomainEntry,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ fn main() {
     );
 
     // --- Additive Schwarz preconditioned LSMR ---
-    let precond = SchwarzPreconditioner::new(build_entries(n), ReductionStrategy::default());
+    let precond = SchwarzPreconditioner::new(build_entries(n));
     let options = MlsmrOptions::default();
     let result_schwarz =
         mlsmr(&a, &rhs, &precond, 1e-10, 200, options).expect("preconditioned lsmr");

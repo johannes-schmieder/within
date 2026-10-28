@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use rstest::{fixture, rstest};
 use schwarz_precond::{
     lsmr, mlsmr, LocalSolveError, LocalSolver, MlsmrOptions, Operator, PartitionWeights,
-    ReductionStrategy, SchwarzPreconditioner, SubdomainCore, SubdomainEntry,
+    SchwarzPreconditioner, SubdomainCore, SubdomainEntry,
 };
 
 use common::{make_schwarz_entries, FailingLocalSolver, TridiagOperator, UniformDiagLocalSolver};
@@ -93,10 +93,7 @@ fn run_nested_rayon_regression_case() {
         .build()
         .expect("test rayon pool");
     pool.install(|| {
-        let schwarz = SchwarzPreconditioner::new(
-            make_nested_parallel_entries(n),
-            ReductionStrategy::ParallelReduction,
-        );
+        let schwarz = SchwarzPreconditioner::new(make_nested_parallel_entries(n));
 
         for _ in 0..8 {
             let mut z = vec![0.0; n];
@@ -151,9 +148,17 @@ fn test_nested_rayon_does_not_deadlock() {
         thread::sleep(Duration::from_millis(25));
     }
 }
-#[test]
-fn test_additive_schwarz_reduces_iterations() {
-    let n = 20;
+/// Additive Schwarz over `make_schwarz_entries(n)`, 20 DOFs unless `#[with(n)]` says otherwise.
+#[fixture]
+fn schwarz(#[default(20)] n: usize) -> SchwarzPreconditioner<UniformDiagLocalSolver> {
+    SchwarzPreconditioner::new(make_schwarz_entries(n))
+}
+
+#[rstest]
+fn test_additive_schwarz_reduces_iterations(
+    schwarz: SchwarzPreconditioner<UniformDiagLocalSolver>,
+) {
+    let n = schwarz.nrows();
     let a = TridiagOperator::new(n, 3.0);
     let rhs = vec![1.0; n];
 
@@ -163,7 +168,6 @@ fn test_additive_schwarz_reduces_iterations() {
         "Unpreconditioned LSMR did not converge"
     );
 
-    let schwarz = SchwarzPreconditioner::new(make_schwarz_entries(n), ReductionStrategy::default());
     let options = MlsmrOptions::default();
     let precond = mlsmr(&a, &rhs, &schwarz, 1e-8, 200, options).expect("preconditioned lsmr");
     assert!(precond.converged, "Preconditioned LSMR did not converge");
@@ -176,11 +180,11 @@ fn test_additive_schwarz_reduces_iterations() {
     );
 }
 
-#[test]
-fn test_clone_produces_independent_preconditioner() {
-    let n = 20;
-    let original =
-        SchwarzPreconditioner::new(make_schwarz_entries(n), ReductionStrategy::default());
+#[rstest]
+fn test_clone_produces_independent_preconditioner(
+    #[from(schwarz)] original: SchwarzPreconditioner<UniformDiagLocalSolver>,
+) {
+    let n = original.nrows();
     let cloned = original.clone();
 
     // Apply on different inputs and verify both produce correct results.
@@ -223,11 +227,11 @@ fn test_clone_produces_independent_preconditioner() {
     }
 }
 
-#[test]
-fn test_additive_schwarz_operator_dimensions() {
+#[rstest]
+fn test_additive_schwarz_operator_dimensions(
+    #[with(10)] schwarz: SchwarzPreconditioner<UniformDiagLocalSolver>,
+) {
     let n = 10;
-    let schwarz = SchwarzPreconditioner::new(make_schwarz_entries(n), ReductionStrategy::default());
-
     assert_eq!(schwarz.nrows(), n);
     assert_eq!(schwarz.ncols(), n);
 
@@ -253,7 +257,7 @@ fn test_additive_schwarz_operator_dimensions() {
 #[test]
 fn test_additive_schwarz_parallel_apply_stress_no_panics() {
     let n = 64;
-    let schwarz = SchwarzPreconditioner::new(make_schwarz_entries(n), ReductionStrategy::default());
+    let schwarz = SchwarzPreconditioner::new(make_schwarz_entries(n));
 
     let rhs_columns: Vec<Vec<f64>> = (0..128)
         .map(|k| {
@@ -339,7 +343,7 @@ fn test_additive_apply_is_the_subdomain_order_sum_at_any_thread_count(
     subdomain_order_sum: Vec<f64>,
     #[values(1, 2, 3, 8)] threads: usize,
 ) {
-    let schwarz = SchwarzPreconditioner::new(deep_overlap_entries, ReductionStrategy::default());
+    let schwarz = SchwarzPreconditioner::new(deep_overlap_entries);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
@@ -367,7 +371,7 @@ fn test_additive_schwarz_subdomains_accessor() {
     let n = 10;
     let entries = make_schwarz_entries(n);
     let expected_len = entries.len();
-    let schwarz = SchwarzPreconditioner::new(entries, ReductionStrategy::default());
+    let schwarz = SchwarzPreconditioner::new(entries);
     assert_eq!(schwarz.subdomains().len(), expected_len);
 }
 
@@ -379,7 +383,7 @@ fn test_additive_schwarz_apply_subdomain_empty_indices() {
     let solver = common::UniformDiagLocalSolver::new(0, 1.0);
     let core = SubdomainCore::uniform(vec![]);
     let entry = make_entry(core, solver);
-    let schwarz = SchwarzPreconditioner::new(vec![entry], ReductionStrategy::default());
+    let schwarz = SchwarzPreconditioner::new(vec![entry]);
     assert_eq!(schwarz.nrows(), 0);
 
     let r: Vec<f64> = vec![];
@@ -559,7 +563,7 @@ fn test_additive_schwarz_parallel_readout_large_n() {
         ));
     }
 
-    let schwarz = SchwarzPreconditioner::new(entries, ReductionStrategy::default());
+    let schwarz = SchwarzPreconditioner::new(entries);
     assert_eq!(schwarz.nrows(), n);
 
     let rhs = vec![4.0; n];
@@ -588,7 +592,7 @@ fn test_additive_schwarz_apply_returns_err_on_solver_failure() {
     let core = SubdomainCore::uniform(vec![0u32, 1]);
     let entry = make_entry(core, solver);
 
-    let schwarz = SchwarzPreconditioner::new(vec![entry], ReductionStrategy::default());
+    let schwarz = SchwarzPreconditioner::new(vec![entry]);
 
     let n = schwarz.nrows();
     let rhs = vec![1.0; n];
@@ -619,7 +623,7 @@ fn with_n_dofs_pads_uncovered_tail_and_applies_zero() {
         UniformDiagLocalSolver::new(2, 2.0),
     )];
     let n_dofs = 4;
-    let padded = SchwarzPreconditioner::with_n_dofs(entries, n_dofs, ReductionStrategy::default());
+    let padded = SchwarzPreconditioner::with_n_dofs(entries, n_dofs);
     assert_eq!((padded.nrows(), padded.ncols()), (n_dofs, n_dofs));
 
     let rhs = vec![4.0; n_dofs];

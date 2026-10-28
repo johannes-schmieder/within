@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::block_elim::BlockElimSolver;
-use crate::config::{LocalSolverConfig, PreconditionerConfig, ReductionStrategy, Staleness};
+use crate::config::{LocalSolverConfig, PreconditionerConfig, Staleness};
 use crate::domain::{LocalDomain, PreparedDesign};
 use crate::{BuildError, BuildWarning};
 
@@ -19,7 +19,6 @@ mod tests;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SchwarzConfig {
     pub(crate) local_solver: LocalSolverConfig,
-    pub(crate) reduction: ReductionStrategy,
 }
 
 /// Concrete additive Schwarz type used in the parent crate.
@@ -107,7 +106,7 @@ pub(crate) fn build_additive(
         .map(|domain| build_entry(domain, &config.local_solver))
         .collect::<Result<Vec<_>, BuildError>>()?;
     Ok(FeSchwarz {
-        inner: SchwarzPreconditioner::with_n_dofs(entries, n_dofs, config.reduction),
+        inner: SchwarzPreconditioner::with_n_dofs(entries, n_dofs),
         config: config.clone(),
     })
 }
@@ -179,12 +178,10 @@ impl Preconditioner {
         match &self.inner {
             Variant::Additive(p) => PreconditionerConfig::Additive {
                 local_solver: p.config.local_solver.clone(),
-                reduction: p.config.reduction,
             },
             Variant::Diagonal(_) => PreconditionerConfig::Diagonal,
             Variant::Adaptive(ladder) => PreconditionerConfig::Adaptive {
                 local_solver: ladder.escalated.local_solver.clone(),
-                reduction: ladder.escalated.reduction,
                 stall: ladder.stall,
             },
         }

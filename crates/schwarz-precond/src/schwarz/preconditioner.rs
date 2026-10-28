@@ -15,7 +15,7 @@ use crate::local_solve::{LocalSolver, SubdomainEntry};
 use crate::Operator;
 
 use super::executor::AdditiveExecutor;
-use super::planning::{AdditiveScheduler, ReductionStrategy};
+use super::planning::AdditiveScheduler;
 
 /// Persists `n_dofs`, which entries alone cannot recover when some columns are uncovered.
 #[cfg(feature = "serde")]
@@ -25,10 +25,9 @@ where
 {
     fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("SchwarzPreconditioner", 3)?;
+        let mut state = serializer.serialize_struct("SchwarzPreconditioner", 2)?;
         state.serialize_field("subdomains", self.executor.subdomains())?;
         state.serialize_field("n_dofs", &self.executor.n_dofs())?;
-        state.serialize_field("reduction_strategy", &self.reduction_strategy)?;
         state.end()
     }
 }
@@ -46,7 +45,6 @@ where
         struct Helper<S: LocalSolver> {
             subdomains: Vec<SubdomainEntry<S>>,
             n_dofs: usize,
-            reduction_strategy: ReductionStrategy,
         }
 
         let h: Helper<S> = Helper::deserialize(deserializer)?;
@@ -63,42 +61,29 @@ where
                 h.n_dofs
             )));
         }
-        Ok(SchwarzPreconditioner::with_n_dofs(
-            h.subdomains,
-            h.n_dofs,
-            h.reduction_strategy,
-        ))
+        Ok(SchwarzPreconditioner::with_n_dofs(h.subdomains, h.n_dofs))
     }
 }
 
 /// One-level additive Schwarz preconditioner; pooled per-thread buffers make `apply()` safe.
 pub struct SchwarzPreconditioner<S: LocalSolver> {
-    reduction_strategy: ReductionStrategy,
     scheduler: AdditiveScheduler,
     executor: AdditiveExecutor<S>,
 }
 
 impl<S: LocalSolver> SchwarzPreconditioner<S> {
     /// Infers `n_dofs` from the maximum global index; only valid when every DOF is covered.
-    pub fn new(entries: Vec<SubdomainEntry<S>>, strategy: ReductionStrategy) -> Self {
-        Self::build(entries, None, strategy)
+    pub fn new(entries: Vec<SubdomainEntry<S>>) -> Self {
+        Self::build(entries, None)
     }
 
     /// Explicit global DOF count; an uncovered column stays in the null space and applies to `0`.
-    pub fn with_n_dofs(
-        entries: Vec<SubdomainEntry<S>>,
-        n_dofs: usize,
-        strategy: ReductionStrategy,
-    ) -> Self {
-        Self::build(entries, Some(n_dofs), strategy)
+    pub fn with_n_dofs(entries: Vec<SubdomainEntry<S>>, n_dofs: usize) -> Self {
+        Self::build(entries, Some(n_dofs))
     }
 
     /// One pass over `entries` derives `max_scratch_size`, the metrics, and the covered span.
-    fn build(
-        entries: Vec<SubdomainEntry<S>>,
-        n_dofs: Option<usize>,
-        strategy: ReductionStrategy,
-    ) -> Self {
+    fn build(entries: Vec<SubdomainEntry<S>>, n_dofs: Option<usize>) -> Self {
         let mut max_scratch_size: usize = 0;
         let mut total_inner_parallel_work: usize = 0;
         let mut max_inner_parallel_work: usize = 0;
@@ -126,7 +111,6 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
             max_inner_parallel_work,
         };
         Self {
-            reduction_strategy: strategy,
             scheduler,
             executor,
         }
@@ -135,11 +119,6 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
     /// Access the underlying subdomain entries.
     pub fn subdomains(&self) -> &[SubdomainEntry<S>] {
         self.executor.subdomains()
-    }
-
-    /// The configured strategy, which `apply` ignores.
-    pub fn reduction_strategy(&self) -> ReductionStrategy {
-        self.reduction_strategy
     }
 
     /// Operator apply that propagates local-solver failures.
@@ -167,7 +146,6 @@ impl<S: LocalSolver> Clone for SchwarzPreconditioner<S> {
     /// Clone shares subdomain data and the buffer pool via `Arc`: O(1) and fully interchangeable.
     fn clone(&self) -> Self {
         Self {
-            reduction_strategy: self.reduction_strategy,
             scheduler: self.scheduler,
             executor: self.executor.clone(),
         }

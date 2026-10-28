@@ -38,29 +38,17 @@ impl PrecondSlot {
                 map: Some(build_diagonal(prepared)?),
                 warnings: Vec::new(),
             },
-            PreconditionerConfig::Additive {
-                local_solver,
-                reduction,
-            } => {
-                let schwarz = SchwarzConfig {
-                    local_solver,
-                    reduction,
-                };
-                let (map, warnings) = build_schwarz(prepared, &schwarz)?;
+            PreconditionerConfig::Additive { local_solver } => {
+                let (map, warnings) = build_schwarz(prepared, &SchwarzConfig { local_solver })?;
                 Self::Static { map, warnings }
             }
             PreconditionerConfig::Adaptive {
                 local_solver,
-                reduction,
                 stall,
             } => {
                 // Fail before the diagonal pass; `reuse` repeats this for a deserialized ladder.
                 local_solver.validate()?;
-                let escalated = SchwarzConfig {
-                    local_solver,
-                    reduction,
-                };
-                let base = build_adaptive(prepared, stall, escalated)?;
+                let base = build_adaptive(prepared, stall, SchwarzConfig { local_solver })?;
                 Self::reuse(prepared, base)?
             }
         })
