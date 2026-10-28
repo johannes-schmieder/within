@@ -17,64 +17,73 @@ pub(crate) fn gather_apply(
     debug_assert_eq!(src.len(), design.n_dofs);
     debug_assert_eq!(dst.len(), design.n_obs);
 
-    dst.fill(0.0);
-
-    let frame = &design.frame;
     for_each_chunk(dst, |chunk, row_start| {
-        for (q, t) in design.terms.iter().enumerate() {
-            let (offset, n_levels) = (t.offset, t.n_levels);
-            let levels = frame.level_column(q);
-            let col = |c: usize| &src[offset + c * n_levels..offset + (c + 1) * n_levels];
-            match &*t.columns {
-                [Loading::Constant] => gather_term(chunk, row_start, levels, [col(0)], |_| [1.0]),
-                [Loading::Constant, Loading::Covariate(c0)] => {
-                    let z0 = frame.loading_column(*c0 as usize);
-                    gather_term(chunk, row_start, levels, [col(0), col(1)], |i| [1.0, z0[i]])
-                }
-                [Loading::Constant, Loading::Covariate(c0), Loading::Covariate(c1)] => {
-                    let z0 = frame.loading_column(*c0 as usize);
-                    let z1 = frame.loading_column(*c1 as usize);
-                    gather_term(chunk, row_start, levels, [col(0), col(1), col(2)], |i| {
-                        [1.0, z0[i], z1[i]]
-                    })
-                }
-                [Loading::Covariate(c0), Loading::Covariate(c1)] => {
-                    let z0 = frame.loading_column(*c0 as usize);
-                    let z1 = frame.loading_column(*c1 as usize);
-                    gather_term(chunk, row_start, levels, [col(0), col(1)], |i| {
-                        [z0[i], z1[i]]
-                    })
-                }
-                [Loading::Covariate(c0)] => {
-                    let z0 = frame.loading_column(*c0 as usize);
-                    gather_term(chunk, row_start, levels, [col(0)], |i| [z0[i]])
-                }
-                columns => {
-                    // A dynamic column count cannot monomorphize a fixed arity.
-                    for (local, dst_val) in chunk.iter_mut().enumerate() {
-                        let i = row_start + local;
-                        let lev = levels[i] as usize;
-                        let mut acc = 0.0;
-                        for (c, loading) in columns.iter().enumerate() {
-                            let coef = src[offset + c * n_levels + lev];
-                            acc += match loading {
-                                Loading::Constant => coef,
-                                Loading::Covariate(k) => {
-                                    coef * frame.loading_column(*k as usize)[i]
-                                }
-                            };
-                        }
-                        *dst_val += acc;
-                    }
-                }
-            }
-        }
-        if let Some(scale) = scale {
-            for (s, dst_val) in scale[row_start..].iter().zip(chunk.iter_mut()) {
-                *dst_val *= s;
-            }
-        }
+        gather_rows(design, src, chunk, row_start, scale)
     });
+}
+
+/// `chunk[k]` = row `row_start + k` of the gather, overwriting `chunk`; the
+/// per-row arithmetic of [`gather_apply`], shared with the fused LSMR step.
+pub(crate) fn gather_rows(
+    design: &Design<'_>,
+    src: &[f64],
+    chunk: &mut [f64],
+    row_start: usize,
+    scale: Option<&[f64]>,
+) {
+    chunk.fill(0.0);
+    let frame = &design.frame;
+    for (q, t) in design.terms.iter().enumerate() {
+        let (offset, n_levels) = (t.offset, t.n_levels);
+        let levels = frame.level_column(q);
+        let col = |c: usize| &src[offset + c * n_levels..offset + (c + 1) * n_levels];
+        match &*t.columns {
+            [Loading::Constant] => gather_term(chunk, row_start, levels, [col(0)], |_| [1.0]),
+            [Loading::Constant, Loading::Covariate(c0)] => {
+                let z0 = frame.loading_column(*c0 as usize);
+                gather_term(chunk, row_start, levels, [col(0), col(1)], |i| [1.0, z0[i]])
+            }
+            [Loading::Constant, Loading::Covariate(c0), Loading::Covariate(c1)] => {
+                let z0 = frame.loading_column(*c0 as usize);
+                let z1 = frame.loading_column(*c1 as usize);
+                gather_term(chunk, row_start, levels, [col(0), col(1), col(2)], |i| {
+                    [1.0, z0[i], z1[i]]
+                })
+            }
+            [Loading::Covariate(c0), Loading::Covariate(c1)] => {
+                let z0 = frame.loading_column(*c0 as usize);
+                let z1 = frame.loading_column(*c1 as usize);
+                gather_term(chunk, row_start, levels, [col(0), col(1)], |i| {
+                    [z0[i], z1[i]]
+                })
+            }
+            [Loading::Covariate(c0)] => {
+                let z0 = frame.loading_column(*c0 as usize);
+                gather_term(chunk, row_start, levels, [col(0)], |i| [z0[i]])
+            }
+            columns => {
+                // A dynamic column count cannot monomorphize a fixed arity.
+                for (local, dst_val) in chunk.iter_mut().enumerate() {
+                    let i = row_start + local;
+                    let lev = levels[i] as usize;
+                    let mut acc = 0.0;
+                    for (c, loading) in columns.iter().enumerate() {
+                        let coef = src[offset + c * n_levels + lev];
+                        acc += match loading {
+                            Loading::Constant => coef,
+                            Loading::Covariate(k) => coef * frame.loading_column(*k as usize)[i],
+                        };
+                    }
+                    *dst_val += acc;
+                }
+            }
+        }
+    }
+    if let Some(scale) = scale {
+        for (s, dst_val) in scale[row_start..].iter().zip(chunk.iter_mut()) {
+            *dst_val *= s;
+        }
+    }
 }
 
 /// Sweep `dst` in cache-sized chunks, parallel above [`PAR_THRESHOLD`] rows.

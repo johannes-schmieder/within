@@ -16,7 +16,7 @@ use crate::domain::level_moments::TermMoments;
 use crate::domain::{Design, Effect};
 use crate::observation::ObservationFrame;
 use crate::operator::design::gather_apply;
-use crate::operator::design::StableAdjoint;
+use crate::operator::design::{FusedPlan, StableAdjoint};
 use crate::operator::schwarz::{build_preconditioner, Preconditioner};
 use crate::operator::DesignOperator;
 use crate::{BuildError, BuildWarning, SolveError, WithinError};
@@ -315,6 +315,10 @@ pub struct Solver<'a> {
     sqrt_weights: Option<Vec<f64>>,
     preconditioner: Option<Preconditioner>,
     stable_adjoint: Option<StableAdjoint>,
+    /// Ownership index of the fused plan's separate terms, absent when
+    /// `stable_adjoint` already indexes every term.
+    owners: Option<StableAdjoint>,
+    kernel: StepKernel,
     reparam: Option<SlopeReparam>,
     warnings: Vec<BuildWarning>,
 }
@@ -345,6 +349,19 @@ struct RhsSolution {
     time_solve: f64,
 }
 
+/// How each modified-LSMR step applies the design operator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StepKernel {
+    /// One pass over the observations per step computes `A v`, the update of
+    /// `u`, its norm and `Aᵀ u`; every adjoint sums in a fixed order that does
+    /// not depend on the worker count, without atomics.
+    #[default]
+    Fused,
+    /// Separate gather, update/norm and per-term scatter passes, as in 0.4.
+    /// Default-mode adjoints use atomic or work-stealing reductions.
+    Separate,
+}
+
 /// Optional diagnostic screening of raw slope covariates against other terms.
 /// This policy never changes whitening rank tolerance or coefficient recovery.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -355,6 +372,12 @@ pub enum SlopeScreening {
     /// Skip cross-term diagnostics and build whitening moments one term at a time.
     /// This retains the earlier constructor's warnings and temporary storage scope.
     Disabled,
+}
+
+/// Ownership index for the terms the fused plan cannot lane-accumulate.
+fn fused_owners(design: &Design<'_>) -> Result<StableAdjoint, BuildError> {
+    let plan = FusedPlan::new(design);
+    StableAdjoint::for_terms(design, |q| plan.is_separate(q))
 }
 
 impl<'a> Solver<'a> {
@@ -449,15 +472,54 @@ impl<'a> Solver<'a> {
             w
         });
 
+        let owners = Some(fused_owners(&design)?);
         Ok(Self {
             design,
             replacement_source: std::sync::OnceLock::new(),
             sqrt_weights,
             preconditioner,
             stable_adjoint: None,
+            owners,
+            kernel: StepKernel::Fused,
             reparam,
             warnings,
         })
+    }
+
+    /// Select the LSMR step kernel; [`StepKernel::Fused`] is the default.
+    pub fn with_step_kernel(mut self, kernel: StepKernel) -> Result<Self, BuildError> {
+        self.kernel = kernel;
+        self.owners = match kernel {
+            StepKernel::Fused if self.stable_adjoint.is_none() => Some(fused_owners(&self.design)?),
+            _ => None,
+        };
+        Ok(self)
+    }
+
+    /// The LSMR step kernel in use.
+    pub fn step_kernel(&self) -> StepKernel {
+        self.kernel
+    }
+
+    /// The design operator for one solve or action.
+    pub(crate) fn design_operator(&self) -> DesignOperator<'_> {
+        let sqrt_weights = self.sqrt_weights.as_deref();
+        match (
+            self.kernel,
+            self.stable_adjoint.as_ref().or(self.owners.as_ref()),
+        ) {
+            (StepKernel::Fused, Some(owners)) => DesignOperator::fused(
+                &self.design,
+                sqrt_weights,
+                FusedPlan::new(&self.design),
+                owners,
+            ),
+            _ => DesignOperator::with_stable(
+                &self.design,
+                sqrt_weights,
+                self.stable_adjoint.as_ref(),
+            ),
+        }
     }
 
     /// Fix adjoint and Schwarz accumulation order independently of task completion.
@@ -465,6 +527,7 @@ impl<'a> Solver<'a> {
     pub fn with_reproducible(mut self) -> Result<Self, BuildError> {
         if self.stable_adjoint.is_none() {
             self.stable_adjoint = Some(StableAdjoint::new(&self.design)?);
+            self.owners = None;
             self.preconditioner = self.preconditioner.map(Preconditioner::into_reproducible);
         }
         Ok(self)
@@ -510,14 +573,7 @@ impl<'a> Solver<'a> {
         let y_internal = self.design.permute_obs_in(y);
         let y: &[f64] = &y_internal;
 
-        let rect_op = match self.stable_adjoint.as_ref() {
-            Some(stable) => DesignOperator::with_stable(
-                &self.design,
-                self.sqrt_weights.as_deref(),
-                Some(stable),
-            ),
-            None => DesignOperator::new(&self.design, self.sqrt_weights.as_deref()),
-        };
+        let rect_op = self.design_operator();
         let b = rect_op.weighted_rhs(y);
         let b: &[f64] = &b;
 

@@ -1,15 +1,18 @@
 use std::borrow::Cow;
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use portable_atomic::AtomicF64;
 use schwarz_precond::Operator;
 
 use crate::domain::Design;
 
+mod fused;
 mod gather;
 mod scatter;
 mod stable;
+pub(crate) use fused::FusedPlan;
 pub(crate) use stable::StableAdjoint;
 
 #[cfg(test)]
@@ -21,6 +24,14 @@ use scatter::scatter_apply;
 /// Minimum number of rows before scatter/gather loops are parallelized.
 const PAR_THRESHOLD: usize = 10_000;
 
+/// Fused-step state: the lane plan and its reusable lane buffers.
+struct Fused<'a> {
+    plan: FusedPlan,
+    /// Ownership index for the plan's separate terms.
+    owners: &'a StableAdjoint,
+    buffers: Mutex<Vec<f64>>,
+}
+
 /// Design operator `D` or `W^{1/2} D`, whose normal equations `AᵀA = DᵀWD` recover the Gramian.
 pub(crate) struct DesignOperator<'a> {
     design: &'a Design<'a>,
@@ -28,13 +39,17 @@ pub(crate) struct DesignOperator<'a> {
     /// Sized once to the largest term's block, so it allocates per operator, not per iteration.
     scatter_scratch: Vec<AtomicF64>,
     stable: Option<&'a StableAdjoint>,
+    /// Fused kernel: one-pass steps and lane-ordered adjoints, without atomics.
+    fused: Option<Fused<'a>>,
     /// Debug-only reentry sentinel: a concurrent `apply_adjoint` would race the scratch writes.
     #[cfg(debug_assertions)]
     adjoint_active: AtomicBool,
 }
 
 impl<'a> DesignOperator<'a> {
-    /// `sqrt_weights` must be pre-square-rooted and `design.n_obs` long.
+    /// The separate kernel without an ownership index; `sqrt_weights` must be
+    /// pre-square-rooted and `design.n_obs` long.
+    #[cfg(test)]
     pub(crate) fn new(design: &'a Design<'a>, sqrt_weights: Option<&'a [f64]>) -> Self {
         if let Some(sw) = sqrt_weights {
             assert_eq!(
@@ -63,6 +78,33 @@ impl<'a> DesignOperator<'a> {
                 (0..max_block).map(|_| AtomicF64::new(0.0)).collect()
             },
             stable,
+            fused: None,
+            #[cfg(debug_assertions)]
+            adjoint_active: AtomicBool::new(false),
+        }
+    }
+
+    /// The fused kernel: every adjoint follows the lane order of `plan`, and
+    /// `owners` sums the plan's separate terms per coefficient in row order.
+    pub(crate) fn fused(
+        design: &'a Design<'a>,
+        sqrt_weights: Option<&'a [f64]>,
+        plan: FusedPlan,
+        owners: &'a StableAdjoint,
+    ) -> Self {
+        if let Some(sw) = sqrt_weights {
+            assert_eq!(sw.len(), design.n_obs, "sqrt-weights length mismatch");
+        }
+        Self {
+            design,
+            sqrt_weights,
+            scatter_scratch: Vec::new(),
+            stable: None,
+            fused: Some(Fused {
+                plan,
+                owners,
+                buffers: Mutex::new(Vec::new()),
+            }),
             #[cfg(debug_assertions)]
             adjoint_active: AtomicBool::new(false),
         }
@@ -122,6 +164,18 @@ impl Operator for DesignOperator<'_> {
         let _guard = ReentryGuard::acquire(&self.adjoint_active);
         debug_assert_eq!(x.len(), self.design.n_obs);
         debug_assert_eq!(y.len(), self.design.n_dofs);
+        if let Some(fused) = &self.fused {
+            let mut buffers = fused.buffers.lock().unwrap_or_else(PoisonError::into_inner);
+            return fused::fused_adjoint(
+                self.design,
+                &fused.plan,
+                &mut buffers,
+                fused.owners,
+                self.sqrt_weights,
+                x,
+                y,
+            );
+        }
         y.fill(0.0);
         if let Some(stable) = self.stable {
             stable.apply(self.design, self.sqrt_weights, x, y);
@@ -133,6 +187,30 @@ impl Operator for DesignOperator<'_> {
             None => scatter_apply(self.design, &self.scatter_scratch, y, &|i| x[i]),
         }
         Ok(())
+    }
+
+    fn apply_fused_update(
+        &self,
+        x: &[f64],
+        c: f64,
+        u: &mut [f64],
+        y: &mut [f64],
+    ) -> Option<Result<f64, schwarz_precond::SolveError>> {
+        let fused = self.fused.as_ref()?;
+        #[cfg(debug_assertions)]
+        let _guard = ReentryGuard::acquire(&self.adjoint_active);
+        let mut buffers = fused.buffers.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(fused::fused_update(
+            self.design,
+            &fused.plan,
+            &mut buffers,
+            fused.owners,
+            self.sqrt_weights,
+            x,
+            c,
+            u,
+            y,
+        ))
     }
 }
 

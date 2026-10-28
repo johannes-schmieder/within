@@ -1,11 +1,15 @@
-//! Session storage changes must not move a bit: digests pinned at `efe35ee`.
+//! Session storage changes must not move a bit: the separate step kernel keeps
+//! the digests pinned at `efe35ee`. The fused kernel must repeat exactly and
+//! agree across worker counts in default and reproducible mode, and agree
+//! with the separate kernel within the solve tolerance.
 //!
-//! Every case runs at 1, 2, 4 and 8 workers. Reproducible solvers must agree
-//! across worker counts and with the digest recorded from the pinned release;
-//! default solvers are checked at one worker, where their reductions are serial.
+//! Separate reproducible solvers run at 1, 2, 4 and 8 workers and must match
+//! the pinned digests; separate default solvers are checked at one worker,
+//! where their reductions are serial.
 
 use within::{
-    Effect, LocalSolverConfig, LsmrOptions, PreconditionerConfig, ReductionStrategy, Solver,
+    Effect, LocalSolverConfig, LsmrOptions, PreconditionerConfig, ReductionStrategy, SolveResult,
+    Solver, StepKernel,
 };
 
 const ROWS: usize = 3 * 4096 + 7_001;
@@ -70,7 +74,7 @@ fn digest(words: impl IntoIterator<Item = u64>) -> u64 {
     hash
 }
 
-fn result_digest(result: &within::SolveResult) -> u64 {
+fn result_digest(result: &SolveResult) -> u64 {
     digest(
         result
             .x
@@ -98,14 +102,24 @@ fn preconditioner(name: &str) -> PreconditionerConfig {
 
 /// One session flow per case: an unseeded or seeded start, a capped first
 /// action, a continuation, a tighter residual correction and a snapshot.
-fn run(data: &Data, weighted: bool, precond: &str, seeded: bool, reproducible: bool) -> [u64; 3] {
+fn run(
+    data: &Data,
+    weighted: bool,
+    precond: &str,
+    seeded: bool,
+    reproducible: bool,
+    kernel: StepKernel,
+) -> ([u64; 3], SolveResult) {
     let effects = vec![
         Effect::new(&data.worker, true, std::iter::empty::<&[f64]>()).unwrap(),
         Effect::new(&data.firm, true, std::iter::empty::<&[f64]>()).unwrap(),
         Effect::new(&data.third, true, std::iter::empty::<&[f64]>()).unwrap(),
     ];
     let weights = weighted.then(|| data.weights.clone());
-    let mut solver = Solver::new(effects, weights, preconditioner(precond)).unwrap();
+    let mut solver = Solver::new(effects, weights, preconditioner(precond))
+        .unwrap()
+        .with_step_kernel(kernel)
+        .unwrap();
     if reproducible {
         solver = solver.with_reproducible().unwrap();
     }
@@ -130,7 +144,19 @@ fn run(data: &Data, weighted: bool, precond: &str, seeded: bool, reproducible: b
     let converged = result_digest(&session.snapshot());
     session.restart_correction(1e-11).unwrap();
     session.run_action(None, usize::MAX, None).unwrap();
-    [snapshot, converged, result_digest(&session.finish())]
+    let finished = session.finish();
+    ([snapshot, converged, result_digest(&finished)], finished)
+}
+
+fn at(
+    threads: usize,
+    work: impl FnOnce() -> ([u64; 3], SolveResult) + Send,
+) -> ([u64; 3], SolveResult) {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+        .install(work)
 }
 
 /// `(weighted, preconditioner, seeded, reproducible)` and its pinned digests.
@@ -308,7 +334,7 @@ const PINNED: &[Case] = &[
 ];
 
 #[test]
-fn session_results_match_pinned_digests_across_worker_counts() {
+fn separate_kernel_sessions_match_pinned_digests() {
     let data = data();
     let mut observed = Vec::new();
     let mut failures = Vec::new();
@@ -320,11 +346,11 @@ fn session_results_match_pinned_digests_across_worker_counts() {
                     let digests: Vec<[u64; 3]> = workers
                         .iter()
                         .map(|&threads| {
-                            rayon::ThreadPoolBuilder::new()
-                                .num_threads(threads)
-                                .build()
-                                .unwrap()
-                                .install(|| run(&data, weighted, precond, seeded, reproducible))
+                            at(threads, || {
+                                let kernel = StepKernel::Separate;
+                                run(&data, weighted, precond, seeded, reproducible, kernel)
+                            })
+                            .0
                         })
                         .collect();
                     let case = (weighted, precond, seeded, reproducible);
@@ -353,4 +379,63 @@ fn session_results_match_pinned_digests_across_worker_counts() {
         failures.join("\n"),
         observed.join("\n")
     );
+}
+
+/// The fused kernel repeats exactly and agrees across worker counts in both
+/// modes, and matches the separate kernel within the solve tolerance.
+#[test]
+fn fused_kernel_sessions_repeat_across_worker_counts_and_match_separate() {
+    let data = data();
+    let mut failures = Vec::new();
+    for weighted in [false, true] {
+        for precond in ["off", "diagonal", "additive"] {
+            for seeded in [false, true] {
+                for reproducible in [false, true] {
+                    let case = (weighted, precond, seeded, reproducible);
+                    let fused = |threads| {
+                        at(threads, || {
+                            run(
+                                &data,
+                                weighted,
+                                precond,
+                                seeded,
+                                reproducible,
+                                StepKernel::Fused,
+                            )
+                        })
+                    };
+                    let (reference, result) = fused(1);
+                    for threads in [1, 2, 4, 8, 8] {
+                        let digest = fused(threads).0;
+                        if digest != reference {
+                            failures.push(format!(
+                                "{case:?} at {threads} workers: {digest:x?} vs {reference:x?}"
+                            ));
+                        }
+                    }
+                    let separate = at(1, || {
+                        run(
+                            &data,
+                            weighted,
+                            precond,
+                            seeded,
+                            reproducible,
+                            StepKernel::Separate,
+                        )
+                    })
+                    .1;
+                    let gap = result
+                        .demeaned
+                        .iter()
+                        .zip(&separate.demeaned)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0, f64::max);
+                    if !(result.converged && separate.converged && gap <= 1e-8) {
+                        failures.push(format!("{case:?} demeaned gap {gap:e}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

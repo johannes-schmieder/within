@@ -9,6 +9,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Numerical scope — fused LSMR step and fixed-order adjoints.** Modified LSMR (`mlsmr`, preconditioned solves and sessions) runs each bidiagonalization step as one pass over the observations: `A v`, the update of `u`, `‖u‖²` and `Aᵀ u` are computed per cache-resident block of rows, replacing a gather pass, an update/norm pass and one scatter pass per term. `A v`, `u` and `‖u‖` stay bitwise unchanged; `Aᵀ u` is now summed in fixed row lanes that depend only on the design (sorted terms per level in row order, small unsorted terms in per-lane accumulators added in lane order, slope terms and unsorted terms too large to buffer per coefficient in row order through a shared ownership index). Every design-operator adjoint, including initialization, the unpreconditioned `lsmr` and certification, uses this order, and none uses atomics. Coefficients, residuals and iteration counts of every solve may change in the last bits, within solver tolerance.
+- Default-mode (non-`with_reproducible`) results are now repeatable at a fixed worker count and identical across worker counts, previously true only in reproducible mode: for `Off` and `Diagonal` preconditioners, and for additive preconditioners whose reduction is `Ordered` (`Auto` may still resolve to an atomic or worker-count-dependent Schwarz reduction).
+- The fused step allocates no observation-length `A v` scratch and no per-operator atomic scatter scratch. Lane accumulators hold at most `n_obs / 4` values per operator; an ownership index (one `usize` per row) is built only for unsorted terms beyond that buffer share and for slope terms.
 - A `SolveSession` shares its response storage: with unit weights the solve RHS is the permuted response itself, and an unseeded recurrence shares that RHS (or `W^{1/2} y`). A unit-weight unseeded session holds one observation-length response vector instead of three; unit-weight seeded and weighted unseeded sessions hold one fewer. Results are bitwise unchanged (pinned digests at 1, 2, 4 and 8 workers).
 - **BREAKING:** Python `PreconditionerConfig` is now a tagged union: construct variants as `PreconditionerConfig.Off()`, `.Diagonal()`, or `.Additive(local_solver=..., reduction=...)` (previously class-attribute singletons plus an `.additive()` factory). Instances compare by value and support `match`/`case` on Python ≥3.10.
 - Rust `Preconditioner` objects expose their normalized construction configuration through `Preconditioner::config()`.
@@ -21,6 +24,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `StepKernel` with `Solver::with_step_kernel` and `Solver::step_kernel`; `StepKernel::Separate` restores the separate passes and the 0.4 arithmetic bit for bit.
+- `schwarz_precond::Operator::apply_fused_update` (provided, `None` by default) lets an operator fuse a modified-LSMR step; `lsmr_norm_chunk` and `lsmr_norm_reduce` reproduce the separate update's norm association.
 - `schwarz_precond::MlsmrContinuation::new_shared` takes the original RHS as an `Arc<[f64]>`; an unseeded recurrence keeps it instead of a private copy.
 - Python `Preconditioner.build_duration_seconds` and Rust `Preconditioner::build_duration()` expose the original preconditioner build duration, preserved across serialization and reuse.
 - `BuildWarning::CollinearSlopeCovariate` reports a slope covariate that is (nearly) a per-level combination of another term's columns — a cross-term near-null direction that per-term whitening cannot see and that can inflate iteration counts by orders of magnitude (#281).

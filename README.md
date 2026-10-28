@@ -305,8 +305,11 @@ per unsorted term and fixes each adjoint coefficient's summation order. It
 also converts additive preconditioners to `ReductionStrategy::Ordered`: local
 solves run in bounded parallel windows, with contributions combined in domain
 order. Cloned/prebuilt handles keep their original policy and scratch pool.
-The default solver and reduction policy remain unchanged. Reproducibility
-requires each user-provided local solver to repeat its own arithmetic.
+The default step kernel already fixes the design operator's summation order
+(see `StepKernel::Fused`), so default solves with `Off` or `Diagonal`
+preconditioners repeat exactly at any worker count; `with_reproducible` adds the
+ordered Schwarz reduction. Reproducibility requires each user-provided local
+solver to repeat its own arithmetic.
 
 `Ordered` is appended to the Rust and Python reduction enums; existing serialized
 variants retain their indices. Rust clients matching the enum exhaustively need

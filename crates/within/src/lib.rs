@@ -49,7 +49,7 @@ pub use operator::schwarz::Preconditioner;
 pub use solver::{
     solve, solve_batch, solve_batch_with_screening, ActionProgress, BatchSolveResult,
     CoefficientAddress, CoefficientLayout, IntoDesign, PreconditionerInput, SlopeScreening,
-    SolveResult, SolveSession, Solver,
+    SolveResult, SolveSession, Solver, StepKernel,
 };
 
 pub use fixed::{

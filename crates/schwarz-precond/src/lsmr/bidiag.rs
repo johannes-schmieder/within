@@ -44,6 +44,30 @@ fn axpy_with_sq_norm(y: &mut [f64], x: &[f64], scale: f64) -> f64 {
     }
 }
 
+/// Rows per squared-norm partial of an `n`-row update: one sequential sum
+/// below the parallel threshold, otherwise [`LSMR_UPDATE_CHUNK`]-row chunks.
+pub fn lsmr_norm_chunk(n: usize) -> usize {
+    if n >= LSMR_PAR_THRESHOLD {
+        LSMR_UPDATE_CHUNK
+    } else {
+        n.max(1)
+    }
+}
+
+/// Combines per-chunk squared-norm partials (each a sequential sum from
+/// `0.0` over its [`lsmr_norm_chunk`] rows) in the association of the separate
+/// LSMR update: a midpoint binary tree, independent of worker count.
+pub fn lsmr_norm_reduce(partials: &[f64]) -> f64 {
+    match partials {
+        [] => 0.0,
+        [single] => *single,
+        _ => {
+            let (left, right) = partials.split_at(partials.len() / 2);
+            lsmr_norm_reduce(left) + lsmr_norm_reduce(right)
+        }
+    }
+}
+
 /// `y = alpha * x + beta * y`. Parallel above the threshold.
 #[inline]
 fn axpby(y: &mut [f64], x: &[f64], alpha: f64, beta: f64) {
@@ -316,8 +340,24 @@ impl<A: Operator + ?Sized, M: Operator + ?Sized> Bidiagonalization
 {
     fn step(&mut self) -> Result<BidiagStep, SolveError> {
         let scale = -(self.alpha * self.beta_prev_inv);
-        self.operator.apply(&self.bufs.v, &mut self.bufs.av)?;
-        let beta_sq = axpy_with_sq_norm(&mut self.bufs.u, &self.bufs.av, scale);
+        let fused = self.operator.apply_fused_update(
+            &self.bufs.v,
+            scale,
+            &mut self.bufs.u,
+            &mut self.bufs.atu,
+        );
+        let (beta_sq, adjoint_ready) = match fused {
+            Some(beta_sq) => (beta_sq?, true),
+            None => {
+                // Only the separate path needs `A v` scratch; fused operators never allocate it.
+                if self.bufs.av.len() != self.bufs.u.len() {
+                    self.bufs.av = vec![0.0; self.bufs.u.len()];
+                }
+                self.operator.apply(&self.bufs.v, &mut self.bufs.av)?;
+                let beta_sq = axpy_with_sq_norm(&mut self.bufs.u, &self.bufs.av, scale);
+                (beta_sq, false)
+            }
+        };
         let beta = beta_sq.sqrt();
         if beta == 0.0 {
             // Lucky breakdown: zero `v` and its paired `p̃` so the update contributes nothing.
@@ -330,7 +370,7 @@ impl<A: Operator + ?Sized, M: Operator + ?Sized> Bidiagonalization
         // beta > 0 here: the beta == 0 lucky breakdown returned above.
         let beta_inv = 1.0 / beta;
 
-        self.update_p_tilde(beta, beta_inv)?;
+        self.update_p_tilde(beta, beta_inv, adjoint_ready)?;
         let alpha_new = self.reorthonormalize_v()?;
 
         self.alpha = alpha_new;
@@ -347,7 +387,8 @@ impl<A: Operator + ?Sized, M: Operator + ?Sized> Bidiagonalization
     }
 
     fn certify(&mut self, x: &[f64], rhs: &[f64]) -> Result<Certificate, SolveError> {
-        let normr = true_residual(self.operator, x, rhs, &mut self.bufs.av, &mut self.bufs.atu)?;
+        // Certification is terminal, so the recurrence vector `u` is the residual scratch.
+        let normr = true_residual(self.operator, x, rhs, &mut self.bufs.u, &mut self.bufs.atu)?;
         self.preconditioner
             .apply(&self.bufs.atu, &mut self.bufs.v)?;
         Ok(Certificate {
@@ -440,7 +481,7 @@ struct ModifiedGolubKahanBuffers {
     v: Vec<f64>,
     /// `p̃` recurrence vector (length n); invariant `p_tilde_stored = α · M · v_normalized`.
     p_tilde: Vec<f64>,
-    /// Scratch for `A · v` (length m).
+    /// Scratch for `A · v` (length m), allocated by the first separate step.
     av: Vec<f64>,
     /// Scratch for `Aᵀ · u` (length n).
     atu: Vec<f64>,
@@ -454,7 +495,7 @@ impl ModifiedGolubKahanBuffers {
             u: vec![0.0; m],
             v: vec![0.0; n],
             p_tilde: vec![0.0; n],
-            av: vec![0.0; m],
+            av: Vec::new(),
             atu: vec![0.0; n],
             local_reorth: WindowRing::<2>::new(m, n, local_size),
         }
@@ -550,9 +591,17 @@ impl<'a, A: Operator + ?Sized, M: Operator + ?Sized> ModifiedGolubKahan<'a, A, M
     }
 
     /// Scaling by `β / α_k` cancels the stored `α_k`; requires `α_k > 0`.
-    fn update_p_tilde(&mut self, beta: f64, beta_inv: f64) -> Result<(), SolveError> {
-        self.operator
-            .apply_adjoint(&self.bufs.u, &mut self.bufs.atu)?;
+    /// A fused step has already left `Aᵀ u` in `atu`.
+    fn update_p_tilde(
+        &mut self,
+        beta: f64,
+        beta_inv: f64,
+        adjoint_ready: bool,
+    ) -> Result<(), SolveError> {
+        if !adjoint_ready {
+            self.operator
+                .apply_adjoint(&self.bufs.u, &mut self.bufs.atu)?;
+        }
         debug_assert!(
             self.alpha > 0.0,
             "self.alpha must be > 0; lsmr_from_bidiag's loop guard prevents step() after alpha=0",

@@ -18,53 +18,69 @@ pub(super) fn scatter_apply(
     base: &(impl Fn(usize) -> f64 + Sync),
 ) {
     debug_assert_eq!(dst.len(), design.n_dofs);
+    for (q, t) in design.terms.iter().enumerate() {
+        scatter_term_apply(
+            design,
+            q,
+            scratch,
+            &mut dst[t.offset..t.offset + t.n_dofs()],
+            base,
+        );
+    }
+}
+
+/// [`scatter_apply`] for term `q` alone, accumulating into its coefficient `block`.
+pub(super) fn scatter_term_apply(
+    design: &Design<'_>,
+    q: usize,
+    scratch: &[AtomicF64],
+    block: &mut [f64],
+    base: &(impl Fn(usize) -> f64 + Sync),
+) {
     let parallel = design.n_obs > PAR_THRESHOLD;
     let frame = &design.frame;
-
-    for (q, t) in design.terms.iter().enumerate() {
-        let levels = frame.level_column(q);
-        let block = &mut dst[t.offset..t.offset + t.n_dofs()];
-        match &*t.columns {
-            [Loading::Constant] => {
-                scatter_term::<1>(block, t, levels, parallel, scratch, |i| [base(i)])
-            }
-            [Loading::Constant, Loading::Covariate(c0)] => {
-                let z0 = frame.loading_column(*c0 as usize);
-                scatter_term::<2>(block, t, levels, parallel, scratch, |i| {
-                    let b = base(i);
-                    [b, z0[i] * b]
-                })
-            }
-            [Loading::Constant, Loading::Covariate(c0), Loading::Covariate(c1)] => {
-                let z0 = frame.loading_column(*c0 as usize);
-                let z1 = frame.loading_column(*c1 as usize);
-                scatter_term::<3>(block, t, levels, parallel, scratch, |i| {
-                    let b = base(i);
-                    [b, z0[i] * b, z1[i] * b]
-                })
-            }
-            [Loading::Covariate(c0), Loading::Covariate(c1)] => {
-                let z0 = frame.loading_column(*c0 as usize);
-                let z1 = frame.loading_column(*c1 as usize);
-                scatter_term::<2>(block, t, levels, parallel, scratch, |i| {
-                    let b = base(i);
-                    [z0[i] * b, z1[i] * b]
-                })
-            }
-            columns => {
-                for (c, loading) in columns.iter().enumerate() {
-                    let start = c * t.n_levels;
-                    let slot = &mut block[start..start + t.n_levels];
-                    match loading {
-                        Loading::Constant => {
-                            scatter_term::<1>(slot, t, levels, parallel, scratch, |i| [base(i)]);
-                        }
-                        Loading::Covariate(k) => {
-                            let z = frame.loading_column(*k as usize);
-                            scatter_term::<1>(slot, t, levels, parallel, scratch, move |i| {
-                                [z[i] * base(i)]
-                            });
-                        }
+    let t = &design.terms[q];
+    let levels = frame.level_column(q);
+    match &*t.columns {
+        [Loading::Constant] => {
+            scatter_term::<1>(block, t, levels, parallel, scratch, |i| [base(i)])
+        }
+        [Loading::Constant, Loading::Covariate(c0)] => {
+            let z0 = frame.loading_column(*c0 as usize);
+            scatter_term::<2>(block, t, levels, parallel, scratch, |i| {
+                let b = base(i);
+                [b, z0[i] * b]
+            })
+        }
+        [Loading::Constant, Loading::Covariate(c0), Loading::Covariate(c1)] => {
+            let z0 = frame.loading_column(*c0 as usize);
+            let z1 = frame.loading_column(*c1 as usize);
+            scatter_term::<3>(block, t, levels, parallel, scratch, |i| {
+                let b = base(i);
+                [b, z0[i] * b, z1[i] * b]
+            })
+        }
+        [Loading::Covariate(c0), Loading::Covariate(c1)] => {
+            let z0 = frame.loading_column(*c0 as usize);
+            let z1 = frame.loading_column(*c1 as usize);
+            scatter_term::<2>(block, t, levels, parallel, scratch, |i| {
+                let b = base(i);
+                [z0[i] * b, z1[i] * b]
+            })
+        }
+        columns => {
+            for (c, loading) in columns.iter().enumerate() {
+                let start = c * t.n_levels;
+                let slot = &mut block[start..start + t.n_levels];
+                match loading {
+                    Loading::Constant => {
+                        scatter_term::<1>(slot, t, levels, parallel, scratch, |i| [base(i)]);
+                    }
+                    Loading::Covariate(k) => {
+                        let z = frame.loading_column(*k as usize);
+                        scatter_term::<1>(slot, t, levels, parallel, scratch, move |i| {
+                            [z[i] * base(i)]
+                        });
                     }
                 }
             }

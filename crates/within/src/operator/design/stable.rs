@@ -27,6 +27,15 @@ fn zeros(length: usize) -> Result<Vec<usize>, BuildError> {
 
 impl StableAdjoint {
     pub(crate) fn new(design: &Design<'_>) -> Result<Self, BuildError> {
+        Self::for_terms(design, |_| true)
+    }
+
+    /// Index only the terms `selected` accepts; [`apply_term`](Self::apply_term)
+    /// serves exactly those.
+    pub(crate) fn for_terms(
+        design: &Design<'_>,
+        selected: impl Fn(usize) -> bool,
+    ) -> Result<Self, BuildError> {
         let mut terms = Vec::new();
         terms
             .try_reserve_exact(design.terms.len())
@@ -34,6 +43,13 @@ impl StableAdjoint {
                 context: "reproducible adjoint terms",
             })?;
         for (q, term) in design.terms.iter().enumerate() {
+            if !selected(q) {
+                terms.push(LevelRows {
+                    offsets: Vec::new(),
+                    rows: None,
+                });
+                continue;
+            }
             let levels = design.frame.level_column(q);
             let mut offsets =
                 zeros(term.n_levels.checked_add(1).ok_or(BuildError::Allocation {
@@ -71,28 +87,46 @@ impl StableAdjoint {
         y: &mut [f64],
     ) {
         for (q, term) in design.terms.iter().enumerate() {
-            let index = &self.terms[q];
             let block = &mut y[term.offset..term.offset + term.n_dofs()];
-            block
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(coefficient, value)| {
-                    let level = coefficient % term.n_levels;
-                    let column = coefficient / term.n_levels;
-                    let mut sum = 0.0;
-                    for position in index.offsets[level]..index.offsets[level + 1] {
-                        let row = index.rows.as_ref().map_or(position, |rows| rows[position]);
-                        let base = sqrt_weights.map_or(x[row], |sw| sw[row] * x[row]);
-                        sum += match term.columns[column] {
-                            Loading::Constant => base,
-                            Loading::Covariate(c) => {
-                                design.frame.loading_column(c as usize)[row] * base
-                            }
-                        };
-                    }
-                    *value = sum;
-                });
+            self.apply_term(design, q, sqrt_weights, x, block);
         }
+    }
+
+    /// Term `q`'s coefficient block of [`apply`](Self::apply), overwriting `block`.
+    pub(crate) fn apply_term(
+        &self,
+        design: &Design<'_>,
+        q: usize,
+        sqrt_weights: Option<&[f64]>,
+        x: &[f64],
+        block: &mut [f64],
+    ) {
+        let term = &design.terms[q];
+        let index = &self.terms[q];
+        debug_assert_eq!(
+            index.offsets.len(),
+            term.n_levels + 1,
+            "term {q} is not indexed"
+        );
+        block
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(coefficient, value)| {
+                let level = coefficient % term.n_levels;
+                let column = coefficient / term.n_levels;
+                let mut sum = 0.0;
+                for position in index.offsets[level]..index.offsets[level + 1] {
+                    let row = index.rows.as_ref().map_or(position, |rows| rows[position]);
+                    let base = sqrt_weights.map_or(x[row], |sw| sw[row] * x[row]);
+                    sum += match term.columns[column] {
+                        Loading::Constant => base,
+                        Loading::Covariate(c) => {
+                            design.frame.loading_column(c as usize)[row] * base
+                        }
+                    };
+                }
+                *value = sum;
+            });
     }
 }
 

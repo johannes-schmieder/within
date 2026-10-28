@@ -6,6 +6,7 @@
 
 mod bidiag;
 mod continuation;
+pub use bidiag::{lsmr_norm_chunk, lsmr_norm_reduce};
 pub use continuation::MlsmrContinuation;
 #[cfg(test)]
 mod fixtures;

@@ -54,6 +54,25 @@ pub trait Operator: Send + Sync {
     fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), error::SolveError>;
     /// Computes `y = Aᵀ x`; symmetric operators should delegate to `apply`.
     fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), error::SolveError>;
+
+    /// Optional fused modified-LSMR step: `u ← A x + c·u`, then `y = Aᵀ u`,
+    /// returning `‖u‖²`. `None`, returned before touching `u` or `y`, selects
+    /// the separate `apply`, update/norm and `apply_adjoint` passes.
+    ///
+    /// The updated `u` is used by later steps, so it must equal the separate
+    /// update `(A x)_i + c·u_i` in each entry. Computing `‖u‖²` from
+    /// [`lsmr_norm_chunk`] partials combined by [`lsmr_norm_reduce`] keeps the
+    /// separate path's bits; `y` may differ from `apply_adjoint` by rounding.
+    fn apply_fused_update(
+        &self,
+        x: &[f64],
+        c: f64,
+        u: &mut [f64],
+        y: &mut [f64],
+    ) -> Option<Result<f64, error::SolveError>> {
+        let _ = (x, c, u, y);
+        None
+    }
 }
 
 // Compiles the README usage example as a doctest so it cannot drift from the public API.
@@ -73,7 +92,8 @@ pub use domain::{PartitionWeights, SubdomainCore};
 pub use error::{BuildError, LocalSolveError, SolveError};
 pub use local_solve::{LocalSolver, SubdomainEntry};
 pub use lsmr::{
-    lsmr, mlsmr, EscalationHandler, EscalationPolicy, LsmrResult, LsmrStopReason,
-    MlsmrContinuation, MlsmrOptions, Progress, Staleness, StalenessError,
+    lsmr, lsmr_norm_chunk, lsmr_norm_reduce, mlsmr, EscalationHandler, EscalationPolicy,
+    LsmrResult, LsmrStopReason, MlsmrContinuation, MlsmrOptions, Progress, Staleness,
+    StalenessError,
 };
 pub use schwarz::{ReductionStrategy, SchwarzPreconditioner};

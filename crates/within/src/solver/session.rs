@@ -7,7 +7,6 @@ use schwarz_precond::{EscalationPolicy, LsmrStopReason, MlsmrContinuation, Opera
 
 use super::{CoefficientLayout, SolveResult, Solver};
 use crate::operator::design::gather_apply;
-use crate::operator::DesignOperator;
 use crate::{LsmrOptions, PairReplacement, SolveError};
 
 /// Result of one bounded stretch of Krylov work within a solve session.
@@ -171,11 +170,7 @@ impl SolveSession<'_, '_> {
                 ..self.progress
             });
         }
-        let operator = DesignOperator::with_stable(
-            &self.solver.design,
-            self.solver.sqrt_weights.as_deref(),
-            self.solver.stable_adjoint.as_ref(),
-        );
+        let operator = self.solver.design_operator();
         let identity = Identity(self.x.len());
         let preconditioner: &dyn Operator = match replacement {
             Some(p) => &p.preconditioner,
