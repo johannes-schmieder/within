@@ -314,10 +314,10 @@ pub struct Solver<'a> {
     /// during construction).
     sqrt_weights: Option<Vec<f64>>,
     preconditioner: Option<Preconditioner>,
-    stable_adjoint: Option<StableAdjoint>,
-    /// Ownership index of the fused plan's separate terms, absent when
-    /// `stable_adjoint` already indexes every term.
-    owners: Option<StableAdjoint>,
+    /// Row-ownership index shared by all RHS: the fused plan's separate terms
+    /// under [`StepKernel::Fused`], every term for a reproducible separate kernel.
+    adjoint_index: Option<StableAdjoint>,
+    reproducible: bool,
     kernel: StepKernel,
     reparam: Option<SlopeReparam>,
     warnings: Vec<BuildWarning>,
@@ -372,12 +372,6 @@ pub enum SlopeScreening {
     /// Skip cross-term diagnostics and build whitening moments one term at a time.
     /// This retains the earlier constructor's warnings and temporary storage scope.
     Disabled,
-}
-
-/// Ownership index for the terms the fused plan cannot lane-accumulate.
-fn fused_owners(design: &Design<'_>) -> Result<StableAdjoint, BuildError> {
-    let plan = FusedPlan::new(design);
-    StableAdjoint::for_terms(design, |q| plan.is_separate(q))
 }
 
 impl<'a> Solver<'a> {
@@ -472,27 +466,44 @@ impl<'a> Solver<'a> {
             w
         });
 
-        let owners = Some(fused_owners(&design)?);
-        Ok(Self {
+        let mut solver = Self {
             design,
             replacement_source: std::sync::OnceLock::new(),
             sqrt_weights,
             preconditioner,
-            stable_adjoint: None,
-            owners,
+            adjoint_index: None,
+            reproducible: false,
             kernel: StepKernel::Fused,
             reparam,
             warnings,
-        })
+        };
+        solver.index_adjoints()?;
+        Ok(solver)
+    }
+
+    /// Build the ownership index the kernel and reproducibility mode need,
+    /// releasing any previous index first.
+    fn index_adjoints(&mut self) -> Result<(), BuildError> {
+        self.adjoint_index = None;
+        self.adjoint_index = match (self.kernel, self.reproducible) {
+            (StepKernel::Fused, _) => {
+                let plan = FusedPlan::new(&self.design);
+                Some(StableAdjoint::for_terms(&self.design, |q| {
+                    plan.is_separate(q)
+                })?)
+            }
+            (StepKernel::Separate, true) => Some(StableAdjoint::new(&self.design)?),
+            (StepKernel::Separate, false) => None,
+        };
+        Ok(())
     }
 
     /// Select the LSMR step kernel; [`StepKernel::Fused`] is the default.
     pub fn with_step_kernel(mut self, kernel: StepKernel) -> Result<Self, BuildError> {
-        self.kernel = kernel;
-        self.owners = match kernel {
-            StepKernel::Fused if self.stable_adjoint.is_none() => Some(fused_owners(&self.design)?),
-            _ => None,
-        };
+        if kernel != self.kernel {
+            self.kernel = kernel;
+            self.index_adjoints()?;
+        }
         Ok(self)
     }
 
@@ -504,38 +515,33 @@ impl<'a> Solver<'a> {
     /// The design operator for one solve or action.
     pub(crate) fn design_operator(&self) -> DesignOperator<'_> {
         let sqrt_weights = self.sqrt_weights.as_deref();
-        match (
-            self.kernel,
-            self.stable_adjoint.as_ref().or(self.owners.as_ref()),
-        ) {
+        match (self.kernel, self.adjoint_index.as_ref()) {
             (StepKernel::Fused, Some(owners)) => DesignOperator::fused(
                 &self.design,
                 sqrt_weights,
                 FusedPlan::new(&self.design),
                 owners,
             ),
-            _ => DesignOperator::with_stable(
-                &self.design,
-                sqrt_weights,
-                self.stable_adjoint.as_ref(),
-            ),
+            (_, index) => DesignOperator::with_stable(&self.design, sqrt_weights, index),
         }
     }
 
     /// Fix adjoint and Schwarz accumulation order independently of task completion.
-    /// Indices are prepared once and shared by all RHS; default construction is unchanged.
+    /// The fused kernel's adjoints are already fixed; this orders additive
+    /// Schwarz reductions and, for [`StepKernel::Separate`], indexes every term.
+    /// Indices are prepared once and shared by all RHS.
     pub fn with_reproducible(mut self) -> Result<Self, BuildError> {
-        if self.stable_adjoint.is_none() {
-            self.stable_adjoint = Some(StableAdjoint::new(&self.design)?);
-            self.owners = None;
+        if !self.reproducible {
+            self.reproducible = true;
+            self.index_adjoints()?;
             self.preconditioner = self.preconditioner.map(Preconditioner::into_reproducible);
         }
         Ok(self)
     }
 
-    /// Whether coefficient-owned adjoints and ordered additive execution are enabled.
+    /// Whether reproducible mode (fixed adjoint order and ordered additive execution) is enabled.
     pub fn reproducible(&self) -> bool {
-        self.stable_adjoint.is_some()
+        self.reproducible
     }
 
     /// Non-fatal events from design screening and the preconditioner build; a reused

@@ -83,6 +83,8 @@ impl FusedPlan {
             })
             .collect();
         let norm_chunk = lsmr_norm_chunk(n);
+        // Each block must be one norm chunk, or part of the single sequential one.
+        assert!(norm_chunk == BLOCK_ROWS || norm_chunk >= n);
         let lane_rows = if norm_chunk >= n {
             n.max(1)
         } else {
@@ -518,7 +520,7 @@ mod tests {
     /// several lanes, empty levels, a slope term and zero weights.
     fn cases() -> Vec<Case> {
         let mut out = Vec::new();
-        for rows in [19usize, 9_999, 70_001] {
+        for rows in [19usize, 9_999, 12_289, 70_001] {
             let worker: Vec<u32> = (0..rows)
                 .map(|i| if i < rows / 2 { 0 } else { (3 * i / 5) as u32 })
                 .collect();
@@ -559,6 +561,20 @@ mod tests {
                 weights: Some(weights),
             });
         }
+        // Three sorted levels over three lanes: the first lane holds two
+        // adjacent levels and no interior, the last a single run.
+        let rows = 40_000usize;
+        let first = leak((0..rows).map(|i| (3 * i / rows) as u32).collect());
+        let second = leak((0..rows).map(|i| (i % 2) as u32).collect());
+        let none = std::iter::empty::<&[f64]>;
+        out.push(Case {
+            design: Design::new(vec![
+                Effect::new(first, true, none()).unwrap(),
+                Effect::new(second, true, none()).unwrap(),
+            ])
+            .unwrap(),
+            weights: None,
+        });
         out
     }
 
@@ -590,7 +606,9 @@ mod tests {
                     ),
                 }
             }
-            assert!(plan.is_separate(3), "slope terms use the ownership index");
+            if design.terms.len() == 4 {
+                assert!(plan.is_separate(3), "slope terms use the ownership index");
+            }
             if n == 70_001 {
                 // A dominant sorted term with one run across several lanes.
                 assert_eq!(plan.routes[0], Route::Sorted);
