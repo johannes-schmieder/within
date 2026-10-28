@@ -25,7 +25,7 @@ pub trait LocalSolver: Send + Sync {
     /// Required scratch buffer size (may be > n_local for augmented systems).
     fn scratch_size(&self) -> usize;
 
-    /// Solve into `sol`; buffers are `scratch_size()` long and the parallelism hint may be ignored.
+    /// Solve into `sol`; buffers are `scratch_size()` long; hint and thread count can't change bits.
     fn solve_local(
         &self,
         rhs: &mut [f64],
@@ -100,6 +100,25 @@ impl<S: LocalSolver> SubdomainEntry<S> {
     #[inline]
     pub fn scratch_size(&self) -> usize {
         self.solver.scratch_size()
+    }
+
+    /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` in local coordinates to `out`; scratches are `scratch_size()` long.
+    pub(crate) fn apply_weighted_local(
+        &self,
+        r: &[f64],
+        out: &mut [f64],
+        r_scratch: &mut [f64],
+        z_scratch: &mut [f64],
+        allow_inner_parallelism: bool,
+    ) -> Result<(), LocalSolveError> {
+        if self.core.is_empty() {
+            return Ok(());
+        }
+        self.core.restrict_weighted(r, r_scratch);
+        self.solver
+            .solve_local(r_scratch, z_scratch, allow_inner_parallelism)?;
+        self.core.weight(z_scratch, out);
+        Ok(())
     }
 
     /// Accumulate `out += Rᵢᵀ D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r`; both buffers must be `scratch_size()` long.

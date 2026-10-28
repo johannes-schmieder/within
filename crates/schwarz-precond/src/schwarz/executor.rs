@@ -1,30 +1,30 @@
-//! Additive Schwarz execution engine.
-//!
-//! [`AdditiveExecutor`] owns the subdomain entries and a [`BufferPool`] that
-//! transitively carries the global sizes. Its `apply` method takes a
-//! reduction plan from the scheduler and dispatches to either the
-//! atomic-scatter or the parallel-reduction backend. Buffers are taken from
-//! / returned to the pool so the steady state allocates nothing.
-//!
-//! The pooled scratch-buffer types live in [`super::buffers`].
+//! Additive Schwarz execution. Every subdomain writes its local output into its own slots of one
+//! buffer; each DOF then sums its slots in subdomain order, so no thread count changes the bits.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ops::Range;
 use std::sync::Arc;
 
 use rayon::prelude::*;
 
 use crate::error::SolveError;
 use crate::local_solve::{LocalSolver, SubdomainEntry};
+use crate::prolongation::Prolongation;
 
-use super::buffers::{
-    AdditiveSweepBuffers, BufferPool, LocalSolveScratch, SchwarzBuffers, WorkerBufferStack,
-    WorkerReductionBuffers,
-};
-use super::planning::ReductionPlan;
+use super::buffers::{LocalSolveScratch, WorkerBufferStack, Workspace, WorkspacePool};
+
+/// Where each subdomain's local output lives, and which outputs each DOF sums.
+struct SlotLayout {
+    /// Subdomain `i` owns slots `starts[i]..starts[i + 1]`.
+    starts: Vec<usize>,
+    /// Sums each DOF's slots in subdomain order.
+    prolongation: Prolongation,
+}
 
 pub(super) struct AdditiveExecutor<S: LocalSolver> {
     subdomains: Arc<Vec<SubdomainEntry<S>>>,
-    buf_pool: BufferPool,
+    layout: Arc<SlotLayout>,
+    pool: WorkspacePool,
+    max_scratch_size: usize,
 }
 
 impl<S: LocalSolver> AdditiveExecutor<S> {
@@ -33,9 +33,26 @@ impl<S: LocalSolver> AdditiveExecutor<S> {
         n_dofs: usize,
         max_scratch_size: usize,
     ) -> Self {
+        let mut starts = Vec::with_capacity(subdomains.len() + 1);
+        starts.push(0);
+        for entry in subdomains.iter() {
+            starts.push(starts[starts.len() - 1] + entry.global_indices().len());
+        }
+        let prolongation = Prolongation::new(
+            subdomains
+                .iter()
+                .flat_map(|e| e.global_indices().iter().copied()),
+            n_dofs,
+        );
+        let pool = WorkspacePool::new(starts[subdomains.len()]);
         Self {
             subdomains,
-            buf_pool: BufferPool::new(n_dofs, max_scratch_size),
+            layout: Arc::new(SlotLayout {
+                starts,
+                prolongation,
+            }),
+            pool,
+            max_scratch_size,
         }
     }
 
@@ -44,124 +61,85 @@ impl<S: LocalSolver> AdditiveExecutor<S> {
     }
 
     pub(super) fn n_dofs(&self) -> usize {
-        self.buf_pool.n_dofs()
+        self.layout.prolongation.n_dofs()
     }
 
-    pub(super) fn n_subdomains(&self) -> usize {
-        self.subdomains.len()
-    }
-
-    /// Dispatch entry point: take a buffer from the pool, run the backend, return the buffer.
     pub(super) fn apply(
-        &self,
-        plan: ReductionPlan,
-        r: &[f64],
-        z: &mut [f64],
-    ) -> Result<(), SolveError> {
-        let mut bufs = self.buf_pool.take(plan.strategy)?;
-        let apply_result = match &mut bufs {
-            SchwarzBuffers::Atomic {
-                accum,
-                scratch_pool,
-            } => self.apply_atomic(plan.allow_inner_parallelism, r, z, accum, scratch_pool),
-            SchwarzBuffers::Reduction { pool } => {
-                self.apply_parallel_reduction(plan.allow_inner_parallelism, r, z, pool)
-            }
-        };
-        // `put` is infallible and never overwrites the real `apply_result`.
-        self.buf_pool.put(bufs, &apply_result);
-        apply_result
-    }
-
-    fn apply_atomic(
         &self,
         allow_inner_parallelism: bool,
         r: &[f64],
         z: &mut [f64],
-        accum: &[AtomicU64],
-        scratch_pool: &mut Vec<LocalSolveScratch>,
     ) -> Result<(), SolveError> {
-        let max_scratch_size = self.buf_pool.max_scratch_size();
-        let worker_scratch = WorkerBufferStack::new(std::mem::take(scratch_pool), move || {
-            LocalSolveScratch::new(max_scratch_size)
+        let mut workspace = self.pool.take()?;
+        let result = self.apply_in(&mut workspace, allow_inner_parallelism, r, z);
+        self.pool.put(workspace);
+        result
+    }
+
+    fn apply_in(
+        &self,
+        workspace: &mut Workspace,
+        allow_inner_parallelism: bool,
+        r: &[f64],
+        z: &mut [f64],
+    ) -> Result<(), SolveError> {
+        let worker_scratch = WorkerBufferStack::new(
+            std::mem::take(&mut workspace.scratch),
+            self.max_scratch_size,
+        );
+        let starts = &self.layout.starts;
+        let all = (0..self.subdomains.len(), &mut workspace.local_outputs[..]);
+        let solved = rayon::iter::split(all, |(ids, outputs)| {
+            if ids.len() < 2 {
+                return ((ids, outputs), None);
+            }
+            let mid = ids.start + ids.len() / 2;
+            let (left, right) = outputs.split_at_mut(starts[mid] - starts[ids.start]);
+            ((ids.start..mid, left), Some((mid..ids.end, right)))
+        })
+        .try_for_each(|(ids, outputs)| {
+            worker_scratch.with_buffer(|scratch| {
+                self.solve_span(ids, outputs, r, scratch, allow_inner_parallelism)
+            })
         });
-        let apply_result =
-            self.subdomains
-                .par_iter()
-                .enumerate()
-                .try_for_each(|(subdomain, entry)| {
-                    worker_scratch.with_buffer(|scratch| {
-                        entry
-                            .apply_weighted_into_atomic(
-                                r,
-                                accum,
-                                &mut scratch.r_scratch,
-                                &mut scratch.z_scratch,
-                                allow_inner_parallelism,
-                            )
-                            .map_err(|source| SolveError::LocalSolveFailed { subdomain, source })
-                    })
-                });
 
         // A pool-recovery failure must not mask a real `LocalSolveFailed`.
-        match worker_scratch.into_pool("additive.atomic.scratch.into_inner") {
-            Ok(recovered) => *scratch_pool = recovered,
-            Err(into_err) => return apply_result.and(Err(into_err)),
+        match worker_scratch.into_pool() {
+            Ok(recovered) => workspace.scratch = recovered,
+            Err(into_err) => return solved.and(Err(into_err)),
         }
+        solved?;
 
-        // On apply error the swap-zero readout is skipped, so `put` drops the buffer.
-        apply_result?;
-
-        const READOUT_CHUNK: usize = 4096;
-        z.par_chunks_mut(READOUT_CHUNK)
-            .enumerate()
-            .for_each(|(ci, chunk)| {
-                let offset = ci * READOUT_CHUNK;
-                for (i, zi) in chunk.iter_mut().enumerate() {
-                    let ai = &accum[offset + i];
-                    *zi = f64::from_bits(ai.swap(0, Ordering::Relaxed));
-                }
-            });
+        self.layout.prolongation.apply(&workspace.local_outputs, z);
         Ok(())
     }
 
-    fn apply_parallel_reduction(
+    /// Solves subdomains `ids` into `outputs`, their slots of the local-output buffer.
+    fn solve_span(
         &self,
-        allow_inner_parallelism: bool,
+        ids: Range<usize>,
+        outputs: &mut [f64],
         r: &[f64],
-        z: &mut [f64],
-        pool: &mut Vec<AdditiveSweepBuffers>,
+        scratch: &mut LocalSolveScratch,
+        allow_inner_parallelism: bool,
     ) -> Result<(), SolveError> {
-        let worker_buffers = WorkerReductionBuffers::new(
-            std::mem::take(pool),
-            self.buf_pool.n_dofs(),
-            self.buf_pool.max_scratch_size(),
-        );
-        let apply_result =
-            self.subdomains
-                .par_iter()
-                .enumerate()
-                .try_for_each(|(subdomain, entry)| {
-                    worker_buffers.stack.with_buffer(|buffers| {
-                        entry
-                            .apply_weighted_into_with_scratch(
-                                r,
-                                &mut buffers.global_accum,
-                                &mut buffers.scratch.r_scratch,
-                                &mut buffers.scratch.z_scratch,
-                                allow_inner_parallelism,
-                            )
-                            .map_err(|source| SolveError::LocalSolveFailed { subdomain, source })
-                    })
-                });
-
-        // A pool-recovery failure must not mask a real `LocalSolveFailed`.
-        match worker_buffers.finish_round(z, &apply_result) {
-            Ok(recovered) => *pool = recovered,
-            Err(finish_err) => return apply_result.and(Err(finish_err)),
+        let starts = &self.layout.starts;
+        let base = starts[ids.start];
+        for i in ids {
+            self.subdomains[i]
+                .apply_weighted_local(
+                    r,
+                    &mut outputs[starts[i] - base..starts[i + 1] - base],
+                    &mut scratch.r_scratch,
+                    &mut scratch.z_scratch,
+                    allow_inner_parallelism,
+                )
+                .map_err(|source| SolveError::LocalSolveFailed {
+                    subdomain: i,
+                    source,
+                })?;
         }
-
-        apply_result
+        Ok(())
     }
 }
 
@@ -169,7 +147,9 @@ impl<S: LocalSolver> Clone for AdditiveExecutor<S> {
     fn clone(&self) -> Self {
         Self {
             subdomains: Arc::clone(&self.subdomains),
-            buf_pool: self.buf_pool.clone(),
+            layout: Arc::clone(&self.layout),
+            pool: self.pool.clone(),
+            max_scratch_size: self.max_scratch_size,
         }
     }
 }

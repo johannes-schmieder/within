@@ -5,7 +5,8 @@
 //! subdomain entries once to derive `max_scratch_size` and the scheduling
 //! metrics (and, unless given explicitly, `n_dofs`). `apply` reuses pooled
 //! scratch buffers — no large per-apply allocation, but a short buffer-pool
-//! lock is taken on both borrow and return.
+//! lock is taken on both borrow and return. The result does not depend on the
+//! Rayon thread count.
 
 use std::sync::Arc;
 
@@ -14,10 +15,9 @@ use crate::local_solve::{LocalSolver, SubdomainEntry};
 use crate::Operator;
 
 use super::executor::AdditiveExecutor;
-use super::planning::{AdditiveScheduler, ReductionPlan, ReductionStrategy};
+use super::planning::{AdditiveScheduler, ReductionStrategy};
 
-/// Persists `n_dofs`, which entries alone cannot recover when some columns are uncovered,
-/// plus the configured reduction strategy (including `Auto`, before runtime resolution).
+/// Persists `n_dofs`, which entries alone cannot recover when some columns are uncovered.
 #[cfg(feature = "serde")]
 impl<S> serde::Serialize for SchwarzPreconditioner<S>
 where
@@ -102,7 +102,6 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
         let mut max_scratch_size: usize = 0;
         let mut total_inner_parallel_work: usize = 0;
         let mut max_inner_parallel_work: usize = 0;
-        let mut total_scatter_dofs: usize = 0;
         let mut covered_span: usize = 0;
 
         for entry in &entries {
@@ -111,9 +110,7 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
             max_inner_parallel_work = max_inner_parallel_work.max(work);
             max_scratch_size = max_scratch_size.max(entry.scratch_size());
 
-            let indices = entry.global_indices();
-            total_scatter_dofs = total_scatter_dofs.saturating_add(indices.len());
-            if let Some(&max_idx) = indices.iter().max() {
+            if let Some(&max_idx) = entry.global_indices().iter().max() {
                 covered_span = covered_span.max(max_idx as usize + 1);
             }
         }
@@ -127,7 +124,6 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
         let scheduler = AdditiveScheduler {
             total_inner_parallel_work,
             max_inner_parallel_work,
-            total_scatter_dofs,
         };
         Self {
             reduction_strategy: strategy,
@@ -141,9 +137,9 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
         self.executor.subdomains()
     }
 
-    /// Concrete backend selected for the current Rayon thread-pool width.
+    /// The configured strategy, which `apply` ignores.
     pub fn reduction_strategy(&self) -> ReductionStrategy {
-        self.reduction_plan().strategy.as_public()
+        self.reduction_strategy
     }
 
     /// Operator apply that propagates local-solver failures.
@@ -161,18 +157,9 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
                 message: format!("z.len() ({}) != n_dofs ({})", z.len(), n_dofs),
             });
         }
-        let plan = self.reduction_plan();
-        self.executor.apply(plan, r, z)
-    }
-
-    fn reduction_plan(&self) -> ReductionPlan {
         let threads = rayon::current_num_threads().max(1);
-        self.scheduler.reduction_plan(
-            self.reduction_strategy,
-            threads,
-            self.executor.n_subdomains(),
-            self.executor.n_dofs(),
-        )
+        self.executor
+            .apply(self.scheduler.allow_inner_parallelism(threads), r, z)
     }
 }
 
