@@ -12,7 +12,7 @@ use schwarz_precond::SubdomainCore;
 use crate::csr_block::CsrBlock;
 use crate::domain::{build_local_domains, LocalDomain, PreparedDesign};
 use crate::domain::{CrossTab, LocalComponent};
-use crate::operator::schwarz::{build_additive, SchwarzConfig};
+use crate::operator::schwarz::build_additive;
 use schwarz_precond::{LocalSolver, Operator};
 
 const BLOCK_ELIM_NESTED_RAYON_CHILD_ENV: &str = "WITHIN_TEST_BLOCK_ELIM_NESTED_RAYON_CHILD";
@@ -113,14 +113,8 @@ fn run_block_elim_nested_rayon_case() {
     };
     let rhs: Vec<f64> = (0..n_dofs).map(|i| ((i % 29) as f64) - 14.0).collect();
 
-    let schwarz = build_additive(
-        domain_pairs,
-        &SchwarzConfig {
-            local_solver: config,
-        },
-        n_dofs,
-    )
-    .expect("build block-elim preconditioner");
+    let schwarz =
+        build_additive(domain_pairs, &config, n_dofs).expect("build block-elim preconditioner");
 
     // Two subdomains: inner parallelism is off in a 1-thread pool and on in a 4-thread pool.
     let apply_in = |threads: usize| {
@@ -189,11 +183,12 @@ fn test_block_elim_nested_rayon_does_not_deadlock() {
 #[test]
 fn test_build_additive() {
     let (design, domain_pairs) = make_test_data();
-    let config = SchwarzConfig {
-        local_solver: LocalSolverConfig::default(),
-    };
-    let schwarz = build_additive(domain_pairs, &config, design.design.n_dofs)
-        .expect("build schwarz with explicit domains");
+    let schwarz = build_additive(
+        domain_pairs,
+        &LocalSolverConfig::default(),
+        design.design.n_dofs,
+    )
+    .expect("build schwarz with explicit domains");
     let r = vec![1.0; design.design.n_dofs];
     let mut z = vec![0.0; design.design.n_dofs];
     schwarz.apply(&r, &mut z).expect("schwarz apply succeeds");
