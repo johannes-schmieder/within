@@ -266,12 +266,136 @@ fn both_accumulators_recover_signed_cells_and_reset_compensation() {
         col_load: Unit,
         sqrt_weights: None,
     };
+    let other_loading = PairColumns {
+        row_levels: &rows,
+        col_levels: &cols,
+        row_load: Unit,
+        col_load: &loading[..],
+        sqrt_weights: None,
+    };
     for actual in [
         accumulate_dense_cross_block(pair, 2, 2),
         accumulate_sparse_cross_block(pair, 2, 2),
+        accumulate_dense_cross_block(other_loading, 2, 2),
+        accumulate_sparse_cross_block(other_loading, 2, 2),
     ] {
         assert_eq!(actual.indptr, [0, 2, 3]);
         assert_eq!(actual.indices, [0, 1, 0]);
         assert_eq!(actual.data, [1., 2., 1.]);
+    }
+}
+
+#[test]
+fn categorical_cells_match_independent_integer_counts_bit_for_bit() {
+    use std::collections::BTreeMap;
+
+    // Missing rows/columns, repeated cells, descending/nonmonotone labels, and
+    // counts spanning several binary carries. The oracle counts integers by key,
+    // independently of either accumulator's flat-table or bucket representation.
+    let fixtures = [
+        (7, 8, Vec::<(u32, u32)>::new()),
+        (7, 8, vec![(5, 6); 257]),
+        (
+            7,
+            8,
+            [
+                (5, 6),
+                (1, 2),
+                (5, 1),
+                (1, 2),
+                (3, 6),
+                (5, 6),
+                (3, 1),
+                (1, 4),
+            ]
+            .into_iter()
+            .cycle()
+            .take(513)
+            .collect(),
+        ),
+        (
+            19,
+            23,
+            (0..65_537)
+                .rev()
+                .map(|i| (((i * 7) % 17) as u32, ((i * 13 + i / 17) % 19) as u32))
+                .collect(),
+        ),
+    ];
+    for (n_rows, n_cols, observations) in fixtures {
+        let (rows, cols): (Vec<_>, Vec<_>) = observations.iter().copied().unzip();
+        let mut counts = BTreeMap::<(u32, u32), u64>::new();
+        for key in observations {
+            *counts.entry(key).or_default() += 1;
+        }
+        let mut expected_indptr = vec![0u32];
+        let mut expected_indices = Vec::new();
+        let mut expected_bits = Vec::new();
+        for row in 0..n_rows {
+            for (&(r, c), &count) in &counts {
+                if r as usize == row {
+                    expected_indices.push(c);
+                    expected_bits.push((count as f64).to_bits());
+                }
+            }
+            expected_indptr.push(expected_indices.len() as u32);
+        }
+        let pair = PairColumns {
+            row_levels: &rows,
+            col_levels: &cols,
+            row_load: Unit,
+            col_load: Unit,
+            sqrt_weights: None,
+        };
+        // Option::None has the same mathematical loading but deliberately uses
+        // the generic compensated kernel; sparse retains its separate algorithm.
+        let generic = PairColumns {
+            row_levels: &rows,
+            col_levels: &cols,
+            row_load: None,
+            col_load: None,
+            sqrt_weights: None,
+        };
+        for actual in [
+            accumulate_dense_cross_block(pair, n_rows, n_cols),
+            accumulate_sparse_cross_block(pair, n_rows, n_cols),
+            accumulate_dense_cross_block(generic, n_rows, n_cols),
+        ] {
+            assert_eq!((actual.nrows, actual.ncols), (n_rows, n_cols));
+            assert_eq!(actual.indptr, expected_indptr);
+            assert_eq!(actual.indices, expected_indices);
+            assert_eq!(
+                actual.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected_bits
+            );
+        }
+    }
+}
+
+#[test]
+fn weighted_unit_cells_keep_small_contributions() {
+    // Exact weighted total is 10^16 + 2. Uncompensated addition would lose the
+    // two unit contributions even though both channels are intercepts.
+    let rows = [0, 0, 0, 1, 1];
+    let cols = [0, 0, 0, 0, 1];
+    let roots = [1e8, 1., 1., 0., 0.5];
+    let pair = PairColumns {
+        row_levels: &rows,
+        col_levels: &cols,
+        row_load: Unit,
+        col_load: Unit,
+        sqrt_weights: Some(&roots),
+    };
+    for actual in [
+        accumulate_dense_cross_block(pair, 2, 2),
+        accumulate_sparse_cross_block(pair, 2, 2),
+    ] {
+        assert_eq!(actual.indptr, [0, 1, 2]);
+        assert_eq!(actual.indices, [0, 1]);
+        assert_eq!(
+            actual.data[0].to_bits(),
+            10_000_000_000_000_002f64.to_bits()
+        );
+        assert_eq!(actual.data[1].to_bits(), 0.25f64.to_bits());
     }
 }
