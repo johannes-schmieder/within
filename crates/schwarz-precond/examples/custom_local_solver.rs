@@ -74,9 +74,21 @@ impl DenseCholeskyLocalSolver {
             n_local: m,
         }
     }
+}
 
-    /// Solve L L^T x = b in place via forward/backward substitution.
-    fn solve(&self, x: &mut [f64]) {
+impl LocalSolver for DenseCholeskyLocalSolver {
+    fn n_local(&self) -> usize {
+        self.n_local
+    }
+    fn workspace_len(&self) -> usize {
+        0
+    }
+    fn solve_local(
+        &self,
+        x: &mut [f64],
+        _workspace: &mut [f64],
+        _allow_inner_parallelism: bool,
+    ) -> Result<(), LocalSolveError> {
         let m = self.n_local;
 
         // Forward solve: L z = b, z overwriting b
@@ -96,23 +108,6 @@ impl DenseCholeskyLocalSolver {
             }
             x[i] = s / self.l_row_major[i * m + i];
         }
-    }
-}
-
-impl LocalSolver for DenseCholeskyLocalSolver {
-    fn n_local(&self) -> usize {
-        self.n_local
-    }
-    fn workspace_len(&self) -> usize {
-        0
-    }
-    fn solve_local(
-        &self,
-        x: &mut [f64],
-        _workspace: &mut [f64],
-        _allow_inner_parallelism: bool,
-    ) -> Result<(), LocalSolveError> {
-        self.solve(x);
         Ok(())
     }
 }

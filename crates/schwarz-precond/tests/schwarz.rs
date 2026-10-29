@@ -248,10 +248,11 @@ fn test_additive_schwarz_operator_dimensions(
     }
 }
 
-#[test]
-fn test_additive_schwarz_parallel_apply_stress_no_panics() {
-    let n = 64;
-    let schwarz = SchwarzPreconditioner::new(make_schwarz_entries(n));
+#[rstest]
+fn test_additive_schwarz_parallel_apply_stress_no_panics(
+    #[with(64)] schwarz: SchwarzPreconditioner<UniformDiagLocalSolver>,
+) {
+    let n = schwarz.nrows();
 
     let rhs_columns: Vec<Vec<f64>> = (0..128)
         .map(|k| {

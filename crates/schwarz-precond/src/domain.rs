@@ -131,15 +131,12 @@ impl SubdomainCore {
         }
     }
 
-    /// Weighting in local coordinates: `out[i] = w[i] * local[i]`
+    /// Weighting in local coordinates: `local[i] *= w[i]`
     #[inline]
-    pub(crate) fn weight(&self, local: &[f64], out: &mut [f64]) {
-        match &self.partition_weights {
-            PartitionWeights::Uniform(_) => out.copy_from_slice(local),
-            PartitionWeights::NonUniform(w) => {
-                for ((o, &li), &wi) in out.iter_mut().zip(local).zip(w) {
-                    *o = li * wi;
-                }
+    pub(crate) fn weight(&self, local: &mut [f64]) {
+        if let PartitionWeights::NonUniform(w) = &self.partition_weights {
+            for (li, &wi) in local.iter_mut().zip(w) {
+                *li *= wi;
             }
         }
     }

@@ -62,35 +62,37 @@ pub struct SchwarzPreconditioner<S: LocalSolver> {
     /// One per concurrent apply; every apply rewrites all slots, so a failure leaves nothing stale.
     local_outputs: Arc<Pool>,
     /// One per running span of subdomains.
-    scratch: Arc<Pool>,
+    workspaces: Arc<Pool>,
     outer_capacity: f64,
 }
 
 impl<S: LocalSolver> SchwarzPreconditioner<S> {
     const MIN_INNER_PARALLEL_WORK: usize = 200_000;
     const OUTER_CAPACITY_TARGET: f64 = 0.75;
+    /// Each spans every slot, so a burst of concurrent applies must not stay resident.
+    const MAX_FREE_LOCAL_OUTPUTS: usize = 4;
 
     /// Infers `n_dofs` from the maximum global index; only valid when every DOF is covered.
     pub fn new(entries: Vec<SubdomainEntry<S>>) -> Self {
-        Self::build(entries, None)
+        let n_dofs = covered_span(&entries);
+        Self::with_n_dofs(entries, n_dofs)
     }
 
     /// Explicit global DOF count; an uncovered column stays in the null space and applies to `0`.
     pub fn with_n_dofs(entries: Vec<SubdomainEntry<S>>, n_dofs: usize) -> Self {
-        Self::build(entries, Some(n_dofs))
-    }
-
-    fn build(entries: Vec<SubdomainEntry<S>>, n_dofs: Option<usize>) -> Self {
-        let n_dofs = n_dofs.unwrap_or_else(|| covered_span(&entries));
-        debug_assert!(
-            n_dofs >= covered_span(&entries),
-            "n_dofs ({n_dofs}) is below the covered index span"
-        );
         let prolongation = Prolongation::new(entries.iter().map(|e| e.global_indices()), n_dofs);
-        let scratch_len = entries.iter().map(|e| e.scratch_len()).max().unwrap_or(0);
+        let workspace_len = entries
+            .iter()
+            .map(|e| e.solver().workspace_len())
+            .max()
+            .unwrap_or(0);
         Self {
-            local_outputs: Arc::new(Pool::new(prolongation.n_slots())),
-            scratch: Arc::new(Pool::new(scratch_len)),
+            local_outputs: Arc::new(Pool::new(
+                prolongation.n_slots(),
+                Self::MAX_FREE_LOCAL_OUTPUTS,
+            )),
+            // Sized by the largest subdomain only; the old per-thread stacks were uncapped too.
+            workspaces: Arc::new(Pool::new(workspace_len, usize::MAX)),
             outer_capacity: Self::outer_capacity(&entries),
             subdomains: Arc::new(entries),
             prolongation: Arc::new(prolongation),
@@ -125,16 +127,43 @@ impl<S: LocalSolver> SchwarzPreconditioner<S> {
     pub fn apply(&self, r: &[f64], z: &mut [f64]) -> Result<(), SolveError> {
         self.check_len("r", r.len())?;
         self.check_len("z", z.len())?;
-        let sweep = Sweep {
-            preconditioner: self,
-            r,
-            allow_inner_parallelism: self.allow_inner_parallelism(),
-        };
+        let allow_inner_parallelism = self.allow_inner_parallelism();
+        let p = &*self.prolongation;
         self.local_outputs.lend(|outputs| {
-            sweep.solve_all(outputs)?;
-            self.prolongation.apply(outputs, z);
+            let all = Span {
+                ids: 0..self.subdomains.len(),
+                outputs: &mut *outputs,
+            };
+            rayon::iter::split(all, |span| span.halve(p)).try_for_each(|span| {
+                self.workspaces
+                    .lend(|workspace| self.solve_span(span, r, workspace, allow_inner_parallelism))
+            })?;
+            p.apply(outputs, z);
             Ok(())
         })
+    }
+
+    fn solve_span(
+        &self,
+        mut span: Span<'_>,
+        r: &[f64],
+        workspace: &mut [f64],
+        allow_inner_parallelism: bool,
+    ) -> Result<(), SolveError> {
+        for i in span.ids.clone() {
+            self.subdomains[i]
+                .apply_weighted_local(
+                    r,
+                    span.outputs_of(i, &self.prolongation),
+                    workspace,
+                    allow_inner_parallelism,
+                )
+                .map_err(|source| SolveError::LocalSolveFailed {
+                    subdomain: i,
+                    source,
+                })?;
+        }
+        Ok(())
     }
 
     fn check_len(&self, name: &str, len: usize) -> Result<(), SolveError> {
@@ -197,55 +226,14 @@ impl Span<'_> {
     }
 }
 
-/// One apply's fixed inputs.
-struct Sweep<'a, S: LocalSolver> {
-    preconditioner: &'a SchwarzPreconditioner<S>,
-    r: &'a [f64],
-    allow_inner_parallelism: bool,
-}
-
-impl<S: LocalSolver> Sweep<'_, S> {
-    /// Solves every subdomain into its slots of `outputs`, in parallel over halved spans.
-    fn solve_all(&self, outputs: &mut [f64]) -> Result<(), SolveError> {
-        let p = &*self.preconditioner.prolongation;
-        let all = Span {
-            ids: 0..self.preconditioner.subdomains.len(),
-            outputs,
-        };
-        rayon::iter::split(all, |span| span.halve(p)).try_for_each(|span| {
-            self.preconditioner
-                .scratch
-                .lend(|scratch| self.solve(span, scratch))
-        })
-    }
-
-    fn solve(&self, mut span: Span<'_>, scratch: &mut [f64]) -> Result<(), SolveError> {
-        let p = &*self.preconditioner.prolongation;
-        for i in span.ids.clone() {
-            self.preconditioner.subdomains[i]
-                .apply_weighted_local(
-                    self.r,
-                    span.outputs_of(i, p),
-                    scratch,
-                    self.allow_inner_parallelism,
-                )
-                .map_err(|source| SolveError::LocalSolveFailed {
-                    subdomain: i,
-                    source,
-                })?;
-        }
-        Ok(())
-    }
-}
-
 impl<S: LocalSolver> Clone for SchwarzPreconditioner<S> {
-    /// Clone shares subdomain data and the buffer pool via `Arc`: O(1) and fully interchangeable.
+    /// Clone shares subdomain data and the buffer pools via `Arc`: O(1) and fully interchangeable.
     fn clone(&self) -> Self {
         Self {
             subdomains: Arc::clone(&self.subdomains),
             prolongation: Arc::clone(&self.prolongation),
             local_outputs: Arc::clone(&self.local_outputs),
-            scratch: Arc::clone(&self.scratch),
+            workspaces: Arc::clone(&self.workspaces),
             outer_capacity: self.outer_capacity,
         }
     }

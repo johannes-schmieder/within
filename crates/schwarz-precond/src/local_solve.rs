@@ -23,7 +23,7 @@ pub trait LocalSolver: Send + Sync {
     /// Length of the private `workspace` that `solve_local` gets with stale contents.
     fn workspace_len(&self) -> usize;
 
-    /// Solves in place: `x` spans `n_local()`, rhs in, solution out; bits ignore hint and threads.
+    /// Solves in place: `x` spans `n_local()`, rhs in, solution out; bits depend on `x` alone.
     fn solve_local(
         &self,
         x: &mut [f64],
@@ -80,28 +80,24 @@ impl<S: LocalSolver> SubdomainEntry<S> {
         self.core.is_empty()
     }
 
-    /// Room for the local `x` and solver workspace of [`Self::apply_weighted_local`].
-    pub(crate) fn scratch_len(&self) -> usize {
-        self.core.n_local() + self.solver.workspace_len()
-    }
-
-    /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; `scratch` must hold `scratch_len()`.
+    /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; `workspace` holds at least `workspace_len()`.
     pub(crate) fn apply_weighted_local(
         &self,
         r: &[f64],
         out: &mut [f64],
-        scratch: &mut [f64],
+        workspace: &mut [f64],
         allow_inner_parallelism: bool,
     ) -> Result<(), LocalSolveError> {
         if self.core.is_empty() {
             return Ok(());
         }
-        let (x, rest) = scratch.split_at_mut(self.core.n_local());
-        let workspace = &mut rest[..self.solver.workspace_len()];
-        self.core.restrict_weighted(r, x);
-        self.solver
-            .solve_local(x, workspace, allow_inner_parallelism)?;
-        self.core.weight(x, out);
+        self.core.restrict_weighted(r, out);
+        self.solver.solve_local(
+            out,
+            &mut workspace[..self.solver.workspace_len()],
+            allow_inner_parallelism,
+        )?;
+        self.core.weight(out);
         Ok(())
     }
 }
@@ -151,7 +147,6 @@ mod tests {
     use crate::domain::PartitionWeights;
     use rstest::rstest;
 
-    /// Identity local solver.
     struct IdentityLocalSolver {
         n: usize,
     }
@@ -201,9 +196,8 @@ mod tests {
         core.restrict_weighted(&global, &mut local);
         assert_eq!(local, restricted);
 
-        let mut out = vec![0.0; weighted.len()];
-        core.weight(&local, &mut out);
-        assert_eq!(out, weighted);
+        core.weight(&mut local);
+        assert_eq!(local, weighted);
     }
 
     #[test]
@@ -214,10 +208,8 @@ mod tests {
 
         let r = vec![10.0, 20.0, 30.0, 40.0];
         let mut out = vec![0.0; 2];
-        let mut scratch = vec![0.0; entry.scratch_len()];
-
         entry
-            .apply_weighted_local(&r, &mut out, &mut scratch, true)
+            .apply_weighted_local(&r, &mut out, &mut [], true)
             .expect("identity local solver should not fail");
 
         // Restricts DOFs [1, 2] → [20, 30] and solves with the identity.
