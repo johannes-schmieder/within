@@ -54,9 +54,11 @@ fn backsub_block_from_scaled_rhs(
         let start = cross_matrix.indptr[i] as usize;
         let end = cross_matrix.indptr[i + 1] as usize;
         let mut sum = 0.0;
-        for idx in start..end {
-            let j = cross_matrix.indices[idx] as usize;
-            sum += cross_matrix.data[idx] * sol_source[j];
+        for (&j, &value) in cross_matrix.indices[start..end]
+            .iter()
+            .zip(&cross_matrix.data[start..end])
+        {
+            sum += value * sol_source[j as usize];
         }
         scaled_rhs[i] + (inv_diag[i] * sum)
     };
