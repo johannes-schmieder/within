@@ -73,7 +73,7 @@ pub use domain::{PartitionWeights, SubdomainCore};
 pub use error::{BuildError, LocalSolveError, SolveError};
 pub use local_solve::{LocalSolver, SubdomainEntry};
 pub use lsmr::{
-    lsmr, mlsmr, EscalationHandler, EscalationPolicy, LsmrResult, LsmrStopReason, MlsmrOptions,
-    Progress, Staleness, StalenessError,
+    lsmr, lsmr_counted, mlsmr, mlsmr_counted, EscalationHandler, EscalationPolicy, LsmrFailure,
+    LsmrResult, LsmrStopReason, MlsmrOptions, Progress, Staleness, StalenessError,
 };
 pub use schwarz::{ReductionStrategy, SchwarzPreconditioner};

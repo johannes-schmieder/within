@@ -253,6 +253,25 @@ assert_eq!(result.x.len(), 4); // two observed levels in each of two factors
 | `CoefficientAddress` | `{ channel: Channel { term, column }, level: u32 }` |
 | `CoefficientLayout` | `index(CoefficientAddress) -> Option<usize>`, `address(usize) -> Option<CoefficientAddress>`, `n_dofs()`, `n_terms()`, `n_levels(term)`, `n_columns(term)` |
 
+### Caller-controlled attempts
+
+`Solver::solve_controlled(y, options, SolveControl { initial_coefficients,
+escalation })` exposes warm starts and the existing `EscalationPolicy` without
+switching preconditioners. Construct the solver with an explicit fixed
+`Off`, `Diagonal`, or `Additive` configuration; adaptive solvers are rejected.
+The result contains `solution: SolveResult` and `stop_reason: LsmrStopReason`.
+An early-stop handler can request `Escalated`, then the caller can build its
+chosen preconditioner and seed the next attempt with `solution.x`.
+
+Initial coefficients use the returned coefficient layout and original slope
+units, regardless of weights or observation sorting. Nonzero unidentified
+slots are rejected. Always provide the original response, including for a
+correction after independent validation, so convergence references do not
+reset to the smaller correction response. Debit `solution.iterations` on
+success or `ControlledSolveError.iterations` on failure from a shared budget;
+the latter includes a failing attempted iteration. This API retains no Krylov
+recurrence and is currently Rust-only.
+
 ### Varying slopes
 
 Pass a `Vec<Effect>` instead of a categories array. Each term is a factor's

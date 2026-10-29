@@ -148,6 +148,15 @@ impl<'a> PreparedDesign<'a> {
         diag
     }
 
+    /// Map coefficients in the returned layout into the solve basis.
+    pub(crate) fn forward_transform(&self, x: &mut [f64]) {
+        for (t, reparam) in self.design.terms.iter().zip(&self.reparams) {
+            if let Some(reparam) = reparam {
+                reparam.forward_transform(t, x);
+            }
+        }
+    }
+
     /// Map solve-basis coefficients back to the user's parametrization.
     pub(crate) fn back_transform(&self, x: &mut [f64]) {
         for (t, reparam) in self.design.terms.iter().zip(&self.reparams) {

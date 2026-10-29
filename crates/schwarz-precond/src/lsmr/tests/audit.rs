@@ -81,6 +81,7 @@ fn scripted_run(
         SolveStart {
             x0: None,
             reference: NormalEqReference::cold(step1, Magnitude::product(step1.alpha, step1.beta)),
+            attempted: &mut 0,
         },
         criteria,
         maxiter,
