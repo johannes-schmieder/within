@@ -19,6 +19,9 @@ const DENSE_TABLE_MAX_BYTES: usize = 40_000_000;
 
 /// A channel's per-observation loading.
 pub(crate) trait Loading: Copy {
+    /// A structural intercept, rather than an observation-dependent loading.
+    const IS_UNIT: bool = false;
+
     fn at(self, uid: usize) -> f64;
 }
 
@@ -27,6 +30,8 @@ pub(crate) trait Loading: Copy {
 pub(super) struct Unit;
 
 impl Loading for Unit {
+    const IS_UNIT: bool = true;
+
     #[inline]
     fn at(self, _uid: usize) -> f64 {
         1.0
@@ -187,6 +192,19 @@ pub(super) fn accumulate_dense_cross_block<Lq: Loading, Lr: Loading>(
     n_cols: usize,
 ) -> CsrBlock {
     let mut table = vec![0.0f64; n_rows * n_cols];
+    if Lq::IS_UNIT
+        && Lr::IS_UNIT
+        && cols.sqrt_weights.is_none()
+        && cols.row_levels.len() as u64 <= (1u64 << 53)
+    {
+        // Every cell and intermediate sum is an integer <= n_obs <= 2^53.
+        // Adding 1 is exact, so the compensated path's corrections are all zero.
+        for o in cols.observations() {
+            debug_assert!(o.row < n_rows && o.col < n_cols);
+            table[o.row * n_cols + o.col] += 1.0;
+        }
+        return CsrBlock::from_dense_table(&table, n_rows, n_cols);
+    }
     let mut corrections = vec![0.0f64; table.len()];
 
     for o in cols.observations() {
