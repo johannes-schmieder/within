@@ -22,9 +22,7 @@
 //! ULP scale — reproducible within solver tolerance, not bitwise. Pinning the
 //! Rayon width across runs holds estimates stable within solver tolerance (and
 //! is bitwise in practice at a fixed width, though only the single-threaded
-//! case is a guarantee); when the width may vary, also pin an explicit
-//! [`ReductionStrategy`] rather than [`ReductionStrategy::Auto`], which selects
-//! its backend from the width.
+//! case is a guarantee).
 //!
 //! [`PreconditionerConfig::Adaptive`] reproduces raw coefficients per solve, not
 //! across solves; fitted values agree.
@@ -43,7 +41,7 @@ pub(crate) mod solver;
 pub use channel::{Channel, ChannelPair, CoefficientAddress};
 pub use config::{
     ApproxCholConfig, ApproxSchurConfig, LocalSolverConfig, LsmrOptions, PreconditionerConfig,
-    ReductionStrategy, ScalingConfig, ScalingFailure, SchurMode, Staleness, StalenessError,
+    ScalingConfig, ScalingFailure, SchurMode, Staleness, StalenessError,
 };
 pub use domain::{Design, Effect};
 pub use error::{BuildError, BuildWarning, SolveError, WithinError};

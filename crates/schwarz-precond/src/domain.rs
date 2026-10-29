@@ -5,8 +5,6 @@
 //!   to form a Schwarz term `Rᵢᵀ D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ`.
 //! - [`PartitionWeights`] — per-DOF weights, uniform constant or explicit vector.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use crate::error::BuildError;
 
 /// PoU weights for a subdomain; the common uniform-1.0 case avoids allocating.
@@ -39,24 +37,6 @@ impl PartitionWeights {
     /// Returns `true` if there are no weights.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-}
-
-/// Atomic add for f64 using CAS loop on `AtomicU64` bit representation.
-#[inline(always)]
-fn atomic_f64_add(target: &AtomicU64, val: f64) {
-    let mut old_bits = target.load(Ordering::Relaxed);
-    loop {
-        let new_val = f64::from_bits(old_bits) + val;
-        match target.compare_exchange_weak(
-            old_bits,
-            new_val.to_bits(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(x) => old_bits = x,
-        }
     }
 }
 
@@ -132,7 +112,7 @@ impl SubdomainCore {
 
     /// Weighted gather: `local[i] = w[i] * global[idx[i]]`
     #[inline]
-    pub fn restrict_weighted(&self, global: &[f64], local: &mut [f64]) {
+    pub(crate) fn restrict_weighted(&self, global: &[f64], local: &mut [f64]) {
         match &self.partition_weights {
             PartitionWeights::Uniform(_) => {
                 for (dst, &gi) in local.iter_mut().zip(self.global_indices.iter()) {
@@ -151,51 +131,12 @@ impl SubdomainCore {
         }
     }
 
-    /// Weighted scatter: `global[idx[i]] += w[i] * local[i]`
+    /// Weighting in local coordinates: `local[i] *= w[i]`
     #[inline]
-    pub fn prolongate_weighted_add(&self, local: &[f64], global: &mut [f64]) {
-        match &self.partition_weights {
-            PartitionWeights::Uniform(_) => {
-                for (&gi, &li) in self.global_indices.iter().zip(local.iter()) {
-                    global[gi as usize] += li;
-                }
-            }
-            PartitionWeights::NonUniform(w) => {
-                for ((&gi, &li), &wi) in self.global_indices.iter().zip(local.iter()).zip(w.iter())
-                {
-                    global[gi as usize] += li * wi;
-                }
-            }
-        }
-    }
-
-    /// Weighting in local coordinates: `out[i] = w[i] * local[i]`
-    #[inline]
-    pub(crate) fn weight(&self, local: &[f64], out: &mut [f64]) {
-        match &self.partition_weights {
-            PartitionWeights::Uniform(_) => out.copy_from_slice(&local[..out.len()]),
-            PartitionWeights::NonUniform(w) => {
-                for ((o, &li), &wi) in out.iter_mut().zip(local).zip(w) {
-                    *o = li * wi;
-                }
-            }
-        }
-    }
-
-    /// Weighted scatter into atomic accumulator: `global[idx[i]] += w[i] * local[i]`
-    #[inline]
-    pub fn prolongate_weighted_add_atomic(&self, local: &[f64], global: &[AtomicU64]) {
-        match &self.partition_weights {
-            PartitionWeights::Uniform(_) => {
-                for (&gi, &li) in self.global_indices.iter().zip(local.iter()) {
-                    atomic_f64_add(&global[gi as usize], li);
-                }
-            }
-            PartitionWeights::NonUniform(w) => {
-                for ((&gi, &li), &wi) in self.global_indices.iter().zip(local.iter()).zip(w.iter())
-                {
-                    atomic_f64_add(&global[gi as usize], li * wi);
-                }
+    pub(crate) fn weight(&self, local: &mut [f64]) {
+        if let PartitionWeights::NonUniform(w) = &self.partition_weights {
+            for (li, &wi) in local.iter_mut().zip(w) {
+                *li *= wi;
             }
         }
     }

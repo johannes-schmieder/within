@@ -78,4 +78,4 @@ pub use lsmr::{
     lsmr, mlsmr, EscalationHandler, EscalationPolicy, LsmrResult, LsmrStopReason, MlsmrOptions,
     Progress, Staleness, StalenessError,
 };
-pub use schwarz::{ReductionStrategy, SchwarzPreconditioner};
+pub use schwarz::SchwarzPreconditioner;
