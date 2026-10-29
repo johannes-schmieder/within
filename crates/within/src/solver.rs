@@ -8,15 +8,16 @@ use std::time::Instant;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
 use schwarz_precond::{
-    lsmr as lsmr_solve, mlsmr, EscalationPolicy, LsmrResult, LsmrStopReason, MlsmrOptions,
+    lsmr_cancellable, mlsmr_cancellable, EscalationPolicy, LsmrResult, LsmrStopReason, MlsmrOptions,
 };
 
+use crate::cancellation::checkpoint;
 use crate::channel::CoefficientAddress;
 use crate::config::{LsmrOptions, PreconditionerConfig};
 use crate::domain::{Design, Effect, PreparedDesign};
 use crate::operator::schwarz::Preconditioner;
 use crate::operator::DesignOperator;
-use crate::{BuildError, BuildWarning, SolveError, WithinError};
+use crate::{BuildError, BuildWarning, Cancellation, SolveError, WithinError};
 
 mod controlled;
 mod ladder;
@@ -305,28 +306,52 @@ impl<'a> Solver<'a> {
         weights: Option<&[f64]>,
         preconditioner: impl Into<PreconditionerInput>,
     ) -> Result<Self, BuildError> {
+        Self::new_cancellable(design, weights, preconditioner, Cancellation::default())
+    }
+
+    /// Construct with caller cancellation between major construction stages.
+    ///
+    /// The query is borrowed for this call only; later solves supply their own.
+    /// All dispatched work is joined before cancellation returns. Checks do not
+    /// interrupt observation scans or an in-flight factorization; see [`Cancellation`].
+    pub fn new_cancellable(
+        design: impl IntoDesign<'a>,
+        weights: Option<&[f64]>,
+        preconditioner: impl Into<PreconditionerInput>,
+        cancellation: Cancellation<'_>,
+    ) -> Result<Self, BuildError> {
+        checkpoint(cancellation)?;
+        let design = design.into_design();
+        checkpoint(cancellation)?;
         // Whiten the slope columns (if any) before the preconditioner reads them.
-        let prepared = PreparedDesign::new(design.into_design()?, weights)?;
+        let prepared = PreparedDesign::new(design?, weights);
+        checkpoint(cancellation)?;
+        let prepared = prepared?;
         let n_dofs = prepared.design.n_dofs;
 
         let slot = match preconditioner.into() {
             PreconditionerInput::Default => {
-                PrecondSlot::build(&prepared, PreconditionerConfig::default())?
+                PrecondSlot::build(&prepared, PreconditionerConfig::default(), cancellation)
             }
-            PreconditionerInput::Config(c) => PrecondSlot::build(&prepared, c)?,
+            PreconditionerInput::Config(c) => PrecondSlot::build(&prepared, c, cancellation),
             PreconditionerInput::Prebuilt(p) => {
                 if p.nrows() != n_dofs || p.ncols() != n_dofs {
-                    return Err(BuildError::PreconditionerDimensionMismatch {
+                    Err(BuildError::PreconditionerDimensionMismatch {
                         expected: n_dofs,
                         actual_rows: p.nrows(),
                         actual_cols: p.ncols(),
-                    });
+                    })
+                } else {
+                    PrecondSlot::reuse(&prepared, p)
                 }
-                PrecondSlot::reuse(&prepared, p)?
             }
         };
 
-        Ok(Self { prepared, slot })
+        checkpoint(cancellation)?;
+        Ok(Self {
+            prepared,
+            slot: slot?,
+        })
     }
 
     /// Non-fatal events from the preconditioner build; a reused pre-built preconditioner
@@ -409,7 +434,9 @@ impl<'a> Solver<'a> {
         &self,
         ys: &[&[f64]],
         lsmr: &LsmrOptions,
+        cancellation: Cancellation<'_>,
     ) -> Result<(Vec<RhsSolution>, f64), WithinError> {
+        solve_checkpoint(cancellation)?;
         let (map, ladder) = match &self.slot {
             PrecondSlot::Static { map, .. } => (map.as_ref(), None),
             // A settled ladder never re-probes: its map, or its kept build error, is final.
@@ -427,15 +454,33 @@ impl<'a> Solver<'a> {
         let passes = ys
             .par_iter()
             .map(|y| {
-                let rhs = self.prepare(y)?;
+                solve_checkpoint(cancellation)?;
+                let rhs = self.prepare(y);
+                solve_checkpoint(cancellation)?;
+                let rhs = rhs?;
                 let options = MlsmrOptions {
                     escalation: ladder.map(|a| &a.ladder().stall as &dyn EscalationPolicy),
                     local_size: lsmr.local_size,
                     ..Default::default()
                 };
                 let run = Run::timed(|| match map {
-                    Some(m) => mlsmr(&rhs.op, rhs.b(), m, lsmr.tol, lsmr.maxiter, options),
-                    None => lsmr_solve(&rhs.op, rhs.b(), lsmr.tol, lsmr.maxiter, lsmr.local_size),
+                    Some(m) => mlsmr_cancellable(
+                        &rhs.op,
+                        rhs.b(),
+                        m,
+                        lsmr.tol,
+                        lsmr.maxiter,
+                        options,
+                        cancellation,
+                    ),
+                    None => lsmr_cancellable(
+                        &rhs.op,
+                        rhs.b(),
+                        lsmr.tol,
+                        lsmr.maxiter,
+                        lsmr.local_size,
+                        cancellation,
+                    ),
                 })?;
                 Ok(if stalled(&run.result) {
                     Pass::Stalled(rhs, run)
@@ -443,18 +488,22 @@ impl<'a> Solver<'a> {
                     Pass::Done(self.finish(rhs, run))
                 })
             })
-            .collect::<Result<Vec<_>, SolveError>>()?;
+            .collect::<Result<Vec<_>, SolveError>>();
+        // Rayon collectors join all dispatched RHS before cancellation is returned.
+        solve_checkpoint(cancellation)?;
+        let passes = passes?;
 
         // Built outside the fan-out, so sibling RHS never race for it.
         let build_secs = match ladder {
             Some(a) if passes.iter().any(|p| matches!(p, Pass::Stalled(..))) => {
-                a.escalate(&self.prepared)?
+                a.escalate(&self.prepared, cancellation)?
             }
             _ => 0.0,
         };
         let solutions = passes
             .into_par_iter()
             .map(|pass| {
+                solve_checkpoint(cancellation)?;
                 let (rhs, probe) = match pass {
                     Pass::Done(solution) => return Ok(solution),
                     Pass::Stalled(rhs, probe) => (rhs, probe),
@@ -468,14 +517,24 @@ impl<'a> Solver<'a> {
                     ..Default::default()
                 };
                 let remaining = lsmr.maxiter - rung1.iterations;
-                let mut resumed =
-                    Run::timed(|| mlsmr(&rhs.op, rhs.b(), map, lsmr.tol, remaining, options))?;
+                let mut resumed = Run::timed(|| {
+                    mlsmr_cancellable(
+                        &rhs.op,
+                        rhs.b(),
+                        map,
+                        lsmr.tol,
+                        remaining,
+                        options,
+                        cancellation,
+                    )
+                })?;
                 resumed.result.iterations += rung1.iterations;
                 resumed.solve_secs += probe.solve_secs;
                 Ok(self.finish(rhs, resumed))
             })
-            .collect::<Result<Vec<_>, SolveError>>()?;
-        Ok((solutions, build_secs))
+            .collect::<Result<Vec<_>, SolveError>>();
+        solve_checkpoint(cancellation)?;
+        Ok((solutions?, build_secs))
     }
 
     /// Per-level directions the data cannot identify, shared across all RHS:
@@ -493,17 +552,32 @@ impl<'a> Solver<'a> {
         y: &[f64],
         lsmr: impl Into<Option<&'o LsmrOptions>>,
     ) -> Result<SolveResult, WithinError> {
+        self.solve_cancellable(y, lsmr, Cancellation::default())
+    }
+
+    /// Solve with cooperative cancellation; no partial coefficients are returned.
+    ///
+    /// Covers preparation, iterations, final output, and any Adaptive escalation.
+    /// All parallel work completes before returning; see [`Cancellation`].
+    pub fn solve_cancellable<'o>(
+        &self,
+        y: &[f64],
+        lsmr: impl Into<Option<&'o LsmrOptions>>,
+        cancellation: Cancellation<'_>,
+    ) -> Result<SolveResult, WithinError> {
         let default = LsmrOptions::default();
         let lsmr = lsmr.into().unwrap_or(&default);
 
         let t_start = Instant::now();
-        let (solutions, build_secs) = self.solve_all(&[y], lsmr)?;
+        let solutions = self.solve_all(&[y], lsmr, cancellation);
+        solve_checkpoint(cancellation)?;
+        let (solutions, build_secs) = solutions?;
         let solution = solutions
             .into_iter()
             .next()
             .expect("one RHS yields one solution");
 
-        Ok(SolveResult {
+        let result = SolveResult {
             x: solution.x,
             unidentified: self.unidentified(),
             // Read after solving so a deferred Adaptive build's warnings are included.
@@ -517,7 +591,9 @@ impl<'a> Solver<'a> {
             // A deferred Schwarz build happens between two runs: it is setup, not solve.
             time_setup: solution.gather_secs + build_secs,
             time_solve: solution.time_solve,
-        })
+        };
+        solve_checkpoint(cancellation)?;
+        Ok(result)
     }
 
     /// Solve for multiple RHS vectors in parallel.
@@ -526,12 +602,27 @@ impl<'a> Solver<'a> {
         ys: &[&[f64]],
         lsmr: impl Into<Option<&'o LsmrOptions>>,
     ) -> Result<BatchSolveResult, WithinError> {
+        self.solve_batch_cancellable(ys, lsmr, Cancellation::default())
+    }
+
+    /// Solve a batch with one shared cancellation query.
+    ///
+    /// Cancellation discards the whole batch and joins every dispatched RHS;
+    /// completed RHS results are never returned as a partial batch.
+    pub fn solve_batch_cancellable<'o>(
+        &self,
+        ys: &[&[f64]],
+        lsmr: impl Into<Option<&'o LsmrOptions>>,
+        cancellation: Cancellation<'_>,
+    ) -> Result<BatchSolveResult, WithinError> {
         let t_start = Instant::now();
         let default = LsmrOptions::default();
         let lsmr = lsmr.into().unwrap_or(&default);
         let n_rhs = ys.len();
 
-        let (solutions, build_secs) = self.solve_all(ys, lsmr)?;
+        let solutions = self.solve_all(ys, lsmr, cancellation);
+        solve_checkpoint(cancellation)?;
+        let (solutions, build_secs) = solutions?;
 
         let mut x = Vec::with_capacity(self.prepared.design.n_dofs * n_rhs);
         let mut demeaned = Vec::with_capacity(self.prepared.design.n_obs * n_rhs);
@@ -549,7 +640,7 @@ impl<'a> Solver<'a> {
             time_solve.push(solution.time_solve);
         }
 
-        Ok(BatchSolveResult {
+        let result = BatchSolveResult {
             x,
             unidentified: self.unidentified(),
             // Read after solving so a deferred Adaptive build's warnings are included.
@@ -565,7 +656,9 @@ impl<'a> Solver<'a> {
             time_total: t_start.elapsed().as_secs_f64(),
             n_dofs: self.prepared.design.n_dofs,
             n_obs: self.prepared.design.n_obs,
-        })
+        };
+        solve_checkpoint(cancellation)?;
+        Ok(result)
     }
 
     /// Access the preconditioner (for serialization or reuse across solvers).
@@ -640,4 +733,12 @@ pub fn solve_batch<'a, 'o>(
     result.time_setup += time_setup;
     result.time_total = t_start.elapsed().as_secs_f64();
     Ok(result)
+}
+
+fn solve_checkpoint(cancellation: Cancellation<'_>) -> Result<(), SolveError> {
+    if cancellation.is_cancelled() {
+        Err(SolveError::Cancelled)
+    } else {
+        Ok(())
+    }
 }

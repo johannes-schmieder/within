@@ -20,8 +20,12 @@ const BLOCK_ELIM_NESTED_RAYON_CHILD_ENV: &str = "WITHIN_TEST_BLOCK_ELIM_NESTED_R
 fn make_test_data() -> (PreparedDesign<'static>, Vec<LocalDomain>) {
     let design =
         PreparedDesign::from_levels_for_test(vec![vec![0, 1, 0, 1, 2], vec![0, 0, 1, 1, 0]]);
-    let (domain_pairs, _) =
-        build_local_domains(&design, &LocalSolverConfig::default()).expect("plain domains build");
+    let (domain_pairs, _) = build_local_domains(
+        &design,
+        &LocalSolverConfig::default(),
+        crate::Cancellation::default(),
+    )
+    .expect("plain domains build");
     (design, domain_pairs)
 }
 
@@ -113,8 +117,13 @@ fn run_block_elim_nested_rayon_case() {
     };
     let rhs: Vec<f64> = (0..n_dofs).map(|i| ((i % 29) as f64) - 14.0).collect();
 
-    let schwarz =
-        build_additive(domain_pairs, &config, n_dofs).expect("build block-elim preconditioner");
+    let schwarz = build_additive(
+        domain_pairs,
+        &config,
+        n_dofs,
+        crate::Cancellation::default(),
+    )
+    .expect("build block-elim preconditioner");
 
     // Two subdomains: inner parallelism is off in a 1-thread pool and on in a 4-thread pool.
     let apply_in = |threads: usize| {
@@ -187,6 +196,7 @@ fn test_build_additive() {
         domain_pairs,
         &LocalSolverConfig::default(),
         design.design.n_dofs,
+        crate::Cancellation::default(),
     )
     .expect("build schwarz with explicit domains");
     let r = vec![1.0; design.design.n_dofs];

@@ -5,12 +5,13 @@ use std::time::Instant;
 
 use once_cell::sync::OnceCell;
 
+use crate::cancellation::checkpoint;
 use crate::config::PreconditionerConfig;
 use crate::domain::PreparedDesign;
 use crate::operator::schwarz::{
     build_adaptive, build_diagonal, build_schwarz, AdaptiveLadder, Preconditioner,
 };
-use crate::{BuildError, BuildWarning};
+use crate::{BuildError, BuildWarning, Cancellation};
 
 /// The solver's preconditioner: a fixed map, or an adaptive diagonal→Schwarz ladder.
 pub(super) enum PrecondSlot {
@@ -28,6 +29,18 @@ impl PrecondSlot {
     pub(super) fn build(
         prepared: &PreparedDesign<'_>,
         config: PreconditionerConfig,
+        cancellation: Cancellation<'_>,
+    ) -> Result<Self, BuildError> {
+        checkpoint(cancellation)?;
+        let result = Self::build_inner(prepared, config, cancellation);
+        checkpoint(cancellation)?;
+        result
+    }
+
+    fn build_inner(
+        prepared: &PreparedDesign<'_>,
+        config: PreconditionerConfig,
+        cancellation: Cancellation<'_>,
     ) -> Result<Self, BuildError> {
         Ok(match config {
             PreconditionerConfig::Off => Self::Static {
@@ -39,7 +52,7 @@ impl PrecondSlot {
                 warnings: Vec::new(),
             },
             PreconditionerConfig::Additive { local_solver } => {
-                let (map, warnings) = build_schwarz(prepared, &local_solver)?;
+                let (map, warnings) = build_schwarz(prepared, &local_solver, cancellation)?;
                 Self::Static { map, warnings }
             }
             PreconditionerConfig::Adaptive {
@@ -116,15 +129,28 @@ impl AdaptivePrecond {
     }
 
     /// Build once and return this call's build seconds; every other caller waits for it.
-    pub(super) fn escalate(&self, prepared: &PreparedDesign<'_>) -> Result<f64, BuildError> {
+    pub(super) fn escalate(
+        &self,
+        prepared: &PreparedDesign<'_>,
+        cancellation: Cancellation<'_>,
+    ) -> Result<f64, BuildError> {
+        checkpoint(cancellation)?;
         let mut build_secs = 0.0;
         let built = self.built.get_or_try_init(|| {
             let t_build = Instant::now();
-            let outcome = isolated(|| build_schwarz(prepared, &self.ladder().escalated))?
-                .map(|(schwarz, warnings)| AdaptiveBuild { schwarz, warnings });
+            let outcome =
+                isolated(|| build_schwarz(prepared, &self.ladder().escalated, cancellation))?
+                    .map(|(schwarz, warnings)| AdaptiveBuild { schwarz, warnings });
             build_secs = t_build.elapsed().as_secs_f64();
+            checkpoint(cancellation)?;
+            // Cancellation belongs to this invocation, never to the reusable design.
+            if matches!(outcome, Err(BuildError::Cancelled)) {
+                return Err(BuildError::Cancelled);
+            }
             Ok(outcome)
-        })?;
+        });
+        checkpoint(cancellation)?;
+        let built = built?;
         built.as_ref().map(|_| build_secs).map_err(Clone::clone)
     }
 }
@@ -157,6 +183,54 @@ mod tests {
     use std::time::Duration;
 
     use super::isolated;
+
+    #[test]
+    fn cancellation_during_deferred_construction_is_retryable() {
+        use super::{PrecondSlot, PreparedDesign};
+        use crate::{Cancellation, PreconditionerConfig};
+        use std::sync::atomic::AtomicUsize;
+
+        let prepared = PreparedDesign::from_levels_for_test(vec![
+            (0..800).map(|i| i % 20).collect(),
+            (0..800).map(|i| (i / 20) % 10).collect(),
+        ]);
+        let build = || {
+            let PrecondSlot::Adaptive(a) = PrecondSlot::build(
+                &prepared,
+                PreconditionerConfig::default(),
+                Cancellation::default(),
+            )
+            .unwrap() else {
+                panic!("two terms should build an adaptive ladder")
+            };
+            a
+        };
+        let polls = AtomicUsize::new(0);
+        let count = || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        build()
+            .escalate(&prepared, Cancellation::new(&count))
+            .unwrap();
+        let total = polls.load(Ordering::Relaxed);
+        assert!(total > 8);
+        for stop in 1..=total {
+            let a = build();
+            let polls = AtomicUsize::new(0);
+            let query = || polls.fetch_add(1, Ordering::Relaxed) + 1 >= stop;
+            assert!(matches!(
+                a.escalate(&prepared, Cancellation::new(&query)),
+                Err(crate::BuildError::Cancelled)
+            ));
+            assert!(!matches!(
+                a.built.get(),
+                Some(Err(crate::BuildError::Cancelled))
+            ));
+            a.escalate(&prepared, Cancellation::default()).unwrap();
+            assert!(a.schwarz().is_some());
+        }
+    }
 
     thread_local! {
         static ON_CALLER_POOL: Cell<bool> = const { Cell::new(false) };

@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::block_elim::BlockElimSolver;
+use crate::cancellation::checkpoint;
 use crate::config::{LocalSolverConfig, PreconditionerConfig, Staleness};
 use crate::domain::{LocalDomain, PreparedDesign};
-use crate::{BuildError, BuildWarning};
+use crate::{BuildError, BuildWarning, Cancellation};
 
 #[cfg(test)]
 mod tests;
@@ -94,11 +95,20 @@ pub(crate) fn build_additive(
     domains: Vec<LocalDomain>,
     local_solver: &LocalSolverConfig,
     n_dofs: usize,
+    cancellation: Cancellation<'_>,
 ) -> Result<FeSchwarz, BuildError> {
+    checkpoint(cancellation)?;
     let entries = domains
         .into_par_iter()
-        .map(|domain| build_entry(domain, local_solver))
-        .collect::<Result<Vec<_>, BuildError>>()?;
+        .map(|domain| {
+            checkpoint(cancellation)?;
+            let entry = build_entry(domain, local_solver);
+            checkpoint(cancellation)?;
+            entry
+        })
+        .collect::<Result<Vec<_>, BuildError>>();
+    checkpoint(cancellation)?;
+    let entries = entries?;
     Ok(FeSchwarz {
         inner: SchwarzPreconditioner::with_n_dofs(entries, n_dofs),
         local_solver: local_solver.clone(),
@@ -284,16 +294,20 @@ fn diagonal_map(prepared: &PreparedDesign<'_>) -> Result<DiagonalPreconditioner,
 pub(crate) fn build_schwarz(
     prepared: &PreparedDesign<'_>,
     local_solver: &LocalSolverConfig,
+    cancellation: Cancellation<'_>,
 ) -> Result<(Option<Preconditioner>, Vec<BuildWarning>), BuildError> {
+    checkpoint(cancellation)?;
     let build_started = Instant::now();
-    let (domains, warnings) = crate::domain::build_local_domains(prepared, local_solver)?;
+    let (domains, warnings) =
+        crate::domain::build_local_domains(prepared, local_solver, cancellation)?;
     if domains.is_empty() {
         return Ok((None, warnings));
     }
-    let schwarz = build_additive(domains, local_solver, prepared.design.n_dofs)?;
+    let schwarz = build_additive(domains, local_solver, prepared.design.n_dofs, cancellation)?;
     let preconditioner = Preconditioner {
         inner: Variant::Additive(schwarz),
         build_duration: build_started.elapsed(),
     };
+    checkpoint(cancellation)?;
     Ok((Some(preconditioner), warnings))
 }

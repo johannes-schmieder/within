@@ -14,7 +14,7 @@ mod tests;
 
 use std::borrow::Cow;
 
-use crate::{Operator, SolveError};
+use crate::{Cancellation, Operator, SolveError};
 use bidiag::{axpby, BidiagStep, Bidiagonalization, GolubKahan, StagedStart};
 use magnitude::Magnitude;
 use recurrence::{ConvergenceCriteria, LsmrRecurrenceState, RotationStep, SolutionState, Stop};
@@ -242,6 +242,22 @@ pub fn lsmr<A: Operator + ?Sized>(
     lsmr_counted(operator, b, tol, maxiter, local_size).map_err(|failure| failure.source)
 }
 
+/// Unpreconditioned LSMR with cooperative caller cancellation.
+///
+/// No partial coefficients are returned after cancellation. Checks occur before
+/// setup, once per iteration, and after final validation; see [`Cancellation`].
+pub fn lsmr_cancellable<A: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    tol: f64,
+    maxiter: usize,
+    local_size: Option<usize>,
+    cancellation: Cancellation<'_>,
+) -> Result<LsmrResult, SolveError> {
+    lsmr_counted_cancellable(operator, b, tol, maxiter, local_size, cancellation)
+        .map_err(|failure| failure.source)
+}
+
 /// Unpreconditioned [`lsmr`] with attempted-iteration accounting on errors.
 pub fn lsmr_counted<A: Operator + ?Sized>(
     operator: &A,
@@ -250,9 +266,48 @@ pub fn lsmr_counted<A: Operator + ?Sized>(
     maxiter: usize,
     local_size: Option<usize>,
 ) -> Result<LsmrResult, LsmrFailure> {
+    lsmr_counted_cancellable(
+        operator,
+        b,
+        tol,
+        maxiter,
+        local_size,
+        Cancellation::default(),
+    )
+}
+
+/// [`lsmr_cancellable`] with attempted-iteration accounting, including cancellation.
+pub fn lsmr_counted_cancellable<A: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    tol: f64,
+    maxiter: usize,
+    local_size: Option<usize>,
+    cancellation: Cancellation<'_>,
+) -> Result<LsmrResult, LsmrFailure> {
     let mut iterations = 0;
-    lsmr_impl(operator, b, tol, maxiter, local_size, &mut iterations)
-        .map_err(|source| LsmrFailure { source, iterations })
+    let result = (|| {
+        cancellation.checkpoint()?;
+        let result = lsmr_impl(
+            operator,
+            b,
+            tol,
+            maxiter,
+            local_size,
+            RunControl {
+                attempted: &mut iterations,
+                cancellation,
+            },
+        );
+        cancellation.checkpoint()?;
+        result
+    })();
+    result.map_err(|source| LsmrFailure { source, iterations })
+}
+
+struct RunControl<'a> {
+    attempted: &'a mut usize,
+    cancellation: Cancellation<'a>,
 }
 
 fn lsmr_impl<A: Operator + ?Sized>(
@@ -261,8 +316,12 @@ fn lsmr_impl<A: Operator + ?Sized>(
     tol: f64,
     maxiter: usize,
     local_size: Option<usize>,
-    attempted: &mut usize,
+    control: RunControl<'_>,
 ) -> Result<LsmrResult, SolveError> {
+    let RunControl {
+        attempted,
+        cancellation,
+    } = control;
     validate_lsmr_inputs(operator, b, tol)?;
     let n = operator.ncols();
 
@@ -283,6 +342,7 @@ fn lsmr_impl<A: Operator + ?Sized>(
     let (bidiag, step1) = GolubKahan::init(operator, b, b_norm, local_size)?;
     let criteria = ConvergenceCriteria::new(b_norm, tol);
     let start = SolveStart {
+        cancellation,
         x0: None,
         reference: NormalEqReference::cold(step1, Magnitude::product(step1.alpha, step1.beta)),
         attempted,
@@ -303,6 +363,31 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
         .map_err(|failure| failure.source)
 }
 
+/// Preconditioned LSMR with cooperative caller cancellation.
+///
+/// Like [`lsmr_cancellable`], returns a distinct error without partial coefficients.
+/// Warm starts and escalation retain the same meaning as in [`mlsmr`].
+pub fn mlsmr_cancellable<A: Operator + ?Sized, M: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    preconditioner: &M,
+    tol: f64,
+    maxiter: usize,
+    options: MlsmrOptions<'_>,
+    cancellation: Cancellation<'_>,
+) -> Result<LsmrResult, SolveError> {
+    mlsmr_counted_cancellable(
+        operator,
+        b,
+        preconditioner,
+        tol,
+        maxiter,
+        options,
+        cancellation,
+    )
+    .map_err(|failure| failure.source)
+}
+
 /// [`mlsmr`] with attempted-iteration accounting on errors.
 ///
 /// Callers implementing a sequence of preconditioners can debit `iterations`
@@ -315,17 +400,46 @@ pub fn mlsmr_counted<A: Operator + ?Sized, M: Operator + ?Sized>(
     maxiter: usize,
     options: MlsmrOptions<'_>,
 ) -> Result<LsmrResult, LsmrFailure> {
-    let mut iterations = 0;
-    mlsmr_impl(
+    mlsmr_counted_cancellable(
         operator,
         b,
         preconditioner,
         tol,
         maxiter,
         options,
-        &mut iterations,
+        Cancellation::default(),
     )
-    .map_err(|source| LsmrFailure { source, iterations })
+}
+
+/// [`mlsmr_cancellable`] with attempted-iteration accounting, including cancellation.
+pub fn mlsmr_counted_cancellable<A: Operator + ?Sized, M: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    preconditioner: &M,
+    tol: f64,
+    maxiter: usize,
+    options: MlsmrOptions<'_>,
+    cancellation: Cancellation<'_>,
+) -> Result<LsmrResult, LsmrFailure> {
+    let mut iterations = 0;
+    let result = (|| {
+        cancellation.checkpoint()?;
+        let result = mlsmr_impl(
+            operator,
+            b,
+            preconditioner,
+            tol,
+            maxiter,
+            options,
+            RunControl {
+                attempted: &mut iterations,
+                cancellation,
+            },
+        );
+        cancellation.checkpoint()?;
+        result
+    })();
+    result.map_err(|source| LsmrFailure { source, iterations })
 }
 
 fn mlsmr_impl<A: Operator + ?Sized, M: Operator + ?Sized>(
@@ -335,8 +449,12 @@ fn mlsmr_impl<A: Operator + ?Sized, M: Operator + ?Sized>(
     tol: f64,
     maxiter: usize,
     options: MlsmrOptions<'_>,
-    attempted: &mut usize,
+    control: RunControl<'_>,
 ) -> Result<LsmrResult, SolveError> {
+    let RunControl {
+        attempted,
+        cancellation,
+    } = control;
     validate_lsmr_inputs(operator, b, tol)?;
     let n = operator.ncols();
     if preconditioner.nrows() != n || preconditioner.ncols() != n {
@@ -412,6 +530,7 @@ fn mlsmr_impl<A: Operator + ?Sized, M: Operator + ?Sized>(
         |(metric, plain)| NormalEqReference::warm(metric, plain, step1, cold_plain_reference),
     );
     let start = SolveStart {
+        cancellation,
         x0: warm_start,
         reference,
         attempted,
@@ -464,6 +583,7 @@ impl NormalEqReference {
 
 /// Initial iterate and fixed references; warm streams measure `b − A x₀`, not `b`.
 struct SolveStart<'a> {
+    cancellation: Cancellation<'a>,
     x0: Option<&'a [f64]>,
     reference: NormalEqReference,
     attempted: &'a mut usize,
@@ -482,6 +602,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
     let n = bidiag.v().len();
     let reference = start.reference;
     let attempted = start.attempted;
+    let cancellation = start.cancellation;
     let mut base: Option<Cow<'_, [f64]>> = start.x0.map(Cow::Borrowed);
     let mut iterations = 0;
     let mut restarts = 0;
@@ -528,6 +649,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
         let mut prev_rot = RotationStep::initial();
         let stop_reason = 'pass: {
             while iterations < maxiter {
+                cancellation.checkpoint()?;
                 iterations += 1;
                 *attempted = iterations;
                 let step = bidiag.step()?;

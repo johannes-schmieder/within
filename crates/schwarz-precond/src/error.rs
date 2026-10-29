@@ -56,6 +56,9 @@ pub enum LocalSolveError {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SolveError {
+    /// The caller cancelled; all work started by this call has completed.
+    #[error("solve cancelled")]
+    Cancelled,
     /// A local subdomain solve failed during a preconditioner apply.
     #[error("subdomain {subdomain} local solve failed: {source}")]
     LocalSolveFailed {

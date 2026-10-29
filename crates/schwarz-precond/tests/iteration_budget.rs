@@ -30,8 +30,12 @@ impl Operator for FailingDiagonal {
     }
     fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
         if self.applies.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
-            return Err(SolveError::Synchronization {
-                context: "injected application failure",
+            return Err(SolveError::LocalSolveFailed {
+                subdomain: 0,
+                source: schwarz_precond::LocalSolveError::BackendFailed {
+                    context: "injected application failure",
+                    message: "budget witness".into(),
+                },
             });
         }
         self.product(x, y);
@@ -56,7 +60,7 @@ fn failing_iteration_is_charged_for_standard_and_modified_lsmr() {
         let error = result.err().expect("application must fail");
         assert_eq!(error.iterations, 3);
         assert_eq!(op.applies.load(Ordering::SeqCst), 3);
-        assert!(matches!(error.source, SolveError::Synchronization { .. }));
+        assert!(matches!(error.source, SolveError::LocalSolveFailed { .. }));
     }
 }
 
@@ -102,4 +106,66 @@ fn invalid_input_and_initial_preconditioner_failure_spend_zero() {
     .err()
     .unwrap();
     assert_eq!(failed.iterations, 0);
+}
+
+#[test]
+fn cancellation_keeps_iteration_debit_and_never_returns_a_partial_solution() {
+    use schwarz_precond::{lsmr_counted_cancellable, mlsmr_counted_cancellable, Cancellation};
+    use std::sync::atomic::AtomicBool;
+
+    struct CancelOnApply<'a> {
+        op: FailingDiagonal,
+        flag: &'a AtomicBool,
+        cancel_at: usize,
+    }
+    impl Operator for CancelOnApply<'_> {
+        fn nrows(&self) -> usize {
+            self.op.nrows()
+        }
+        fn ncols(&self) -> usize {
+            self.op.ncols()
+        }
+        fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+            self.op.apply(x, y)?;
+            if self.op.applies.load(Ordering::SeqCst) == self.cancel_at {
+                self.flag.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn apply_adjoint(&self, x: &[f64], y: &mut [f64]) -> Result<(), SolveError> {
+            self.op.apply_adjoint(x, y)
+        }
+    }
+    // A first iteration and a tolerance-stop audit both retain the spent iteration.
+    for (diagonal, cancel_at) in [((1..=8).map(f64::from).collect(), 1), (vec![1.0; 8], 2)] {
+        for modified in [false, true] {
+            let flag = AtomicBool::new(false);
+            let query = || flag.load(Ordering::SeqCst);
+            let cancellation = Cancellation::new(&query);
+            let op = CancelOnApply {
+                op: FailingDiagonal::new(diagonal.clone(), usize::MAX),
+                flag: &flag,
+                cancel_at,
+            };
+            let identity = FailingDiagonal::new(vec![1.0; 8], usize::MAX);
+            let result = if modified {
+                mlsmr_counted_cancellable(
+                    &op,
+                    &[1.0; 8],
+                    &identity,
+                    1e-10,
+                    10,
+                    MlsmrOptions::default(),
+                    cancellation,
+                )
+            } else {
+                lsmr_counted_cancellable(&op, &[1.0; 8], 1e-10, 10, None, cancellation)
+            };
+            let error = result
+                .err()
+                .expect("cancellation must discard partial output");
+            assert!(matches!(error.source, SolveError::Cancelled));
+            assert_eq!(error.iterations, 1);
+        }
+    }
 }

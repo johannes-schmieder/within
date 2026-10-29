@@ -66,6 +66,7 @@ fn caller_handoff_keeps_shared_budget_original_response_and_total_coefficients()
             SolveControl {
                 initial_coefficients: None,
                 escalation: Some(&stop),
+                cancellation: Default::default(),
             },
         )
         .unwrap();
@@ -78,7 +79,6 @@ fn caller_handoff_keeps_shared_budget_original_response_and_total_coefficients()
         Some(&w),
         PreconditionerConfig::Additive {
             local_solver: Default::default(),
-            reduction: within::ReductionStrategy::ParallelReduction,
         },
     )
     .unwrap();
@@ -89,6 +89,7 @@ fn caller_handoff_keeps_shared_budget_original_response_and_total_coefficients()
             SolveControl {
                 initial_coefficients: Some(&first.solution.x),
                 escalation: None,
+                cancellation: Default::default(),
             },
         )
         .unwrap();
@@ -116,6 +117,7 @@ fn caller_handoff_keeps_shared_budget_original_response_and_total_coefficients()
             SolveControl {
                 initial_coefficients: Some(&last.solution.x),
                 escalation: None,
+                cancellation: Default::default(),
             },
         )
         .unwrap();
@@ -147,6 +149,7 @@ fn zero_budget_reports_original_rhs_reference_and_preserves_nonunique_seed_gauge
             SolveControl {
                 initial_coefficients: Some(&seed),
                 escalation: None,
+                cancellation: Default::default(),
             },
         )
         .unwrap();
@@ -236,6 +239,7 @@ fn weighted_two_slope_seeds_round_trip_whitening_pivot_order_and_locality_sort()
                     SolveControl {
                         initial_coefficients: Some(&seed),
                         escalation: None,
+                        cancellation: Default::default(),
                     },
                 )
                 .unwrap();
@@ -256,6 +260,7 @@ fn weighted_two_slope_seeds_round_trip_whitening_pivot_order_and_locality_sort()
                     SolveControl {
                         initial_coefficients: Some(&seed),
                         escalation: None,
+                        cancellation: Default::default(),
                     },
                 )
                 .unwrap();
@@ -294,6 +299,7 @@ fn invalid_seed_and_implicit_adaptation_fail_without_spending_iterations() {
                 SolveControl {
                     initial_coefficients: Some(&seed),
                     escalation: None,
+                    cancellation: Default::default(),
                 },
             )
             .unwrap_err();
@@ -306,6 +312,7 @@ fn invalid_seed_and_implicit_adaptation_fail_without_spending_iterations() {
             SolveControl {
                 initial_coefficients: Some(&[1.0, 2.0, 0.0, 0.0]),
                 escalation: None,
+                cancellation: Default::default(),
             },
         )
         .unwrap();
@@ -345,7 +352,6 @@ fn controlled_cold_calls_preserve_ordinary_science_bits() {
                     PreconditionerConfig::Diagonal,
                     PreconditionerConfig::Additive {
                         local_solver: Default::default(),
-                        reduction: within::ReductionStrategy::ParallelReduction,
                     },
                 ] {
                     let solver = Solver::new(
@@ -397,6 +403,7 @@ fn zero_response_corrects_warm_seed_and_exact_seed_keeps_gauge() {
             SolveControl {
                 initial_coefficients: Some(&exact),
                 escalation: None,
+                cancellation: Default::default(),
             },
         )
         .unwrap();
@@ -410,6 +417,7 @@ fn zero_response_corrects_warm_seed_and_exact_seed_keeps_gauge() {
             SolveControl {
                 initial_coefficients: Some(&exact),
                 escalation: None,
+                cancellation: Default::default(),
             },
         )
         .unwrap();
@@ -436,6 +444,7 @@ fn slope_only_seed_uses_original_units() {
             SolveControl {
                 initial_coefficients: Some(&[7.0, -3.0]),
                 escalation: None,
+                cancellation: Default::default(),
             },
         )
         .unwrap()
@@ -450,5 +459,76 @@ fn slope_only_seed_uses_original_units() {
             .map(|i| w[i] * z[i] * z[i])
             .sum();
         close(result.x[l as usize], numerator / denominator);
+    }
+}
+
+#[test]
+fn cancellation_overrides_handoff_and_retains_its_iteration_count() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use within::{Cancellation, SolveError};
+    struct CancelAtProgress(Arc<AtomicBool>);
+    impl EscalationPolicy for CancelAtProgress {
+        fn handler(&self) -> Box<dyn EscalationHandler> {
+            Box::new(Self(self.0.clone()))
+        }
+    }
+    impl EscalationHandler for CancelAtProgress {
+        fn should_escalate(&mut self, _: Progress) -> bool {
+            self.0.store(true, Ordering::SeqCst);
+            true
+        }
+    }
+    let n = 500;
+    let f: Vec<_> = (0..n).map(|i| (i * 7 % 31) as u32).collect();
+    let g: Vec<_> = (0..n).map(|i| ((i / 3 + i % 7) % 23) as u32).collect();
+    let h: Vec<_> = (0..n).map(|i| ((i / 5 + i % 3) % 17) as u32).collect();
+    let y: Vec<_> = (0..n)
+        .map(|i| (i as f64 * 0.7).sin() + (i % 19) as f64)
+        .collect();
+    for config in [
+        PreconditionerConfig::Off,
+        PreconditionerConfig::Diagonal,
+        PreconditionerConfig::Additive {
+            local_solver: Default::default(),
+        },
+    ] {
+        let solver = Solver::new(
+            vec![
+                Effect::new(&f, true, []).unwrap(),
+                Effect::new(&g, true, []).unwrap(),
+                Effect::new(&h, true, []).unwrap(),
+            ],
+            None,
+            config,
+        )
+        .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let policy = CancelAtProgress(flag.clone());
+        let query = || flag.load(Ordering::SeqCst);
+        let error = solver
+            .solve_controlled(
+                &y,
+                &options(100),
+                SolveControl {
+                    initial_coefficients: None,
+                    escalation: Some(&policy),
+                    cancellation: Cancellation::new(&query),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error.source, SolveError::Cancelled));
+        assert_eq!(error.iterations, 1);
+        let error = solver
+            .solve_controlled(
+                &y,
+                &options(100),
+                SolveControl {
+                    cancellation: Cancellation::new(&query),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error.source, SolveError::Cancelled));
+        assert_eq!(error.iterations, 0);
     }
 }

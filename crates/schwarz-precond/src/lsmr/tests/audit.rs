@@ -79,6 +79,7 @@ fn scripted_run(
         step1,
         &[1.0, 1.0],
         SolveStart {
+            cancellation: crate::Cancellation::default(),
             x0: None,
             reference: NormalEqReference::cold(step1, Magnitude::product(step1.alpha, step1.beta)),
             attempted: &mut 0,

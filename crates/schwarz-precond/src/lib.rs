@@ -61,6 +61,7 @@ pub trait Operator: Send + Sync {
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;
 
+mod cancellation;
 /// Domain decomposition primitives: subdomain cores and partition weights.
 pub mod domain;
 /// Typed errors for build and runtime failures.
@@ -71,11 +72,13 @@ mod lsmr;
 mod prolongation;
 mod schwarz;
 
+pub use cancellation::Cancellation;
 pub use domain::{PartitionWeights, SubdomainCore};
 pub use error::{BuildError, LocalSolveError, SolveError};
 pub use local_solve::{LocalSolver, SubdomainEntry};
 pub use lsmr::{
-    lsmr, lsmr_counted, mlsmr, mlsmr_counted, EscalationHandler, EscalationPolicy, LsmrFailure,
+    lsmr, lsmr_cancellable, lsmr_counted, lsmr_counted_cancellable, mlsmr, mlsmr_cancellable,
+    mlsmr_counted, mlsmr_counted_cancellable, EscalationHandler, EscalationPolicy, LsmrFailure,
     LsmrResult, LsmrStopReason, MlsmrOptions, Progress, Staleness, StalenessError,
 };
 pub use schwarz::SchwarzPreconditioner;

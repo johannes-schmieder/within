@@ -253,8 +253,8 @@ assert_eq!(result.x.len(), 4); // two observed levels in each of two factors
 
 ### Caller-controlled attempts
 
-`Solver::solve_controlled(y, options, SolveControl { initial_coefficients,
-escalation })` exposes warm starts and the existing `EscalationPolicy` without
+`Solver::solve_controlled(y, options, control)` exposes warm starts through
+`SolveControl::initial_coefficients` and the existing `EscalationPolicy` without
 switching preconditioners. Construct the solver with an explicit fixed
 `Off`, `Diagonal`, or `Additive` configuration; adaptive solvers are rejected.
 The result contains `solution: SolveResult` and `stop_reason: LsmrStopReason`.
@@ -268,7 +268,8 @@ correction after independent validation, so convergence references do not
 reset to the smaller correction response. Debit `solution.iterations` on
 success or `ControlledSolveError.iterations` on failure from a shared budget;
 the latter includes a failing attempted iteration. This API retains no Krylov
-recurrence and is currently Rust-only.
+recurrence and is currently Rust-only. Its optional `cancellation` query returns
+`SolveError::Cancelled` with consumed work and no partial coefficients.
 
 ### Varying slopes
 

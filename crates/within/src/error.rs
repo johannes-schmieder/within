@@ -10,6 +10,9 @@ pub use schwarz_precond::SolveError;
 #[derive(Debug, Clone, Error)]
 #[non_exhaustive]
 pub enum BuildError {
+    /// The caller cancelled; all work started by this call has completed.
+    #[error("construction cancelled")]
+    Cancelled,
     /// No observations provided.
     #[error("no observations provided")]
     EmptyObservations,

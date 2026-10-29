@@ -1,8 +1,11 @@
 //! Caller-owned staging with the existing low-level warm-start and stop policy.
 
+use super::solve_checkpoint;
 use super::{CoefficientLayout, PrecondSlot, Run, SolveResult, Solver};
-use crate::{EscalationPolicy, LsmrOptions, LsmrStopReason, SolveError};
-use schwarz_precond::{lsmr_counted, mlsmr_counted, LsmrFailure, MlsmrOptions, Operator};
+use crate::{Cancellation, EscalationPolicy, LsmrOptions, LsmrStopReason, SolveError};
+use schwarz_precond::{
+    lsmr_counted_cancellable, mlsmr_counted_cancellable, LsmrFailure, MlsmrOptions, Operator,
+};
 use std::time::Instant;
 
 /// Controls for one fixed-preconditioner attempt. No Krylov state is retained.
@@ -20,6 +23,9 @@ pub struct SolveControl<'a> {
     /// [`crate::LsmrStopReason::Escalated`] and the total coefficients without
     /// constructing or switching to another preconditioner.
     pub escalation: Option<&'a dyn EscalationPolicy>,
+    /// Shared worker-safe cancellation query. Cancellation returns a distinct
+    /// error with consumed iterations and discards all partial coefficients.
+    pub cancellation: Cancellation<'a>,
 }
 
 /// A completed controlled attempt, including its reason for stopping.
@@ -60,6 +66,7 @@ impl Solver<'_> {
         control: SolveControl<'_>,
     ) -> Result<ControlledSolveResult, ControlledSolveError> {
         let t_start = Instant::now();
+        checkpoint(control.cancellation, 0)?;
         let default = LsmrOptions::default();
         let lsmr = lsmr.into().unwrap_or(&default);
         let map = match &self.slot {
@@ -78,6 +85,7 @@ impl Solver<'_> {
             .initial_coefficients
             .map(|x| self.prepare_seed(x))
             .transpose()?;
+        checkpoint(control.cancellation, 0)?;
         let setup_secs = t_start.elapsed().as_secs_f64();
         let options = MlsmrOptions {
             warm_start: seed.as_deref(),
@@ -86,17 +94,31 @@ impl Solver<'_> {
         };
         let t_solve = Instant::now();
         let result = match map {
-            Some(map) => mlsmr_counted(&rhs.op, rhs.b(), map, lsmr.tol, lsmr.maxiter, options),
-            None if seed.is_none() && control.escalation.is_none() => {
-                lsmr_counted(&rhs.op, rhs.b(), lsmr.tol, lsmr.maxiter, lsmr.local_size)
-            }
-            None => mlsmr_counted(
+            Some(map) => mlsmr_counted_cancellable(
+                &rhs.op,
+                rhs.b(),
+                map,
+                lsmr.tol,
+                lsmr.maxiter,
+                options,
+                control.cancellation,
+            ),
+            None if seed.is_none() && control.escalation.is_none() => lsmr_counted_cancellable(
+                &rhs.op,
+                rhs.b(),
+                lsmr.tol,
+                lsmr.maxiter,
+                lsmr.local_size,
+                control.cancellation,
+            ),
+            None => mlsmr_counted_cancellable(
                 &rhs.op,
                 rhs.b(),
                 &Identity(self.n_dofs()),
                 lsmr.tol,
                 lsmr.maxiter,
                 options,
+                control.cancellation,
             ),
         }?;
         let stop_reason = result.stop_reason;
@@ -107,7 +129,7 @@ impl Solver<'_> {
                 solve_secs: t_solve.elapsed().as_secs_f64(),
             },
         );
-        Ok(ControlledSolveResult {
+        let result = ControlledSolveResult {
             stop_reason,
             solution: SolveResult {
                 x: solution.x,
@@ -122,7 +144,9 @@ impl Solver<'_> {
                 time_setup: setup_secs,
                 time_solve: solution.time_solve,
             },
-        })
+        };
+        checkpoint(control.cancellation, result.solution.iterations)?;
+        Ok(result)
     }
 
     fn prepare_seed(&self, x: &[f64]) -> Result<Vec<f64>, ControlledSolveError> {
@@ -156,6 +180,13 @@ impl Solver<'_> {
         }
         Ok(seed)
     }
+}
+
+fn checkpoint(
+    cancellation: Cancellation<'_>,
+    iterations: usize,
+) -> Result<(), ControlledSolveError> {
+    solve_checkpoint(cancellation).map_err(|source| LsmrFailure { source, iterations })
 }
 
 fn invalid(message: String) -> ControlledSolveError {

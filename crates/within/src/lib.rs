@@ -31,6 +31,7 @@ pub mod config;
 pub mod error;
 
 pub(crate) mod block_elim;
+pub(crate) mod cancellation;
 pub(crate) mod channel;
 pub(crate) mod csr_block;
 pub(crate) mod domain;
@@ -46,7 +47,9 @@ pub use config::{
 pub use domain::{Design, Effect};
 pub use error::{BuildError, BuildWarning, SolveError, WithinError};
 pub use operator::schwarz::Preconditioner;
-pub use schwarz_precond::{EscalationHandler, EscalationPolicy, LsmrStopReason, Progress};
+pub use schwarz_precond::{
+    Cancellation, EscalationHandler, EscalationPolicy, LsmrStopReason, Progress,
+};
 pub use solver::{
     solve, solve_batch, BatchSolveResult, CoefficientLayout, ControlledSolveError,
     ControlledSolveResult, IntoDesign, PreconditionerInput, SolveControl, SolveResult, Solver,
