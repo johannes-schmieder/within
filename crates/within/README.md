@@ -47,6 +47,23 @@ let result = solve(categories.view(), &y, None, &lsmr, &diagonal)
 assert!(result.converged);
 ```
 
+## Caller cancellation
+
+`Solver::new_cancellable`, `Solver::solve_cancellable`, and
+`Solver::solve_batch_cancellable` accept a `Cancellation` query borrowed for
+that call. The query must be thread-safe and remain true once cancellation is
+requested. A host with a main-thread-only interruption API should check that
+API on its main thread and let the query read an atomic flag from workers.
+
+Checks run between construction stages and once per solver iteration, including
+an Adaptive solve's deferred construction. A running scan or factorization can
+finish before noticing the flag; latency is not bounded. All parallel work is
+joined before returning `BuildError::Cancelled` or `SolveError::Cancelled`.
+No partial solve or batch results are returned, and a cancelled Adaptive build
+does not cache a failure that poisons later calls. Existing entry points retain
+their uncancellable behavior. The lower-level `schwarz-precond` crate provides
+`lsmr_cancellable` and `mlsmr_cancellable` with the same query and error contract.
+
 ## Architecture
 
 The crate is organized in three layers:

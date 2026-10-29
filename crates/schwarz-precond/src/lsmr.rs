@@ -14,7 +14,7 @@ mod tests;
 
 use std::borrow::Cow;
 
-use crate::{Operator, SolveError};
+use crate::{Cancellation, Operator, SolveError};
 use bidiag::{axpby, BidiagStep, Bidiagonalization, GolubKahan, StagedStart};
 use magnitude::Magnitude;
 use recurrence::{ConvergenceCriteria, LsmrRecurrenceState, RotationStep, SolutionState, Stop};
@@ -225,6 +225,42 @@ pub fn lsmr<A: Operator + ?Sized>(
     maxiter: usize,
     local_size: Option<usize>,
 ) -> Result<LsmrResult, SolveError> {
+    lsmr_cancellable(
+        operator,
+        b,
+        tol,
+        maxiter,
+        local_size,
+        Cancellation::default(),
+    )
+}
+
+/// Unpreconditioned LSMR with cooperative caller cancellation.
+///
+/// No partial coefficients are returned after cancellation. Checks occur before
+/// setup, once per iteration, and after final validation; see [`Cancellation`].
+pub fn lsmr_cancellable<A: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    tol: f64,
+    maxiter: usize,
+    local_size: Option<usize>,
+    cancellation: Cancellation<'_>,
+) -> Result<LsmrResult, SolveError> {
+    cancellation.checkpoint()?;
+    let result = lsmr_inner(operator, b, tol, maxiter, local_size, cancellation);
+    cancellation.checkpoint()?;
+    result
+}
+
+fn lsmr_inner<A: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    tol: f64,
+    maxiter: usize,
+    local_size: Option<usize>,
+    cancellation: Cancellation<'_>,
+) -> Result<LsmrResult, SolveError> {
     validate_lsmr_inputs(operator, b, tol)?;
     let n = operator.ncols();
 
@@ -245,6 +281,7 @@ pub fn lsmr<A: Operator + ?Sized>(
     let (bidiag, step1) = GolubKahan::init(operator, b, b_norm, local_size)?;
     let criteria = ConvergenceCriteria::new(b_norm, tol);
     let start = SolveStart {
+        cancellation,
         x0: None,
         reference: NormalEqReference::cold(step1, Magnitude::product(step1.alpha, step1.beta)),
     };
@@ -259,6 +296,53 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
     tol: f64,
     maxiter: usize,
     options: MlsmrOptions<'_>,
+) -> Result<LsmrResult, SolveError> {
+    mlsmr_cancellable(
+        operator,
+        b,
+        preconditioner,
+        tol,
+        maxiter,
+        options,
+        Cancellation::default(),
+    )
+}
+
+/// Preconditioned LSMR with cooperative caller cancellation.
+///
+/// Like [`lsmr_cancellable`], returns a distinct error without partial coefficients.
+/// Warm starts and escalation retain the same meaning as in [`mlsmr`].
+pub fn mlsmr_cancellable<A: Operator + ?Sized, M: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    preconditioner: &M,
+    tol: f64,
+    maxiter: usize,
+    options: MlsmrOptions<'_>,
+    cancellation: Cancellation<'_>,
+) -> Result<LsmrResult, SolveError> {
+    cancellation.checkpoint()?;
+    let result = mlsmr_inner(
+        operator,
+        b,
+        preconditioner,
+        tol,
+        maxiter,
+        options,
+        cancellation,
+    );
+    cancellation.checkpoint()?;
+    result
+}
+
+fn mlsmr_inner<A: Operator + ?Sized, M: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    preconditioner: &M,
+    tol: f64,
+    maxiter: usize,
+    options: MlsmrOptions<'_>,
+    cancellation: Cancellation<'_>,
 ) -> Result<LsmrResult, SolveError> {
     validate_lsmr_inputs(operator, b, tol)?;
     let n = operator.ncols();
@@ -335,6 +419,7 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
         |(metric, plain)| NormalEqReference::warm(metric, plain, step1, cold_plain_reference),
     );
     let start = SolveStart {
+        cancellation,
         x0: warm_start,
         reference,
     };
@@ -386,6 +471,7 @@ impl NormalEqReference {
 
 /// Initial iterate and fixed references; warm streams measure `b − A x₀`, not `b`.
 struct SolveStart<'a> {
+    cancellation: Cancellation<'a>,
     x0: Option<&'a [f64]>,
     reference: NormalEqReference,
 }
@@ -402,6 +488,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
 ) -> Result<LsmrResult, SolveError> {
     let n = bidiag.v().len();
     let reference = start.reference;
+    let cancellation = start.cancellation;
     let mut base: Option<Cow<'_, [f64]>> = start.x0.map(Cow::Borrowed);
     let mut iterations = 0;
     let mut restarts = 0;
@@ -448,6 +535,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
         let mut prev_rot = RotationStep::initial();
         let stop_reason = 'pass: {
             while iterations < maxiter {
+                cancellation.checkpoint()?;
                 iterations += 1;
                 let step = bidiag.step()?;
                 convergence.observe(step);

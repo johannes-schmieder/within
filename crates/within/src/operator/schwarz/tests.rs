@@ -20,8 +20,12 @@ const BLOCK_ELIM_NESTED_RAYON_CHILD_ENV: &str = "WITHIN_TEST_BLOCK_ELIM_NESTED_R
 fn make_test_data() -> (PreparedDesign<'static>, Vec<LocalDomain>) {
     let design =
         PreparedDesign::from_levels_for_test(vec![vec![0, 1, 0, 1, 2], vec![0, 0, 1, 1, 0]]);
-    let (domain_pairs, _) =
-        build_local_domains(&design, &LocalSolverConfig::default()).expect("plain domains build");
+    let (domain_pairs, _) = build_local_domains(
+        &design,
+        &LocalSolverConfig::default(),
+        crate::Cancellation::default(),
+    )
+    .expect("plain domains build");
     (design, domain_pairs)
 }
 
@@ -127,6 +131,7 @@ fn run_block_elim_parallel_reduction_regression_case() {
                 reduction: ReductionStrategy::ParallelReduction,
             },
             n_dofs,
+            crate::Cancellation::default(),
         )
         .expect("build block-elim additive preconditioner");
         let atomic = build_additive(
@@ -136,6 +141,7 @@ fn run_block_elim_parallel_reduction_regression_case() {
                 reduction: ReductionStrategy::AtomicScatter,
             },
             n_dofs,
+            crate::Cancellation::default(),
         )
         .expect("build block-elim atomic preconditioner");
 
@@ -211,8 +217,13 @@ fn test_build_additive() {
         local_solver: LocalSolverConfig::default(),
         reduction: ReductionStrategy::default(),
     };
-    let schwarz = build_additive(domain_pairs, &config, design.design.n_dofs)
-        .expect("build schwarz with explicit domains");
+    let schwarz = build_additive(
+        domain_pairs,
+        &config,
+        design.design.n_dofs,
+        crate::Cancellation::default(),
+    )
+    .expect("build schwarz with explicit domains");
     let r = vec![1.0; design.design.n_dofs];
     let mut z = vec![0.0; design.design.n_dofs];
     schwarz.apply(&r, &mut z).expect("schwarz apply succeeds");

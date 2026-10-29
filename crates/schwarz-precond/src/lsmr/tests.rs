@@ -2,6 +2,7 @@
 
 mod audit;
 mod breakdown;
+mod cancellation;
 mod ladder;
 mod range;
 mod solve;
