@@ -21,7 +21,7 @@ use crate::{BuildError, BuildWarning, Cancellation, SolveError, WithinError};
 
 mod controlled;
 mod ladder;
-pub use controlled::{ControlledSolveError, ControlledSolveResult, SolveControl};
+pub use controlled::{ControlledSolveError, ControlledSolveResult, ResidualOutput, SolveControl};
 mod layout;
 #[cfg(test)]
 mod tests;
@@ -410,8 +410,19 @@ impl<'a> Solver<'a> {
     /// Demean and back-transform one finished run. Excludes the design-level `layout` /
     /// `warnings` / `unidentified`, which the public entry points attach once.
     fn finish(&self, rhs: PreparedRhs<'_>, run: Run) -> RhsSolution {
+        self.finish_with_residual_output(rhs, run, ResidualOutput::WeightedAudit)
+    }
+
+    fn finish_with_residual_output(
+        &self,
+        rhs: PreparedRhs<'_>,
+        run: Run,
+        residual_output: ResidualOutput,
+    ) -> RhsSolution {
         let r = run.result;
-        let demeaned = rhs.op.demeaned(&r.x, &rhs.y, r.true_residual);
+        let demeaned = rhs
+            .op
+            .demeaned(&r.x, &rhs.y, r.true_residual, residual_output);
 
         let mut x = r.x;
         self.prepared.back_transform(&mut x);

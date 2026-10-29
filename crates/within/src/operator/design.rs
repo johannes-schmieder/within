@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use schwarz_precond::Operator;
 
 use crate::domain::PreparedDesign;
+use crate::ResidualOutput;
 
 mod gather;
 mod scatter;
@@ -26,15 +27,21 @@ impl<'a> DesignOperator<'a> {
         Self { prepared }
     }
 
-    /// `y − D x`, read off this operator's measured `b − A x` unless a zero weight erased a row.
-    pub(crate) fn demeaned(&self, x: &[f64], y: &[f64], measured: Option<Vec<f64>>) -> Vec<f64> {
-        match (measured, self.prepared.sqrt_weights()) {
-            (Some(residual), None) => residual,
-            (Some(mut residual), Some(sw)) if !sw.contains(&0.0) => {
+    /// Return the measured residual or reconstruct `y − D x` in the prepared frame.
+    pub(crate) fn demeaned(
+        &self,
+        x: &[f64],
+        y: &[f64],
+        measured: Option<Vec<f64>>,
+        output: ResidualOutput,
+    ) -> Vec<f64> {
+        match (measured, self.prepared.sqrt_weights(), output) {
+            (Some(residual), None, ResidualOutput::WeightedAudit) => residual,
+            (Some(mut residual), Some(sw), ResidualOutput::WeightedAudit) if !sw.contains(&0.0) => {
                 unscale(&mut residual, sw);
                 residual
             }
-            (measured, _) => {
+            (measured, _, _) => {
                 let mut demeaned = measured.unwrap_or_else(|| vec![0.0; y.len()]);
                 gather_apply(self.prepared, x, &mut demeaned, None);
                 for (d, &yi) in demeaned.iter_mut().zip(y) {

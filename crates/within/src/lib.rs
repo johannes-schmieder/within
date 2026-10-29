@@ -52,5 +52,6 @@ pub use schwarz_precond::{
 };
 pub use solver::{
     solve, solve_batch, BatchSolveResult, CoefficientLayout, ControlledSolveError,
-    ControlledSolveResult, IntoDesign, PreconditionerInput, SolveControl, SolveResult, Solver,
+    ControlledSolveResult, IntoDesign, PreconditionerInput, ResidualOutput, SolveControl,
+    SolveResult, Solver,
 };
