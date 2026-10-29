@@ -297,7 +297,7 @@ fn run(args: &Args) -> Result<()> {
     println!(
         concat!("{{\"artifact\":\"{}\",\"size\":\"{}\",\"mode\":\"{}\",",
         "\"threads\":{},\"weighted\":{},\"left\":{},\"right\":{},\"nobs\":{},\"rhs\":{},",
-        "\"warmups\":{},\"apply_calls\":{},\"iterations\":{},\"factor_rhs_lower_bound\":{},",
+        "\"warmups\":{},\"explicit_apply_calls\":{},\"iterations\":{},\"factor_rhs_lower_bound\":{},",
         "\"backsub_rows_per_apply\":{},\"backsub_nnz_per_apply\":{},",
         "\"input_fnv64\":\"{:016x}\",\"science_fnv64\":\"{:016x}\",",
         "\"maximum_error\":{:e},\"recurrence_residual\":{:e},\"build_ns\":{},\"elapsed_ns\":{}}}"),
