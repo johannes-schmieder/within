@@ -1,5 +1,6 @@
 //! Domain layer: [`Design`] (design-matrix metadata) and factor-pair [`Subdomain`] construction.
 
+mod adjoint_sum;
 pub(crate) mod cross_tab;
 mod effect;
 pub(crate) mod factor_pairs;
@@ -7,6 +8,7 @@ mod level_moments;
 mod prepared;
 mod reparam;
 
+pub(crate) use adjoint_sum::{AdjointSum, LevelRows};
 pub(crate) use cross_tab::CrossTab;
 pub(crate) use prepared::{PreparedDesign, PreparedTerm};
 use reparam::TermReparam;
@@ -295,6 +297,7 @@ pub(crate) struct Term<'a> {
     sorted: bool,
     /// Raw slopes in coefficient-column order, before whitening.
     slopes: Vec<Cow<'a, [f64]>>,
+    adjoint: AdjointSum,
 }
 
 impl Term<'_> {
@@ -347,6 +350,10 @@ impl Term<'_> {
         self.sorted
     }
 
+    pub(crate) fn adjoint(&self) -> &AdjointSum {
+        &self.adjoint
+    }
+
     /// Raw slopes in coefficient-column order.
     pub(crate) fn raw_slopes(&self) -> impl ExactSizeIterator<Item = &[f64]> {
         self.slopes.iter().map(|slope| &**slope)
@@ -364,6 +371,7 @@ impl Term<'_> {
                 .into_iter()
                 .map(|slope| Cow::Owned(slope.into_owned()))
                 .collect(),
+            adjoint: self.adjoint,
         }
     }
 }
@@ -373,7 +381,6 @@ pub(crate) fn row_weight(sqrt_weights: Option<&[f64]>, obs: usize) -> f64 {
     sqrt_weights.map_or(1.0, |s| s[obs] * s[obs])
 }
 
-// Inspired by [within::operator::design::scatter::scatter_sorted_coalesced]
 const LABEL_CHUNK: usize = 65_536;
 
 /// Label layout used to select an encoding strategy.
@@ -602,59 +609,74 @@ impl<'a> Design<'a> {
             return Err(BuildError::EmptyObservations);
         }
 
-        let mut terms = Vec::with_capacity(effects.len());
-        let mut offset = 0;
-        for Effect {
-            levels,
-            intercept,
-            slopes,
-        } in effects
-        {
-            debug_assert!(
-                slopes.iter().all(|s| s.len() == levels.len()) && (intercept || !slopes.is_empty()),
-                "effect bypassed Effect::new validation"
-            );
-            let EncodedFactor {
-                encoding,
-                levels,
-                sorted,
-            } = FactorEncoding::encode_labels(levels);
-            let term = Term {
-                encoding,
-                offset,
-                intercept,
-                levels,
-                sorted,
-                slopes,
-            };
-            offset += term.n_dofs();
-            terms.push(term);
-        }
-
+        let mut factors: Vec<_> = effects
+            .into_iter()
+            .map(|e| {
+                debug_assert!(
+                    e.slopes.iter().all(|s| s.len() == n_obs)
+                        && (e.intercept || !e.slopes.is_empty()),
+                    "effect bypassed Effect::new validation"
+                );
+                (
+                    FactorEncoding::encode_labels(e.levels),
+                    e.intercept,
+                    e.slopes,
+                )
+            })
+            .collect();
+        let n_dofs = |(factor, intercept, slopes): &(EncodedFactor, bool, Vec<_>)| {
+            (*intercept as usize + slopes.len()) * factor.encoding.n_levels()
+        };
+        let total_dofs: usize = factors.iter().map(n_dofs).sum();
         // Rejected here rather than left to panic in `to_u32`.
-        if u32::try_from(offset).is_err() {
-            return Err(BuildError::DofSpaceExceedsU32 { n_dofs: offset });
+        if u32::try_from(total_dofs).is_err() {
+            return Err(BuildError::DofSpaceExceedsU32 { n_dofs: total_dofs });
         }
 
         // Sort by the term contributing the most DOFs so its gather/scatter runs sequentially.
-        let dominant = terms.iter().max_by_key(|t| t.n_dofs());
+        let dominant = factors.iter().max_by_key(|f| n_dofs(f));
         let obs_perm = match dominant {
-            Some(d) if locality_sort && !d.sorted && u32::try_from(n_obs).is_ok() => {
-                let perm = stable_argsort(&d.levels, d.n_levels());
-                // Factors nested in the dominant one come out sorted, keeping coalesced scatter.
-                for t in terms.iter_mut() {
-                    let levels = gather(&t.levels, &perm);
-                    t.sorted = levels.is_sorted();
-                    t.levels = Cow::Owned(levels);
+            Some((d, ..)) if locality_sort && !d.sorted && u32::try_from(n_obs).is_ok() => {
+                let perm = stable_argsort(&d.levels, d.encoding.n_levels());
+                // Factors nested in the dominant one come out sorted and need no row index.
+                for (f, ..) in factors.iter_mut() {
+                    let levels = gather(&f.levels, &perm);
+                    f.sorted = levels.is_sorted();
+                    f.levels = Cow::Owned(levels);
                 }
                 // Level columns before any slope: interleaving them measured +2–4% here.
-                for slope in terms.iter_mut().flat_map(|t| &mut t.slopes) {
+                for slope in factors.iter_mut().flat_map(|(.., slopes)| slopes) {
                     *slope = Cow::Owned(gather(slope, &perm));
                 }
                 Some(perm.into())
             }
             _ => None,
         };
+
+        let mut offset = 0;
+        let terms = factors
+            .into_iter()
+            .map(|(factor, intercept, slopes)| {
+                let EncodedFactor {
+                    encoding,
+                    levels,
+                    sorted,
+                } = factor;
+                let n_columns = intercept as usize + slopes.len();
+                let adjoint = AdjointSum::new(&levels, encoding.n_levels(), n_columns, sorted);
+                let term = Term {
+                    encoding,
+                    offset,
+                    intercept,
+                    levels,
+                    sorted,
+                    slopes,
+                    adjoint,
+                };
+                offset += term.n_dofs();
+                term
+            })
+            .collect();
 
         Ok(Design {
             terms: Arc::new(terms),

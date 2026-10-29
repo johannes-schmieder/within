@@ -2,7 +2,6 @@ mod design_tests {
     use crate::domain::PreparedDesign;
     use crate::linalg::dot;
     use crate::operator::DesignOperator;
-    use rstest::rstest;
     use schwarz_precond::Operator;
 
     fn make_test_design() -> PreparedDesign<'static> {
@@ -100,12 +99,7 @@ mod design_tests {
         );
     }
 
-    /// Fold on an *unsorted* column. Construction only sorts by the dominant
-    /// factor, so a small non-dominant factor legitimately reaches
-    /// `ScatterStrategy::Fold` (parallel, `n_levels < SCATTER_LOCAL_THRESHOLD`)
-    /// with interleaved levels — Fold must stay order-agnostic. The dominant
-    /// factor here is pre-sorted (no permutation), leaving `fb = i % 50`
-    /// interleaved.
+    /// A non-dominant factor keeps its unsorted rows; at 300 rows per level it takes the Fold.
     #[test]
     fn test_fold_unsorted_secondary_factor() {
         let n_obs = 15_000;
@@ -137,8 +131,6 @@ mod design_tests {
             (lhs - rhs).abs() < 1e-8,
             "Adjoint property violated: <D·x, r>={lhs} vs <x, D^T·r>={rhs}"
         );
-
-        assert_scratch_reuse_matches_fresh(&dm, "fold: non-dominant unsorted 50 levels");
     }
 
     #[test]
@@ -223,85 +215,10 @@ mod design_tests {
             .expect("apply_adjoint succeeds");
         assert_eq!(x, vec![3.0, 7.0, 5.0]);
     }
-
-    /// Single-factor design with `level(i) = i % n_levels`; when
-    /// `n_obs >= n_levels` every level is populated so the inferred level count
-    /// is exactly `n_levels` (which selects the scatter strategy).
-    fn make_strategy_design(n_obs: usize, n_levels: usize) -> PreparedDesign<'static> {
-        let f: Vec<u32> = (0..n_obs).map(|i| (i % n_levels) as u32).collect();
-        PreparedDesign::from_levels_for_test(vec![f])
-    }
-
-    fn assert_all_close(actual: &[f64], expected: &[f64], ctx: &str) {
-        assert_eq!(actual.len(), expected.len(), "{ctx}: length mismatch");
-        for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
-            // Stale-scratch contamination is O(value), so this cannot flake on FP noise.
-            let tol = 1e-9 * e.abs().max(1.0);
-            assert!(
-                (a - e).abs() <= tol,
-                "{ctx}: index {i}: {a} vs {e} (tol {tol})"
-            );
-        }
-    }
-
-    #[rstest]
-    #[case::sequential(200, 16)]
-    #[case::fold(15_000, 64)]
-    #[case::sorted_coalesced(150_000, 100_000)]
-    fn test_scatter_scratch_reuse_matches_fresh_operator(
-        #[case] n_obs: usize,
-        #[case] n_levels: usize,
-    ) {
-        let dm = make_strategy_design(n_obs, n_levels);
-        assert_scratch_reuse_matches_fresh(&dm, &format!("n_obs={n_obs}, n_levels={n_levels}"));
-    }
-
-    /// A large unsorted non-dominant factor cannot coalesce.
-    #[test]
-    fn test_atomic_scatter_scratch_reuse_matches_fresh_operator() {
-        let n_obs = 150_000usize;
-        let fa: Vec<u32> = (0..n_obs as u32).collect();
-        let fb: Vec<u32> = (0..n_obs).map(|i| ((i * 7919) % 100_000) as u32).collect();
-        let dm = PreparedDesign::from_levels_for_test(vec![fa, fb]);
-        assert!(
-            dm.design.obs_perm.is_none(),
-            "dominant factor is sorted; no perm"
-        );
-        assert_scratch_reuse_matches_fresh(&dm, "atomic: non-dominant unsorted 100K levels");
-    }
-
-    /// `apply_adjoint` reuses the operator's atomic scatter scratch across
-    /// calls (cf. the removed `SCATTER_FOLD_POOL` leak): a second call on the
-    /// *same* operator must match a freshly built operator — stale values from
-    /// the first call must not bleed into the second.
-    fn assert_scratch_reuse_matches_fresh(dm: &PreparedDesign<'_>, ctx: &str) {
-        let r: Vec<f64> = (0..dm.design.n_obs)
-            .map(|i| (i as f64 * 0.37 + 1.0).sin())
-            .collect();
-
-        // Baseline: a fresh operator that has never applied before.
-        let fresh = DesignOperator::new(dm);
-        let mut baseline = vec![0.0f64; dm.design.n_dofs];
-        fresh
-            .apply_adjoint(&r, &mut baseline)
-            .expect("apply_adjoint succeeds");
-
-        // The second apply on a dirtied operator must equal the fresh baseline.
-        let op = DesignOperator::new(dm);
-        let mut warmup = vec![0.0f64; dm.design.n_dofs];
-        op.apply_adjoint(&r, &mut warmup)
-            .expect("apply_adjoint succeeds");
-        let mut reused = vec![0.0f64; dm.design.n_dofs];
-        op.apply_adjoint(&r, &mut reused)
-            .expect("apply_adjoint succeeds");
-
-        assert_all_close(&reused, &baseline, &format!("reused vs fresh ({ctx})"));
-    }
 }
 
 mod slope_design_tests {
-    use super::super::scatter::ScatterStrategy;
-    use crate::domain::{Design, Effect, PreparedDesign};
+    use crate::domain::{AdjointSum, Design, Effect, PreparedDesign};
     use crate::operator::DesignOperator;
     use schwarz_precond::Operator;
 
@@ -394,13 +311,16 @@ mod slope_design_tests {
         assert_close(&got_t, &expect_t);
     }
 
-    /// ⟨Dx, r⟩ = ⟨x, Dᵀr⟩, weighted, with each parallel scatter strategy on each fused arity.
-    #[test]
-    fn slope_adjoint_property_parallel_strategies() {
-        let n = 300_000;
+    /// Owner (sorted or indexed) and Fold terms on each fused arity, and levels spanning many leaves.
+    fn adjoint_sum_design() -> PreparedDesign<'static> {
+        let n: usize = 300_000;
         // Largest term and already sorted, so the locality sort leaves every fixture as built.
         let sorted: Vec<u32> = (0..n).map(|i| (i * 160_000 / n) as u32).collect();
         let sorted_small: Vec<u32> = (0..n).map(|i| (i * 30_000 / n) as u32).collect();
+        let sorted_skewed: Vec<u32> = (0..n).map(|i| i.saturating_sub(150_000) as u32).collect();
+        let unsorted_skewed: Vec<u32> = (0..n)
+            .map(|i| (i % 2) as u32 * (1 + i / 2) as u32)
+            .collect();
         let unsorted: Vec<u32> = (0..n).map(|i| ((i * 7919) % 100_000) as u32).collect();
         let unsorted_fused: Vec<u32> = (0..n).map(|i| ((i * 7919) % 60_000) as u32).collect();
         let small: Vec<u32> = (0..n).map(|i| (i % 10) as u32).collect();
@@ -415,30 +335,54 @@ mod slope_design_tests {
             Effect::new(&sorted_small, true, [&z[5][..], &z[6][..], &z[7][..]]).unwrap(),
             Effect::new(&unsorted, false, [&z[8][..], &z[9][..], &z[10][..]]).unwrap(),
             Effect::new(&small, true, [&z[11][..], &z[12][..], &z[13][..]]).unwrap(),
+            Effect::new(&sorted_skewed, true, []).unwrap(),
+            Effect::new(&unsorted_skewed, true, []).unwrap(),
         ];
         let weights: Vec<f64> = (0..n).map(|i| 0.5 + noise(i).abs()).collect();
-        let design = PreparedDesign::new(Design::new(effects).unwrap(), Some(&weights)).unwrap();
+        let design = Design::new(effects).unwrap().into_owned();
+        PreparedDesign::new(design, Some(&weights)).unwrap()
+    }
+
+    /// The adjoint's bits must not depend on the pool it runs in.
+    #[test]
+    fn adjoint_is_pool_independent() {
+        let design = adjoint_sum_design();
+        let op = DesignOperator::new(&design);
+        let r: Vec<f64> = (0..design.design.n_obs)
+            .map(|i| noise(29 * i + 5))
+            .collect();
+        let adjoint_in = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test rayon pool")
+                .install(|| {
+                    let mut dtr = vec![0.0; design.design.n_dofs];
+                    op.apply_adjoint(&r, &mut dtr).unwrap();
+                    dtr.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                })
+        };
+        let reference = adjoint_in(1);
+        for threads in [2, 3, 8] {
+            // Not `assert_eq!`: a printed coefficient vector would bury the thread count.
+            assert!(adjoint_in(threads) == reference, "{threads} threads");
+        }
+    }
+
+    /// ⟨Dx, r⟩ = ⟨x, Dᵀr⟩, weighted, with each adjoint sum on each fused arity.
+    #[test]
+    fn slope_adjoint_property_parallel_strategies() {
+        let design = adjoint_sum_design();
+        let n = design.design.n_obs;
         let op = DesignOperator::new(&design);
 
-        let picked: Vec<ScatterStrategy> = design
-            .terms()
-            .map(|t| {
-                let (block, levels) = (t.term.dofs().len(), t.term.n_levels());
-                ScatterStrategy::pick(true, block, levels, t.term.sorted())
-            })
-            .collect();
-        assert_eq!(
-            picked,
-            [
-                ScatterStrategy::SortedCoalesced,
-                ScatterStrategy::Atomic,
-                ScatterStrategy::Fold,
-                ScatterStrategy::Fold,
-                ScatterStrategy::SortedCoalesced,
-                ScatterStrategy::Atomic,
-                ScatterStrategy::Fold,
-            ]
-        );
+        // Owner unless unsorted with at least 12 rows per coefficient slot.
+        let owner = [true, true, true, false, true, true, false, true, true];
+        let sorted = [true, false, false, false, true, false, false, true, false];
+        for (t, (owner, sorted)) in design.terms().zip(owner.into_iter().zip(sorted)) {
+            assert_eq!(t.term.sorted(), sorted);
+            assert_eq!(matches!(t.term.adjoint(), AdjointSum::Owner(_)), owner);
+        }
         assert!(design.design.obs_perm.is_none());
 
         let x: Vec<f64> = (0..design.design.n_dofs)
