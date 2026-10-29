@@ -168,8 +168,12 @@ fn categorical_fold_slices_preserve_mixed_design_solve_results() {
                         assert_bits(&direct, &generic);
 
                         let diagonal = build_diagonal(&prepared).unwrap();
-                        let (schwarz, _) =
-                            build_schwarz(&prepared, &LocalSolverConfig::default()).unwrap();
+                        let (schwarz, _) = build_schwarz(
+                            &prepared,
+                            &LocalSolverConfig::default(),
+                            crate::Cancellation::default(),
+                        )
+                        .unwrap();
                         let schwarz = schwarz.expect("three-factor Schwarz");
                         let mut results = Vec::new();
                         for preconditioner in [None, Some(&diagonal), Some(&schwarz)] {
