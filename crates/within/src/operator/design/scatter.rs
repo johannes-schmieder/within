@@ -8,11 +8,16 @@ use rayon::prelude::*;
 use super::PAR_THRESHOLD;
 use crate::domain::{AdjointSum, LevelRows, PreparedDesign, PreparedTerm};
 
+#[cfg(test)]
+mod tests;
+
 /// Adjoint scatter over all terms; `base(i)` is the row value each column scales by its loading.
+/// `unweighted` borrows that same row value when no weighting is needed.
 pub(super) fn scatter_apply(
     prepared: &PreparedDesign<'_>,
     dst: &mut [f64],
     base: &(impl Fn(usize) -> f64 + Sync),
+    unweighted: Option<&[f64]>,
 ) {
     let design = &prepared.design;
     debug_assert_eq!(dst.len(), design.n_dofs);
@@ -22,7 +27,12 @@ pub(super) fn scatter_apply(
         let term = t.term;
         let block = &mut dst[term.dofs()];
         match (term.intercept, t.slopes) {
-            (true, []) => scatter_term::<1>(block, &t, parallel, |i| [base(i)]),
+            (true, []) => match (term.adjoint(), unweighted) {
+                (AdjointSum::Fold, Some(values)) => {
+                    categorical_fold(block, term.levels(), values);
+                }
+                _ => scatter_term::<1>(block, &t, parallel, |i| [base(i)]),
+            },
             (true, [z0]) => {
                 let z0 = &z0[..];
                 scatter_term::<2>(block, &t, parallel, |i| {
@@ -70,6 +80,20 @@ pub(super) fn scatter_apply(
             }
         }
     }
+}
+
+/// The unweighted categorical Fold, with row bounds checked once per leaf.
+fn categorical_fold(block: &mut [f64], levels: &[u32], values: &[f64]) {
+    let n_levels = block.len();
+    let leaf = (4 * n_levels).max(65_536);
+    let scatter = |rows: Range<usize>| {
+        let mut sums = vec![0.0; n_levels];
+        for (&level, &value) in levels[rows.clone()].iter().zip(&values[rows]) {
+            sums[level as usize] += value;
+        }
+        sums
+    };
+    block.copy_from_slice(&fixed_tree(0..levels.len(), leaf, &scatter, &add));
 }
 
 /// Write one term's coefficient block: `block[c·L + l] = Σ_{i : level(i) = l} values(i)[c]`.

@@ -74,8 +74,8 @@ impl Operator for DesignOperator<'_> {
         debug_assert_eq!(x.len(), self.prepared.design.n_obs);
         debug_assert_eq!(y.len(), self.prepared.design.n_dofs);
         match self.prepared.sqrt_weights() {
-            Some(sw) => scatter_apply(self.prepared, y, &|i| sw[i] * x[i]),
-            None => scatter_apply(self.prepared, y, &|i| x[i]),
+            Some(sw) => scatter_apply(self.prepared, y, &|i| sw[i] * x[i], None),
+            None => scatter_apply(self.prepared, y, &|i| x[i], Some(x)),
         }
         Ok(())
     }
