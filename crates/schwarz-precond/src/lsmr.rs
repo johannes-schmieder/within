@@ -56,6 +56,18 @@ pub struct LsmrResult {
     pub true_residual: Option<Vec<f64>>,
 }
 
+/// A failed solve together with the work already spent from its iteration budget.
+#[derive(Debug, thiserror::Error)]
+#[error("LSMR failed after {iterations} attempted iterations: {source}")]
+pub struct LsmrFailure {
+    /// Underlying validation, numerical, or operator error.
+    #[source]
+    pub source: SolveError,
+    /// Iterations attempted, including an iteration whose operator application failed.
+    /// Initialization costs zero; exit audits and internal restarts retain the count.
+    pub iterations: usize,
+}
+
 /// Reason an LSMR solve stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LsmrStopReason {
@@ -82,7 +94,9 @@ pub enum LsmrStopReason {
 pub struct Progress {
     /// 1-based index of the iteration just completed.
     pub iteration: usize,
-    /// [`LsmrResult::normal_eq_residual`] as of this iteration.
+    /// Normal-equation residual estimate relative to this Krylov pass's initial
+    /// estimate. Unlike [`LsmrResult::normal_eq_residual`], a warm-start or audit
+    /// restart uses the correction's reference, not the original response's.
     pub normal_eq_residual: f64,
 }
 
@@ -225,6 +239,30 @@ pub fn lsmr<A: Operator + ?Sized>(
     maxiter: usize,
     local_size: Option<usize>,
 ) -> Result<LsmrResult, SolveError> {
+    lsmr_counted(operator, b, tol, maxiter, local_size).map_err(|failure| failure.source)
+}
+
+/// Unpreconditioned [`lsmr`] with attempted-iteration accounting on errors.
+pub fn lsmr_counted<A: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    tol: f64,
+    maxiter: usize,
+    local_size: Option<usize>,
+) -> Result<LsmrResult, LsmrFailure> {
+    let mut iterations = 0;
+    lsmr_impl(operator, b, tol, maxiter, local_size, &mut iterations)
+        .map_err(|source| LsmrFailure { source, iterations })
+}
+
+fn lsmr_impl<A: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    tol: f64,
+    maxiter: usize,
+    local_size: Option<usize>,
+    attempted: &mut usize,
+) -> Result<LsmrResult, SolveError> {
     validate_lsmr_inputs(operator, b, tol)?;
     let n = operator.ncols();
 
@@ -247,6 +285,7 @@ pub fn lsmr<A: Operator + ?Sized>(
     let start = SolveStart {
         x0: None,
         reference: NormalEqReference::cold(step1, Magnitude::product(step1.alpha, step1.beta)),
+        attempted,
     };
     lsmr_from_bidiag(bidiag, step1, b, start, criteria, maxiter, None)
 }
@@ -259,6 +298,44 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
     tol: f64,
     maxiter: usize,
     options: MlsmrOptions<'_>,
+) -> Result<LsmrResult, SolveError> {
+    mlsmr_counted(operator, b, preconditioner, tol, maxiter, options)
+        .map_err(|failure| failure.source)
+}
+
+/// [`mlsmr`] with attempted-iteration accounting on errors.
+///
+/// Callers implementing a sequence of preconditioners can debit `iterations`
+/// on both success and failure before passing the remaining budget to a new run.
+pub fn mlsmr_counted<A: Operator + ?Sized, M: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    preconditioner: &M,
+    tol: f64,
+    maxiter: usize,
+    options: MlsmrOptions<'_>,
+) -> Result<LsmrResult, LsmrFailure> {
+    let mut iterations = 0;
+    mlsmr_impl(
+        operator,
+        b,
+        preconditioner,
+        tol,
+        maxiter,
+        options,
+        &mut iterations,
+    )
+    .map_err(|source| LsmrFailure { source, iterations })
+}
+
+fn mlsmr_impl<A: Operator + ?Sized, M: Operator + ?Sized>(
+    operator: &A,
+    b: &[f64],
+    preconditioner: &M,
+    tol: f64,
+    maxiter: usize,
+    options: MlsmrOptions<'_>,
+    attempted: &mut usize,
 ) -> Result<LsmrResult, SolveError> {
     validate_lsmr_inputs(operator, b, tol)?;
     let n = operator.ncols();
@@ -337,6 +414,7 @@ pub fn mlsmr<A: Operator + ?Sized, M: Operator + ?Sized>(
     let start = SolveStart {
         x0: warm_start,
         reference,
+        attempted,
     };
     let reference_norm = if b_norm > 0.0 { b_norm } else { rhs_norm };
     let criteria = ConvergenceCriteria::new(reference_norm, tol);
@@ -388,6 +466,7 @@ impl NormalEqReference {
 struct SolveStart<'a> {
     x0: Option<&'a [f64]>,
     reference: NormalEqReference,
+    attempted: &'a mut usize,
 }
 
 /// Runs LSMR on the correction to `x0`, restarting from any tolerance stop `b − A x` refutes.
@@ -402,6 +481,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
 ) -> Result<LsmrResult, SolveError> {
     let n = bidiag.v().len();
     let reference = start.reference;
+    let attempted = start.attempted;
     let mut base: Option<Cow<'_, [f64]>> = start.x0.map(Cow::Borrowed);
     let mut iterations = 0;
     let mut restarts = 0;
@@ -449,6 +529,7 @@ fn lsmr_from_bidiag<B: Bidiagonalization>(
         let stop_reason = 'pass: {
             while iterations < maxiter {
                 iterations += 1;
+                *attempted = iterations;
                 let step = bidiag.step()?;
                 convergence.observe(step);
                 let curr_rot = recurrence.step(step);

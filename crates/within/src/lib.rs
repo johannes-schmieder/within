@@ -46,7 +46,8 @@ pub use config::{
 pub use domain::{Design, Effect};
 pub use error::{BuildError, BuildWarning, SolveError, WithinError};
 pub use operator::schwarz::Preconditioner;
+pub use schwarz_precond::{EscalationHandler, EscalationPolicy, LsmrStopReason, Progress};
 pub use solver::{
-    solve, solve_batch, BatchSolveResult, CoefficientLayout, IntoDesign, PreconditionerInput,
-    SolveResult, Solver,
+    solve, solve_batch, BatchSolveResult, CoefficientLayout, ControlledSolveError,
+    ControlledSolveResult, IntoDesign, PreconditionerInput, SolveControl, SolveResult, Solver,
 };

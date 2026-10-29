@@ -18,7 +18,9 @@ use crate::operator::schwarz::Preconditioner;
 use crate::operator::DesignOperator;
 use crate::{BuildError, BuildWarning, SolveError, WithinError};
 
+mod controlled;
 mod ladder;
+pub use controlled::{ControlledSolveError, ControlledSolveResult, SolveControl};
 mod layout;
 #[cfg(test)]
 mod tests;

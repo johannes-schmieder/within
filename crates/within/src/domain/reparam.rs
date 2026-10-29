@@ -92,6 +92,38 @@ impl TermReparam {
         })
     }
 
+    /// Invert the existing back-transform on its identified columns.
+    ///
+    /// Gram–Schmidt adds one new pivot per row of W. Reverse substitution in
+    /// that pivot order solves Wᵀ q = b without a second factorization or
+    /// retaining another per-level matrix. The caller rejects nonzero dropped
+    /// coordinates before calling this method.
+    pub(crate) fn forward_transform(&self, term: &Term<'_>, x: &mut [f64]) {
+        let slope_slot =
+            |j: usize, level: usize| term.column_dofs(term.slope_column(j)).start + level;
+        let v = self.slopes.len();
+        let mut b = vec![0.0; v];
+        for (l, t) in self.transforms.iter().enumerate() {
+            for (j, bj) in b.iter_mut().enumerate() {
+                *bj = x[slope_slot(j, l)];
+                x[slope_slot(j, l)] = 0.0;
+            }
+            if term.intercept {
+                x[term.column_dofs(0).start + l] += dot(&b, &t.center);
+            }
+            for (k, row) in t.w.chunks_exact(v).enumerate().rev() {
+                let pivot = (0..v)
+                    .find(|&j| row[j] != 0.0 && t.w[..k * v].chunks_exact(v).all(|r| r[j] == 0.0))
+                    .expect("each Gram–Schmidt row introduces one pivot");
+                let q = b[pivot] / row[pivot];
+                x[slope_slot(k, l)] = q;
+                for (bj, &wj) in b.iter_mut().zip(row) {
+                    *bj -= wj * q;
+                }
+            }
+        }
+    }
+
     /// Map this term's solve-basis coefficients back; slots outside its block are untouched.
     pub(crate) fn back_transform(&self, term: &Term<'_>, x: &mut [f64]) {
         let slope_slot =
