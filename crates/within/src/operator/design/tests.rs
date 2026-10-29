@@ -5,6 +5,29 @@ mod design_tests {
     use rstest::rstest;
     use schwarz_precond::Operator;
 
+    #[test]
+    fn prepared_residual_reuses_measured_storage_with_and_without_zero_weights() {
+        use crate::{Design, Effect, ResidualOutput};
+
+        let f = [0, 0, 1, 1];
+        let y = [3.0, 2.0, 8.0, 7.0];
+        for weights in [[1e-18, 1.0, 2.0, 4.0], [1e-18, 1.0, 0.0, 4.0]] {
+            let design = Design::new(vec![Effect::new(&f, true, []).unwrap()]).unwrap();
+            let prepared = PreparedDesign::new(design, Some(&weights)).unwrap();
+            let op = DesignOperator::new(&prepared);
+            let measured = vec![0.0; y.len()];
+            let allocation = measured.as_ptr();
+            let result = op.demeaned(
+                &[1.0, 2.0],
+                &y,
+                Some(measured),
+                ResidualOutput::PreparedModel,
+            );
+            assert_eq!(result.as_ptr(), allocation);
+            assert_eq!(result, [2.0, 1.0, 6.0, 5.0]);
+        }
+    }
+
     fn make_test_design() -> PreparedDesign<'static> {
         // Sorted on the dominant factor, so construction applies no locality permutation.
         PreparedDesign::from_levels_for_test(vec![vec![0, 1, 1, 2, 0], vec![0, 0, 1, 2, 3]])

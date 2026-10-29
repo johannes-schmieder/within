@@ -66,6 +66,7 @@ fn caller_handoff_keeps_shared_budget_original_response_and_total_coefficients()
             SolveControl {
                 initial_coefficients: None,
                 escalation: Some(&stop),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -89,6 +90,7 @@ fn caller_handoff_keeps_shared_budget_original_response_and_total_coefficients()
             SolveControl {
                 initial_coefficients: Some(&first.solution.x),
                 escalation: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -116,6 +118,7 @@ fn caller_handoff_keeps_shared_budget_original_response_and_total_coefficients()
             SolveControl {
                 initial_coefficients: Some(&last.solution.x),
                 escalation: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -147,6 +150,7 @@ fn zero_budget_reports_original_rhs_reference_and_preserves_nonunique_seed_gauge
             SolveControl {
                 initial_coefficients: Some(&seed),
                 escalation: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -236,6 +240,7 @@ fn weighted_two_slope_seeds_round_trip_whitening_pivot_order_and_locality_sort()
                     SolveControl {
                         initial_coefficients: Some(&seed),
                         escalation: None,
+                        ..Default::default()
                     },
                 )
                 .unwrap();
@@ -256,6 +261,7 @@ fn weighted_two_slope_seeds_round_trip_whitening_pivot_order_and_locality_sort()
                     SolveControl {
                         initial_coefficients: Some(&seed),
                         escalation: None,
+                        ..Default::default()
                     },
                 )
                 .unwrap();
@@ -294,6 +300,7 @@ fn invalid_seed_and_implicit_adaptation_fail_without_spending_iterations() {
                 SolveControl {
                     initial_coefficients: Some(&seed),
                     escalation: None,
+                    ..Default::default()
                 },
             )
             .unwrap_err();
@@ -306,6 +313,7 @@ fn invalid_seed_and_implicit_adaptation_fail_without_spending_iterations() {
             SolveControl {
                 initial_coefficients: Some(&[1.0, 2.0, 0.0, 0.0]),
                 escalation: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -397,6 +405,7 @@ fn zero_response_corrects_warm_seed_and_exact_seed_keeps_gauge() {
             SolveControl {
                 initial_coefficients: Some(&exact),
                 escalation: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -410,6 +419,7 @@ fn zero_response_corrects_warm_seed_and_exact_seed_keeps_gauge() {
             SolveControl {
                 initial_coefficients: Some(&exact),
                 escalation: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -436,6 +446,7 @@ fn slope_only_seed_uses_original_units() {
             SolveControl {
                 initial_coefficients: Some(&[7.0, -3.0]),
                 escalation: None,
+                ..Default::default()
             },
         )
         .unwrap()
