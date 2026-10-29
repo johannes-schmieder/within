@@ -135,3 +135,77 @@ fn fixed_worker_repeats_cross_worker_decisions_and_reused_batch_agree() {
         }
     }
 }
+
+/// Equal-weight duplicate rows with opposite errors make the known residual
+/// orthogonal to every design column, independently of the numerical solver.
+#[test]
+fn converged_weighted_slopes_match_the_known_projection_and_repeat() {
+    let n = 2 * 31 * 29 * 7;
+    let mut levels = [Vec::new(), Vec::new(), Vec::new()];
+    let mut z = [Vec::new(), Vec::new(), Vec::new()];
+    let (mut y, mut weights, mut expected) = (Vec::new(), Vec::new(), Vec::new());
+    for a in 0..31 {
+        for b in 0..29 {
+            for c in 0..7 {
+                let index = (a * 29 + b) * 7 + c;
+                let slopes = [noise(index, 1), noise(index, 2), noise(index, 3)];
+                let fitted = 2.0 + 0.02 * a as f64 - 0.03 * b as f64
+                    + 0.04 * c as f64
+                    + slopes[0] * 0.005 * b as f64
+                    + slopes[1] * 0.004 * (b % 5) as f64
+                    + slopes[2] * 0.01 * (b % 7) as f64;
+                for error in [-0.125, 0.125] {
+                    for (ids, level) in levels.iter_mut().zip([a, b, c]) {
+                        ids.push(level as u32);
+                    }
+                    for (column, value) in z.iter_mut().zip(slopes) {
+                        column.push(value);
+                    }
+                    weights.push(1.0 + noise(index, 11));
+                    y.push(fitted + error);
+                    expected.push(error);
+                }
+            }
+        }
+    }
+    assert_eq!(y.len(), n);
+    let options = LsmrOptions {
+        tol: 1e-12,
+        maxiter: 200,
+        local_size: Some(4),
+    };
+    for preconditioner in [
+        PreconditionerConfig::Off,
+        PreconditionerConfig::Diagonal,
+        PreconditionerConfig::Additive {
+            local_solver: LocalSolverConfig::default(),
+        },
+    ] {
+        let mut reference = None;
+        for workers in [1, 2, 3, 8] {
+            let result = ThreadPoolBuilder::new().num_threads(workers).build().unwrap().install(|| {
+                let effects = vec![
+                    Effect::new(&levels[0], true, []).unwrap(),
+                    Effect::new(&levels[1], true, z.iter().map(Vec::as_slice)).unwrap(),
+                    Effect::new(&levels[2], true, []).unwrap(),
+                ];
+                let solver = Solver::new(effects, Some(weights.as_slice()), &preconditioner).unwrap();
+                let result = solver.solve(&y, &options).unwrap();
+                assert!(result.converged, "not converged: {preconditioner:?}, workers={workers}");
+                let error = result.demeaned.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0.0_f64, f64::max);
+                assert!(error < 1e-9, "independent projection error={error:e}, {preconditioner:?}, workers={workers}");
+                let repeated = solver.solve(&y, &options).unwrap();
+                assert!(fingerprint(&result) == fingerprint(&repeated), "fixed-worker converged mismatch: {preconditioner:?}, workers={workers}");
+                fingerprint(&result)
+            });
+            if let Some(ref old) = reference {
+                assert!(
+                    old == &result,
+                    "cross-worker converged mismatch: {preconditioner:?}, workers={workers}"
+                );
+            } else {
+                reference = Some(result);
+            }
+        }
+    }
+}
