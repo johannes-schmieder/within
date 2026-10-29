@@ -242,6 +242,7 @@ fn run(args: &Args) -> Result<()> {
                 let solved = solver.solve(black_box(input), &options)?;
                 outcome.elapsed_ns += started.map_or(0, |t| t.elapsed().as_nanos());
                 if !solved.converged
+                    || !solved.residual.is_finite()
                     || !solved.unidentified.is_empty()
                     || !solved.warnings.is_empty()
                 {
