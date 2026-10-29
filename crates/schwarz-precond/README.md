@@ -1,5 +1,12 @@
 # schwarz-precond
 
+Additive Schwarz reserves its per-apply local-output and local-solver scratch
+buffers fallibly. A failed reservation returns `SolveError::Allocation`, so a
+host can report resource exhaustion separately from numerical nonconvergence.
+Retaining scratch for reuse is optional; a failed cache reservation discards
+the buffer without changing the solve result. This guarantee is limited to
+these scratch buffers, not every allocation made while building or solving.
+
 Generic domain decomposition library providing a one-level additive Schwarz
 preconditioner with pluggable local solvers, plus a Modified LSMR iterative
 solver for rectangular least-squares problems. Suitable for symmetric

@@ -271,3 +271,68 @@ impl<S: LocalSolver> Operator for SchwarzPreconditioner<S> {
         SchwarzPreconditioner::apply(self, r, z)
     }
 }
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use crate::{LocalSolveError, SubdomainCore};
+
+    struct Identity;
+    impl LocalSolver for Identity {
+        fn n_local(&self) -> usize {
+            1
+        }
+        fn workspace_len(&self) -> usize {
+            1
+        }
+        fn solve_local(
+            &self,
+            _: &mut [f64],
+            _: &mut [f64],
+            _: bool,
+        ) -> Result<(), LocalSolveError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scratch_refusal_reaches_apply_without_publishing_partial_output() {
+        for threads in [1, 4] {
+            let team = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            team.install(|| {
+                for refuse_output in [false, true] {
+                    let entries = (0..8)
+                        .map(|i| {
+                            SubdomainEntry::try_new(SubdomainCore::uniform(vec![i]), Identity)
+                                .unwrap()
+                        })
+                        .collect();
+                    let mut preconditioner = SchwarzPreconditioner::new(entries);
+                    if refuse_output {
+                        preconditioner.local_outputs = Arc::new(Pool::new(usize::MAX, 4));
+                    } else {
+                        preconditioner.workspaces = Arc::new(Pool::new(usize::MAX, usize::MAX));
+                    }
+                    let mut output = [19.0; 8];
+                    assert!(matches!(
+                        preconditioner.apply(&[2.0; 8], &mut output),
+                        Err(SolveError::Allocation { .. })
+                    ));
+                    assert_eq!(output, [19.0; 8]);
+                    // Only the failed pool is replaced; a successful retry may
+                    // reuse the other pool's returned scratch after all tasks join.
+                    if refuse_output {
+                        preconditioner.local_outputs = Arc::new(Pool::new(8, 4));
+                    } else {
+                        preconditioner.workspaces = Arc::new(Pool::new(1, usize::MAX));
+                    }
+                    preconditioner.apply(&[2.0; 8], &mut output).unwrap();
+                    assert_eq!(output, [2.0; 8]);
+                }
+            });
+        }
+    }
+}

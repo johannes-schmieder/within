@@ -59,6 +59,12 @@ pub enum SolveError {
     /// The caller cancelled; all work started by this call has completed.
     #[error("solve cancelled")]
     Cancelled,
+    /// A required numeric scratch buffer could not be reserved during a solve.
+    #[error("unable to reserve solver scratch at {context}")]
+    Allocation {
+        /// Context identifying the failed reservation.
+        context: &'static str,
+    },
     /// A local subdomain solve failed during a preconditioner apply.
     #[error("subdomain {subdomain} local solve failed: {source}")]
     LocalSolveFailed {
