@@ -69,6 +69,7 @@ impl Solver<'_> {
         checkpoint(control.cancellation, 0)?;
         let default = LsmrOptions::default();
         let lsmr = lsmr.into().unwrap_or(&default);
+        checkpoint(control.cancellation, 0)?;
         let map = match &self.slot {
             PrecondSlot::Static { map, .. } => map.as_ref(),
             PrecondSlot::Adaptive(_) => {
@@ -77,15 +78,18 @@ impl Solver<'_> {
                 ))
             }
         };
-        let rhs = self.prepare(y).map_err(|source| LsmrFailure {
+        let prepared = self.prepare(y);
+        checkpoint(control.cancellation, 0)?;
+        let rhs = prepared.map_err(|source| LsmrFailure {
             source,
             iterations: 0,
         })?;
         let seed = control
             .initial_coefficients
             .map(|x| self.prepare_seed(x))
-            .transpose()?;
+            .transpose();
         checkpoint(control.cancellation, 0)?;
+        let seed = seed?;
         let setup_secs = t_start.elapsed().as_secs_f64();
         let options = MlsmrOptions {
             warm_start: seed.as_deref(),

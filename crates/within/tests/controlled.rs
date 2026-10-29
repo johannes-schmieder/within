@@ -532,3 +532,74 @@ fn cancellation_overrides_handoff_and_retains_its_iteration_count() {
         assert_eq!(error.iterations, 0);
     }
 }
+
+#[test]
+fn preparation_cancellation_precedes_response_and_seed_validation_errors() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use within::{Cancellation, SolveError};
+    let levels = [0, 1, 0, 1];
+    let solver = Solver::new(
+        vec![Effect::new(&levels, true, []).unwrap()],
+        None,
+        PreconditionerConfig::Off,
+    )
+    .unwrap();
+    let y = [1.0, 2.0, 3.0, 4.0];
+    let bad_seed = [f64::NAN, 0.0];
+    for cancel_at in [2, 3] {
+        let queries = AtomicUsize::new(0);
+        let query = || queries.fetch_add(1, Ordering::SeqCst) >= cancel_at;
+        let error = solver
+            .solve_controlled(
+                if cancel_at == 2 { &y[..2] } else { &y },
+                None,
+                SolveControl {
+                    initial_coefficients: Some(&bad_seed),
+                    cancellation: Cancellation::new(&query),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error.source, SolveError::Cancelled));
+        assert_eq!(error.iterations, 0);
+    }
+}
+
+#[test]
+fn cancellation_during_options_conversion_precedes_adaptive_validation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use within::{Cancellation, SolveError};
+    struct CancelOptions<'a>(&'a AtomicBool);
+    impl<'a> From<CancelOptions<'a>> for Option<&'a LsmrOptions> {
+        fn from(options: CancelOptions<'a>) -> Self {
+            options.0.store(true, Ordering::SeqCst);
+            None
+        }
+    }
+    let f = [0, 1, 0, 1];
+    let g = [0, 0, 1, 1];
+    let solver = Solver::new(
+        vec![
+            Effect::new(&f, true, []).unwrap(),
+            Effect::new(&g, true, []).unwrap(),
+        ],
+        None,
+        None,
+    )
+    .unwrap();
+    let flag = AtomicBool::new(false);
+    let query = || flag.load(Ordering::SeqCst);
+    let error = solver
+        .solve_controlled(
+            &[1.0, 2.0, 3.0, 4.0],
+            CancelOptions(&flag),
+            SolveControl {
+                cancellation: Cancellation::new(&query),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error.source, SolveError::Cancelled));
+    assert_eq!(error.iterations, 0);
+    assert!(!solver.has_escalated());
+}
