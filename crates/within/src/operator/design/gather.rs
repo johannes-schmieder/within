@@ -5,6 +5,9 @@ use rayon::prelude::*;
 use super::PAR_THRESHOLD;
 use crate::domain::PreparedDesign;
 
+#[cfg(test)]
+mod tests;
+
 /// Gather-apply `dst[i] = Σ_t Σ_c src[…] · loading_c(i)`, times `scale[i]` when given.
 pub(crate) fn gather_apply(
     prepared: &PreparedDesign<'_>,
@@ -17,9 +20,8 @@ pub(crate) fn gather_apply(
     debug_assert_eq!(src.len(), design.n_dofs);
     debug_assert_eq!(dst.len(), design.n_obs);
 
-    dst.fill(0.0);
-
     for_each_chunk(dst, |chunk, row_start| {
+        chunk.fill(0.0);
         for t in prepared.terms() {
             let (offset, n_levels, levels) = (t.term.offset, t.term.n_levels(), t.term.levels());
             let col = |c: usize| &src[t.term.column_dofs(c)];
