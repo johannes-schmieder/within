@@ -3,6 +3,5 @@
 
 mod buffers;
 mod preconditioner;
-mod prolongation;
 
 pub use preconditioner::SchwarzPreconditioner;

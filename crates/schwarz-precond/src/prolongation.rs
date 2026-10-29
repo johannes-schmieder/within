@@ -2,50 +2,38 @@
 
 use rayon::prelude::*;
 
-/// Slots number the stacked local vector subdomain by subdomain; each DOF sums its slots ascending.
-pub(super) struct Prolongation {
-    /// Subdomain `i` owns slots `starts[i]..starts[i + 1]`.
-    starts: Vec<usize>,
-    /// DOF `g` owns `slots[offsets[g]..offsets[g + 1]]`.
+/// For each DOF, the slots of the stacked local vector holding it, in ascending slot order.
+pub(crate) struct Prolongation {
     offsets: Vec<usize>,
     slots: Vec<u32>,
 }
 
 impl Prolongation {
-    /// `subdomains` yields each subdomain's DOFs; it is re-walked, so it must be cheap to clone.
-    pub(super) fn new<'a>(
-        subdomains: impl Iterator<Item = &'a [u32]> + Clone,
-        n_dofs: usize,
-    ) -> Self {
-        let starts = std::iter::once(0)
-            .chain(subdomains.clone().scan(0, |end, dofs| {
-                *end += dofs.len();
-                Some(*end)
-            }))
-            .collect();
-        let (offsets, slots) = slots_by_dof(subdomains.flatten().copied(), n_dofs);
-        Self {
-            starts,
-            offsets,
-            slots,
+    /// `dofs` yields each slot's DOF in slot order; it is walked twice, so it must be cheap to clone.
+    pub(crate) fn new(dofs: impl Iterator<Item = u32> + Clone, n_dofs: usize) -> Self {
+        let mut offsets = vec![0usize; n_dofs + 1];
+        for g in dofs.clone() {
+            offsets[g as usize + 1] += 1;
         }
+        for g in 0..n_dofs {
+            offsets[g + 1] += offsets[g];
+        }
+        let mut next = offsets[..n_dofs].to_vec();
+        let mut slots = vec![0u32; offsets[n_dofs]];
+        for (s, g) in dofs.enumerate() {
+            let at = &mut next[g as usize];
+            slots[*at] = u32::try_from(s).expect("at most u32::MAX slots");
+            *at += 1;
+        }
+        Self { offsets, slots }
     }
 
-    /// The first slot of subdomain `i`; one past the last subdomain, the slot count.
-    pub(super) fn first_slot(&self, i: usize) -> usize {
-        self.starts[i]
-    }
-
-    pub(super) fn n_slots(&self) -> usize {
-        self.slots.len()
-    }
-
-    pub(super) fn n_dofs(&self) -> usize {
+    pub(crate) fn n_dofs(&self) -> usize {
         self.offsets.len() - 1
     }
 
     /// `global[g] = Σ local[s]` over the slots `s` of `g`, summed in ascending `s`.
-    pub(super) fn apply(&self, local: &[f64], global: &mut [f64]) {
+    pub(crate) fn apply(&self, local: &[f64], global: &mut [f64]) {
         debug_assert_eq!(local.len(), self.slots.len());
         debug_assert_eq!(global.len() + 1, self.offsets.len());
         const CHUNK: usize = 4096;
@@ -65,25 +53,6 @@ impl Prolongation {
     }
 }
 
-/// Counting sort of slots by DOF: DOF `g` gets `slots[offsets[g]..offsets[g + 1]]`, ascending.
-fn slots_by_dof(dofs: impl Iterator<Item = u32> + Clone, n_dofs: usize) -> (Vec<usize>, Vec<u32>) {
-    let mut offsets = vec![0usize; n_dofs + 1];
-    for g in dofs.clone() {
-        offsets[g as usize + 1] += 1;
-    }
-    for g in 0..n_dofs {
-        offsets[g + 1] += offsets[g];
-    }
-    let mut next = offsets[..n_dofs].to_vec();
-    let mut slots = vec![0u32; offsets[n_dofs]];
-    for (s, g) in dofs.enumerate() {
-        let at = &mut next[g as usize];
-        slots[*at] = u32::try_from(s).expect("at most u32::MAX slots");
-        *at += 1;
-    }
-    (offsets, slots)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,7 +62,7 @@ mod tests {
     #[test]
     fn sums_each_dof_in_slot_order() {
         let big = 2f64.powi(53);
-        let p = Prolongation::new([&[1u32, 0][..], &[1, 1]].into_iter(), 3);
+        let p = Prolongation::new([1u32, 0, 1, 1].into_iter(), 3);
         let mut out = vec![f64::NAN; 3];
         p.apply(&[1.0, 3.0, big, -big], &mut out);
         // `1 + 2⁵³` rounds to `2⁵³`; summed in reverse, DOF 1 would be 1.
@@ -106,10 +75,8 @@ mod tests {
     /// Eight slots per DOF on average, hashed so each DOF's slots lie far apart.
     #[fixture]
     fn scattered_prolongation() -> Prolongation {
-        let dofs: Vec<u32> = (0..SLOTS)
-            .map(|s| ((s * 2_654_435_761) % DOFS) as u32)
-            .collect();
-        Prolongation::new(dofs.chunks(8), DOFS as usize)
+        let dofs = (0..SLOTS).map(|s| ((s * 2_654_435_761) % DOFS) as u32);
+        Prolongation::new(dofs, DOFS as usize)
     }
 
     /// Entries spanning 30 decades, so a reordered sum rounds differently.

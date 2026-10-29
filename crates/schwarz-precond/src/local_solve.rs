@@ -75,11 +75,6 @@ impl<S: LocalSolver> SubdomainEntry<S> {
         &self.solver
     }
 
-    /// Returns `true` if this subdomain is empty.
-    pub fn is_empty(&self) -> bool {
-        self.core.is_empty()
-    }
-
     /// Writes `D̃ᵢ Aᵢ⁻¹ D̃ᵢ Rᵢ r` locally to `out`; `workspace` holds at least `workspace_len()`.
     pub(crate) fn apply_weighted_local(
         &self,
