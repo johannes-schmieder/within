@@ -1,6 +1,9 @@
 //! Scatter kernel: observation space → coefficient space (`Dᵀ x`), summed per term in an
 //! order its [`AdjointSum`] fixes, so the thread count never changes the bits.
 
+#[cfg(test)]
+mod tests;
+
 use std::ops::Range;
 
 use rayon::prelude::*;
@@ -88,10 +91,23 @@ fn scatter_term<const C: usize>(
             let leaf = (4 * C * n_levels).max(65_536);
             let scatter = |rows: Range<usize>| {
                 let mut sums = vec![0.0; C * n_levels];
-                for i in rows {
+                let mut i = rows.start;
+                while i < rows.end {
                     let level = levels[i] as usize;
-                    for (c, v) in values(i).into_iter().enumerate() {
-                        sums[c * n_levels + level] += v;
+                    // Retain the existing sum, not a run subtotal: each column
+                    // still adds every row in its original order.
+                    let mut run: [f64; C] = std::array::from_fn(|c| sums[c * n_levels + level]);
+                    loop {
+                        for (s, v) in run.iter_mut().zip(values(i)) {
+                            *s += v;
+                        }
+                        i += 1;
+                        if i == rows.end || levels[i] as usize != level {
+                            break;
+                        }
+                    }
+                    for (c, sum) in run.into_iter().enumerate() {
+                        sums[c * n_levels + level] = sum;
                     }
                 }
                 sums
