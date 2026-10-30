@@ -17,6 +17,163 @@ impl BlockElimSolver {
 }
 
 #[test]
+fn backsub_preserves_row_arithmetic_in_sequential_and_parallel_recovery() {
+    // Exceed the parallel threshold and end in a partial chunk. Row-dependent
+    // RHS values make skipped, duplicated or misplaced rows observable.
+    let nrows = PAR_BACKSUB_THRESHOLD + 17;
+    let source = [-1.0, 1.0, 1.0, 1.0 - 2.0_f64.powi(-27)];
+    let mut cross = CsrBlock {
+        indptr: vec![0],
+        indices: Vec::new(),
+        data: Vec::new(),
+        nrows,
+        ncols: source.len(),
+    };
+    let mut rhs = Vec::with_capacity(nrows);
+    let mut diagonal = Vec::with_capacity(nrows);
+    let mut expected = Vec::with_capacity(nrows);
+    for i in 0..nrows {
+        let (entries, sum): (&[(u32, f64)], f64) = match i % 5 {
+            0 => (&[], 0.0),
+            1 => (&[(1, 2.0)], 2.0),
+            // Left-to-right gives (2^54 + 1) - 2^54 = 0, not 1.
+            2 => (
+                &[(0, -2.0_f64.powi(54)), (1, 1.0), (2, -2.0_f64.powi(54))],
+                0.0,
+            ),
+            // The product rounds to 1 before addition. FMA would give -2^-54.
+            3 => (&[(0, 1.0), (3, 1.0 + 2.0_f64.powi(-27))], 0.0),
+            _ => (&[(0, -2.0), (1, 3.0), (2, 5.0)], 10.0),
+        };
+        for &(column, value) in entries {
+            cross.indices.push(column);
+            cross.data.push(value);
+        }
+        cross.indptr.push(cross.indices.len() as u32);
+        let base = if matches!(i % 5, 2 | 3) {
+            0.0
+        } else {
+            i as f64 * 0.25
+        };
+        let scale = [0.25, 0.5, 1.0][i % 3];
+        rhs.push(base);
+        diagonal.push(scale);
+        expected.push((base + scale * sum).to_bits());
+    }
+    assert!(cross.is_structurally_valid());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for parallel in [false, true] {
+        let mut output = vec![f64::NAN; nrows];
+        pool.install(|| {
+            backsub_block_from_scaled_rhs(&mut output, &rhs, &cross, &diagonal, &source, parallel);
+        });
+        assert_eq!(
+            output
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn backsub_with_no_kept_columns_preserves_empty_row_arithmetic() {
+    let cross = CsrBlock::from_dense_table(&[], 3, 0);
+    let mut output = [f64::NAN; 3];
+    backsub_block_from_scaled_rhs(
+        &mut output,
+        &[-0.0, 1.0, -2.0],
+        &cross,
+        &[0.5, 1.0, 2.0],
+        &[],
+        true,
+    );
+    assert_eq!(
+        output.map(f64::to_bits),
+        [0.0_f64, 1.0, -2.0].map(f64::to_bits)
+    );
+}
+
+#[test]
+fn backsub_irregular_rows_match_the_indexed_loop_and_integer_block_equations() {
+    // Dyadic coefficients keep the independent integer dot product exact.
+    // Mix empty, short and long rows across parallel chunks and end mid-chunk.
+    let nrows = PAR_BACKSUB_THRESHOLD + 17;
+    let ncols = 257;
+    let source: Vec<f64> = (0..ncols)
+        .map(|j| (j as i64 % 31 - 15) as f64 / 8.0)
+        .collect();
+    let mut cross = CsrBlock {
+        indptr: vec![0],
+        indices: Vec::new(),
+        data: Vec::new(),
+        nrows,
+        ncols,
+    };
+    let rhs: Vec<f64> = (0..nrows)
+        .map(|i| (i as i64 % 97 - 48) as f64 / 16.0)
+        .collect();
+    let inv_diag: Vec<f64> = (0..nrows).map(|i| 2.0_f64.powi(-(i as i32 % 4))).collect();
+    let mut expected = Vec::with_capacity(nrows);
+    for i in 0..nrows {
+        let width = [0, 1, 7, 65, 257][i % 5];
+        let mut integer_dot = 0i64;
+        for j in 0..width {
+            let numerator = (i * 13 + j * 17) as i64 % 41 - 20;
+            cross.indices.push(j as u32);
+            cross.data.push(numerator as f64 / 4.0);
+            integer_dot += numerator * (j as i64 % 31 - 15);
+        }
+        cross.indptr.push(cross.indices.len() as u32);
+        // D*x - C*y = D*rhs, with D = 1/inv_diag.
+        expected.push(rhs[i] + inv_diag[i] * integer_dot as f64 / 32.0);
+    }
+    assert!(cross.is_structurally_valid());
+
+    // Freeze the upstream-base operation sequence separately from the oracle.
+    let indexed: Vec<f64> = (0..nrows)
+        .map(|i| {
+            let mut sum = 0.0;
+            for k in cross.indptr[i] as usize..cross.indptr[i + 1] as usize {
+                sum += cross.data[k] * source[cross.indices[k] as usize];
+            }
+            rhs[i] + inv_diag[i] * sum
+        })
+        .collect();
+    assert_eq!(indexed, expected);
+    let expected_bits: Vec<u64> = expected.iter().map(|x| x.to_bits()).collect();
+    for workers in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        for parallel in [false, true] {
+            for _ in 0..2 {
+                let mut output = vec![f64::NAN; nrows];
+                pool.install(|| {
+                    backsub_block_from_scaled_rhs(
+                        &mut output,
+                        &rhs,
+                        &cross,
+                        &inv_diag,
+                        &source,
+                        parallel,
+                    )
+                });
+                assert_eq!(
+                    output.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected_bits
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_subtract_mean_empty() {
     let mut data: Vec<f64> = Vec::new();
     subtract_mean(&mut data);
